@@ -86,15 +86,20 @@ contributors submit PRs?"
 - If **no** (personal/team): Default to `type(scope): description [prefix-xxx]`
   with optional bead reference for traceability.
 
-Present the detected commit convention from Phase 1 as the default. Every
-option must include a markdown preview showing example commits in that format
-(use real examples from git log). Options without previews show "No preview
-available" which is confusing.
+**Recommendation logic:** Don't blindly recommend keeping the detected format.
+Evaluate it: if the detected format lacks scope (e.g., `type: description`
+with no parenthesized scope), recommend `type(scope): description` instead.
+Only recommend "keep current" when the detected format already includes scope.
 
-Options:
-- Use detected format (show it)
-- type(scope): description [prefix-xxx] (with bead ref)
-- type(scope): description (without bead ref)
+Every option must include a markdown preview showing example commits in that
+format (use real examples from git log, rewritten into each format). Options
+without previews show "No preview available" which is confusing.
+
+Options (always show all four):
+- Keep current format (show it) - only mark "(Recommended)" if it already has scope
+- type(scope): description (with scope, no bead ref) - recommend for open source, or when detected format lacks scope
+- type(scope): description [prefix-xxx] (with scope + bead ref) - recommend for personal/team projects
+- type: description [prefix-xxx] (no scope, with bead ref)
 
 ### Q4: Code Change Policy
 
