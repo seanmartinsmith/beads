@@ -16,13 +16,17 @@ Before starting the interview, detect the current project state.
 **Onboard version:** v3
 
 1. Check for `.beads/` directory:
-   - **If missing:** offer to initialize. "No beads found. Initialize now?"
-     - If yes: run `bd init --prefix <auto-detected-from-dir-name>`
-     - Show result: "Initialized beads with prefix `<prefix>`."
-     - Ask: "Want a different prefix?" (offer to re-run with custom prefix)
-     - Mention: "For multi-user sync, consider `bd init --team` instead."
+   - **If missing:** offer to initialize with AskUserQuestion:
+     "No beads found. Initialize now? The prefix is used for issue IDs
+     (e.g., `<dir-name>-1`, `<dir-name>-2`)."
+     - Option 1: "Yes, use `<dir-name>` as prefix" (auto-detected from directory name)
+     - Option 2: "Yes, but let me choose a prefix" (prompt for custom prefix)
+     - Option 3: "Yes, with team mode" (runs `bd init --team` for multi-user sync)
+     - If user selects option 1: run `bd init --prefix <dir-name>`
+     - If user selects option 2: ask for prefix, then run `bd init --prefix <custom>`
+     - If user selects option 3: run `bd init --team --prefix <dir-name>` (or custom)
+     - If user declines: stop. "Run `bd init` when ready, then re-run `/beads:onboard`."
      - Continue to step 2 after init completes.
-     - If no: stop. "Run `bd init` when ready, then re-run `/beads:onboard`."
 2. Read `.beads/config.yaml` for the issue prefix.
 3. Check for `.beads/conventions/.onboard-state.yaml` and `.beads/conventions/` directory:
    - **No state file AND no conventions dir:** first-time onboard. Proceed normally.
@@ -136,7 +140,10 @@ Present them as options (the built-in "Other" handles freeform):
 - Option 3: [Purpose description: problem it solves, value delivered]
 
 For planned/empty projects: base descriptions on planning docs or user input
-rather than codebase analysis. Acknowledge the project is early-stage.
+rather than codebase analysis. Describe what the project IS (function, type,
+audience), not its development stage. "A Go TUI for browsing usage data" is
+stable whether the project is in planning or fully built. "Planning docs only,
+no code yet" becomes stale in a week — don't include development status.
 
 ### Q2: Area Labels
 
@@ -168,9 +175,13 @@ Evaluate it: if the detected format lacks scope (e.g., `type: description`
 with no parenthesized scope), recommend `type(scope): description` instead.
 Only recommend "keep current" when the detected format already includes scope.
 
-Every option must include a markdown preview showing example commits in that
-format (use real examples from git log, rewritten into each format). Options
-without previews show "No preview available" which is confusing.
+Every option must include a markdown preview showing the SAME example commits
+rewritten into that option's format. This makes the difference between options
+visually obvious. Use real examples from git log if available, or generate
+realistic examples using the project's area labels as scopes. The `(scope)` is
+the area of the codebase being changed — it maps to the area labels from Q2
+(e.g., `feat(data):` means a feature in the data area). Options without
+previews show "No preview available" which is confusing.
 
 Options (always show all four):
 - Keep current format (show it) - only mark "(Recommended)" if it already has scope
@@ -186,19 +197,29 @@ Options (always show all four):
 - All code changes (strict - every change gets a bead)
 - Only multi-session work (minimal - beads for persistence only)
 
-### Q5: Beads + Ephemeral Tasks
+### Q5: Beads + Claude Code Tasks
 
-"Do you use ephemeral task tools (Claude Code Tasks, Copilot Todos, etc.)
-alongside beads for within-session work?"
+Before presenting the question, explain the context:
 
-Explain the complementary pattern regardless of answer:
-- Beads = persistent across sessions, changelog-worthy, searchable history
-- Tasks = ephemeral within a session, execution coordination, implementation steps
+"Beads is your project's issue tracker — what work exists, why, and what
+happened. Claude Code Tasks (TaskCreate, TaskUpdate, TaskList) is a built-in
+checklist for tracking your steps while working, and complements beads well."
+
+Then explain the complementary pattern:
+- Beads = project memory. Cross-session, changelog-worthy, searchable history.
+  Git-backed, syncs across machines and teams, works with any agent tool.
+  "What work exists and why."
+- Tasks = session memory. Execution steps, implementation order within a session.
+  Disk-backed, survives compaction. "Where I am right now."
+- The pattern: claim a bead → break it into 3-7 tasks → work the tasks → close
+  the bead with a rich close_reason capturing what the tasks accomplished.
+
+Then ask: "Do you use Claude Code Tasks alongside beads for within-session
+execution?"
 
 Options:
-- Yes, I use both (tailor the generated docs to emphasize the integration)
-- No, just beads (still mention tasks as an option in the reference doc)
-- Not sure what this means (explain further, then re-ask)
+- Yes, I use both (generate full integration guidance in reference.md)
+- No, just beads (skip detailed tasks integration guidance in reference.md)
 
 ### Q6: Close Outcome Template
 
@@ -301,6 +322,17 @@ Files: <paths>
 Verify: <how verified>
 Risk: <if any>
 Notes: <optional gotchas>
+
+**Why each field matters:**
+
+| Field | Purpose |
+|---|---|
+| Summary | Search target — what `bd search` finds when someone hits the same problem |
+| Change | Scope — what was actually modified, so future agents know the blast radius |
+| Files | Navigation — where to look when verifying or extending this work |
+| Verify | Confidence — how to confirm the fix still holds after other changes |
+| Risk | Landmines — what could break, so future agents don't step on it |
+| Notes | Gotchas — the thing that took 30 minutes to figure out, saved for the next agent |
 
 **Formatting:** Use blank lines between sections. No semicolons.
 
@@ -555,15 +587,51 @@ moments during implementation to build structured, searchable metadata.
 - Consider context window scope when claiming work — if a bead requires
   touching many files or systems, consider breaking it into sub-beads
 
-## Beads + Ephemeral Tasks
+## Beads + Claude Code Tasks
 
-[If Q5 = yes, include full integration pattern:]
-Beads for persistence across sessions. Tasks for within-session execution.
-Create a bead for the work item. Use Tasks to break down implementation.
-Close the bead when the work ships.
+[If Q5 = yes, include full integration pattern. If no, include a brief mention.]
 
-When to create a bead: Would it show up in a changelog? Will you need context
-in a future session? Is there a decision worth recording?
+Beads and Tasks serve different levels of the same workflow:
+
+| | Beads (`bd`) | Tasks (`TaskCreate`) |
+|---|---|---|
+| **Level** | Project-level work items | Execution-level steps |
+| **Tracks** | What work exists and why | How you're implementing a specific bead |
+| **Persists** | Yes (git-backed, survives everything) | Yes (disk-backed, survives compaction) |
+| **Granularity** | Changelog-worthy changes | 1-3 files, completable in one focused stretch |
+| **Dependencies** | Full DAG (blocks, relates, parent-child) | Simple DAG (blockedBy/blocks) |
+
+### The integration pattern
+
+1. **Find work:** `bd ready` → pick a bead
+2. **Claim it:** `bd update <id> --status=in_progress`
+3. **Break it down:** read the bead description, create 3-7 Tasks referencing
+   the bead ID in each task subject
+4. **Execute:** work through Tasks, mark each `completed` as you go
+5. **Close the bead:** `bd close <id> --reason="..."` — the close_reason
+   captures what the Tasks accomplished (handoff from execution to history)
+
+### When to create Tasks for a bead
+
+Create Tasks when:
+- The bead has 3+ distinct implementation steps
+- Complex work where tangents are likely
+- You're mentally planning a sequence of changes
+
+Skip Tasks when:
+- Single-step fix (just do it)
+- Exploratory work (investigate first, break down after)
+- Simple enough to hold in your head
+
+### Anti-patterns
+- **Orphan Tasks:** tasks without a bead — work becomes untraceable in project history
+- **Scope drift:** tasks that wander beyond the bead's scope — create a new bead instead
+- **Task hoarding:** 10+ tasks means the bead is too big — split the bead first
+
+### When to create a bead (vs just working)
+
+Would it show up in a changelog? Will you need context in a future session?
+Is there a decision worth recording? If yes to any → create a bead.
 
 ## Connecting Plans, Docs, and Commits
 
@@ -717,14 +785,32 @@ After generating all files:
 6. Suggest: "Run `bd doctor` to verify full project health."
 7. Remind: "These conventions are now active. Agents will follow them for every
    bead created in this project. Review and adjust as needed."
-8. Offer milestone bead: "Want me to create a reminder bead to revisit
-   conventions after your first 30 beads? (Priority 3, surfaces in `bd ready`
-   when the time is right.)"
-   - If yes: `bd create --title="Re-evaluate project conventions" --type=chore
-     --priority=3 --description="After 30+ beads, re-run /beads:onboard to
-     refine conventions based on actual usage. Check: Are descriptions
-     structured? Close reasons rich? Labels consistent? Priority assignments
-     calibrated?" --labels=workflow:brainstorm`
+8. Offer milestone bead. Adapt the explanation based on project state:
+
+   **If first-time onboard (no existing beads):**
+   "This onboard created conventions, but since this project has no existing
+   beads the guidance was based on predictions. After 30 beads of real usage,
+   you'll have data to see what's actually working — are agents enriching
+   beads with structured fields or just leaving comments? Is the label
+   taxonomy still relevant or do you need more areas? Are close reasons
+   structured or falling back to one-liners? A reminder bead surfaces this
+   at the right time."
+
+   **If re-onboard (existing beads):**
+   "You just updated your conventions — a reminder bead lets you verify
+   these changes are landing in practice. It'll record today's date so when
+   it surfaces after 30 beads, you can compare beads created after this
+   re-onboard against beads before it. Are agents following the updated
+   guidance? Did the changes actually improve quality?"
+
+   Then ask: "Want me to create a P3 reminder bead to verify these updated
+   conventions are working after 30 more beads?"
+   - If yes: `bd create --title="Verify re-onboard conventions are working" --type=chore
+     --priority=3 --description="Re-onboarded on [today's date]. After 30+ beads,
+     compare bead quality before vs after this date. Check: Are agents following
+     the updated description templates? Are the new area labels the right split?
+     Are close reasons richer than before? If not, re-run /beads:onboard to
+     refine further." --labels=workflow:brainstorm`
    - If no: skip silently.
 
 ## Important
