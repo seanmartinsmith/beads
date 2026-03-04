@@ -334,14 +334,34 @@ Notes: <optional gotchas>
 | Risk | Landmines — what could break, so future agents don't step on it |
 | Notes | Gotchas — the thing that took 30 minutes to figure out, saved for the next agent |
 
-**Formatting:** Use blank lines between sections. No semicolons.
+**Formatting:** The `--reason` field is searchable and renders as markdown.
+Use **blank lines** between sections (double newline). This is critical for
+readability — single newlines without blank lines won't render as line breaks.
 
-**Good example:**
-[Generate one example using this project's prefix]
+**Good example — note the literal newlines in the bash string:**
+
+```bash
+bd close [prefix]-xxx --reason="Summary: [one-sentence summary]
+
+Change: [what changed]
+
+Files: [paths]
+
+Verify: [how verified]
+
+Risk: [if any]
+
+Notes: [optional gotchas]"
+```
+
+[Also generate one filled-in example using this project's prefix and realistic
+content, showing the same bash syntax with literal newlines]
 
 **Bad examples:**
-- "Done" - no context, unsearchable
-- "Fixed it" - no details for future agents
+- `"Done"` - no context, unsearchable
+- `"Fixed it"` - no details for future agents
+- `"Summary: x; Change: y; Files: z"` - semicolons on one line, unreadable
+- Single newlines without blank lines - won't render as separate sections
 
 ## Creating Issues
 
@@ -695,7 +715,24 @@ Description structure by type: `.beads/conventions/reference.md`
 
 ### Close Outcome Format
 
-[Template from Q6]
+Use **literal newlines with blank lines** between fields in `--reason`:
+
+[Template from Q6, shown as a bash command with literal newlines like:]
+```bash
+bd close <id> --reason="Summary: ...
+
+Change: ...
+
+Files: ...
+
+Verify: ...
+
+Risk: ...
+
+Notes: ..."
+```
+
+Never use semicolons or single-line formatting. See reference.md for full guidance.
 
 ### Session Rules
 
