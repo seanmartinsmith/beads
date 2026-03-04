@@ -7,16 +7,39 @@ Onboard a project with beads quality conventions. Analyzes the codebase and
 interactively generates project-specific rules that make agents produce
 high-quality, searchable, non-redundant beads.
 
-Run this once per project, ideally right after `bd init`.
+Run this once per project, or re-run after upgrading to get improved guidance.
 
 ## Phase 0: State Detection
 
 Before starting the interview, detect the current project state.
 
-1. Check for `.beads/` directory. **If missing, stop and suggest `bd init`.**
+**Onboard version:** v3
+
+1. Check for `.beads/` directory:
+   - **If missing:** offer to initialize. "No beads found. Initialize now?"
+     - If yes: run `bd init --prefix <auto-detected-from-dir-name>`
+     - Show result: "Initialized beads with prefix `<prefix>`."
+     - Ask: "Want a different prefix?" (offer to re-run with custom prefix)
+     - Mention: "For multi-user sync, consider `bd init --team` instead."
+     - Continue to step 2 after init completes.
+     - If no: stop. "Run `bd init` when ready, then re-run `/beads:onboard`."
 2. Read `.beads/config.yaml` for the issue prefix.
-3. Check for `.beads/conventions/` directory:
-   - If exists: this is a re-onboard. Ask: "Conventions already exist. Update them or start fresh?"
+3. Check for `.beads/conventions/.onboard-state.yaml` and `.beads/conventions/` directory:
+   - **No state file AND no conventions dir:** first-time onboard. Proceed normally.
+   - **No state file BUT conventions dir exists:** onboarded by older version (pre-v3).
+     Read existing convention files to extract previous answers as defaults.
+     Tell user: "Conventions exist from an earlier onboard version. v3 adds description
+     templates, priority calibration, and lifecycle guidance. Re-running the interview
+     with your existing answers as defaults." Offer: "Update with new guidance
+     (Recommended)" or "Start completely fresh."
+   - **State file exists, version < current:** read saved answers for pre-filling.
+     Tell user what's new in this version. Same offer as above.
+   - **State file exists, version = current:** "Conventions are current (v3). Want to
+     review/update your answers, or start fresh?"
+   - In all re-onboard cases, check if convention files were manually edited after
+     generation (compare file content against what saved answers would produce). If
+     customized, warn: "Your convention files have custom edits. New guidance will be
+     merged alongside your customizations."
 4. Check for `<!-- BEGIN BEADS INTEGRATION -->` markers in AGENTS.md:
    - If markers found: will replace content between markers (interop with `bd setup`).
    - If no markers but beads content found: will wrap replacement in markers.
@@ -24,12 +47,23 @@ Before starting the interview, detect the current project state.
 5. Check if CLAUDE.md exists and whether it references `@AGENTS.md`.
 6. Run `bd doctor 2>&1 || true` (capture output, don't show it yet). Note errors
    and warnings to surface as recommendations after generation.
+7. Detect project state for Phase 1 detection strategy:
+   - **Existing project:** significant code exists (>5 source files or package manager
+     config like package.json, go.mod, Cargo.toml, pyproject.toml).
+   - **Planned project:** minimal/no code but planning docs exist (check
+     `docs/brainstorms/`, `docs/plans/`, `docs/`, root `.md` files).
+   - **Empty project:** neither code nor planning docs.
+   Store the detected state for Phase 1.
 
-**Do not block on doctor results.** The only hard gate is `.beads/` existence.
+**Do not block on doctor results.** The hard gate is `.beads/` existence (or willingness
+to init).
 
-## Phase 1: Analyze the Codebase
+## Phase 1: Analyze the Project
 
-Perform mechanical detection to inform the interview:
+Detection adapts based on project state from Phase 0. The goal is the same
+regardless of state: gather defaults for the interview questions.
+
+### If existing project (has code):
 
 1. **Directory structure**: List top-level directories. Map each to a candidate
    area label (e.g., `cmd/` → `area:cli`, `internal/` → `area:internal`,
@@ -47,6 +81,40 @@ Perform mechanical detection to inform the interview:
    - **Platform labels** (if cross-platform): windows, macos, linux, mobile, ios, android
    - **Browser labels** (if web project): firefox, safari, chrome
 
+### If planned project (has docs, minimal code):
+
+1. **Read planning docs**: scan `docs/brainstorms/`, `docs/plans/`, `docs/`, and
+   root `.md` files. Extract: project description, planned directory structure,
+   tech stack mentions, feature lists.
+2. **Map planned structure to areas**: if docs describe a file/directory layout,
+   derive candidate area labels from it.
+3. **Languages and frameworks**: extract from tech stack mentions in docs.
+4. **Commit conventions**: no history to detect. Default: `type(scope): description`.
+5. **Issue prefix**: read from `.beads/config.yaml`.
+6. **Cross-cutting dimensions**: infer from project description (e.g., "cross-platform
+   CLI" → platform labels, "web app" → browser labels).
+
+### If empty project (no code, no docs):
+
+1. **No detection possible.** Use universal defaults:
+   - Areas: `area:core` (placeholder — user will customize in Q2)
+   - Commit format: `type(scope): description`
+   - Languages: unknown
+2. **Issue prefix**: read from `.beads/config.yaml`.
+3. **Cross-cutting dimensions**: include concern and workflow labels (always useful).
+   Skip platform/browser unless user adds them in Q2.
+
+### All modes — project type detection:
+
+Detect project type for priority calibration in Phase 3:
+- **Production app**: has deployment configs (Dockerfile, vercel.json, netlify.toml,
+  AWS configs, CI/CD with deploy steps).
+- **Library/SDK**: has library indicators (go.mod with module path, package.json
+  with `main`/`exports`/`types` fields, gem spec, setup.py with classifiers).
+- **CLI tool**: has CLI entry points (cmd/ directory, bin/ scripts, console scripts).
+- **Personal/internal**: no deployment configs, no library exports.
+If unclear, default to "personal/internal" (most conservative priority calibration).
+
 ## Phase 2: Interview
 
 Ask these questions **one at a time** using AskUserQuestion. Wait for each
@@ -54,12 +122,21 @@ answer before proceeding to the next question.
 
 ### Q1: Project Description
 
-Generate three short descriptions (1-2 sentences each) based on the codebase
-analysis. Present them as options (the built-in "Other" handles freeform):
+Generate three short descriptions (1-2 sentences each) that ground the project
+in reality. Each description must capture: what the project IS (function, not
+aspiration), what TYPE of project it is (production web app, CLI tool, library,
+personal project), and who/what it serves. These descriptions help agents scope
+their work — a portfolio site on S3 is fundamentally different from an internal
+API serving production traffic.
 
-- Option 1: [AI-generated description emphasizing primary function]
-- Option 2: [AI-generated description emphasizing tech stack/architecture]
-- Option 3: [AI-generated description emphasizing user/audience]
+Present them as options (the built-in "Other" handles freeform):
+
+- Option 1: [Grounded description: what it is, project type, audience]
+- Option 2: [Technical description: stack, architecture, deployment context]
+- Option 3: [Purpose description: problem it solves, value delivered]
+
+For planned/empty projects: base descriptions on planning docs or user input
+rather than codebase analysis. Acknowledge the project is early-stage.
 
 ### Q2: Area Labels
 
@@ -248,13 +325,235 @@ Search before creating: `bd search "query"`
 - Use `bd dep relate <a> <b>` for connected but parallel work
 - Never use `blocks` to mean "belongs to epic" - use parent-child
 
+## Description Structure
+
+Structure descriptions by issue type. Without explicit section guidance, agents
+default to one-line descriptions that are unsearchable and useless for future
+sessions.
+
+### Epic
+Include when relevant: Context, Core Issues, Phases [NOW/SOON/LATER], Key
+Decisions, Related beads
+
+### Bug
+Include when relevant: Observed behavior, Expected behavior, Steps to reproduce,
+Environment
+
+### Feature
+Include when relevant: Motivation (why this matters), Acceptance criteria, Scope
+boundary (what is NOT included)
+
+### Task
+Include when relevant: Context (why now, not later), Scope, Done-when
+
+### Chore
+Include when relevant: What + why now (not just "update deps" — state the reason,
+e.g., "because CVE-2026-xxxx affects production")
+
+### Examples
+
+[Generate one complete `bd create` command per type using the project's actual
+prefix and labels. Descriptions must be filled in with realistic content for this
+project, not placeholder text. These are the examples agents pattern-match from.]
+
+**Bug example:**
+```
+bd create --title="[realistic bug title for this project]" --type=bug --priority=1 \
+  --labels=area:[detected-area],ux \
+  --description="Observed: [specific behavior in this project's context]
+
+Expected: [correct behavior]
+
+Steps to reproduce:
+1. [step using this project's actual commands/UI]
+2. [step]
+
+Environment: [relevant platform/browser/version]"
+```
+
+**Feature example:**
+```
+bd create --title="[realistic feature for this project]" --type=feature --priority=2 \
+  --labels=area:[detected-area] \
+  --description="Motivation: [why this matters for this project's users]
+
+Acceptance criteria:
+- [concrete criterion using this project's context]
+- [concrete criterion]
+
+Scope boundary: Does NOT include [explicit exclusion]"
+```
+
+**Task example:**
+```
+bd create --title="[realistic task for this project]" --type=task --priority=2 \
+  --labels=area:[detected-area] \
+  --description="Context: [why this task is needed now]
+
+Scope: [what this covers]
+
+Done-when: [concrete completion signal]"
+```
+
+**Chore example:**
+```
+bd create --title="[realistic chore for this project]" --type=chore --priority=3 \
+  --labels=area:[detected-area] \
+  --description="Update [specific dependency] because [specific reason — CVE,
+breaking change in downstream, compatibility with new version of X].
+
+Scope: [what's included in this update]"
+```
+
+**Epic example:**
+```
+bd create --title="[realistic epic for this project]" --type=epic --priority=1 \
+  --labels=area:epic \
+  --description="Context: [why this initiative exists]
+
+Core Issues:
+- [issue 1]
+- [issue 2]
+
+Phases:
+[NOW] [immediate work]
+[SOON] [next steps after NOW completes]
+[LATER] [future work, may change]
+
+Key Decisions:
+- [decision with rationale]
+
+Related: [prefix]-xxx, [prefix]-yyy"
+```
+
+## Priority Semantics
+
+Priority determines creation-time classification. `bd ready` handles work
+ordering via the dependency graph — priority is a tiebreaker when multiple
+unblocked items exist.
+
+[Generate the table matching the detected project type from Phase 1. If project
+type is unclear, use the personal/internal table as default.]
+
+**For production apps:**
+
+| Priority | Meaning | Example |
+|---|---|---|
+| P0 | Site down, data loss, security incident | Database failures, auth broken, data corruption |
+| P1 | Core feature broken, major regression | Checkout error, search returns nothing, API 500s |
+| P2 | Meaningful improvement or non-critical bug | Visual glitch, slow page load, confusing UX |
+| P3 | Minor polish, non-urgent | Tooltip wording, button alignment, minor refactor |
+| P4 | Backlog, speculative | "Someday" ideas, exploratory features |
+
+**For CLI tools:**
+
+| Priority | Meaning | Example |
+|---|---|---|
+| P0 | Data loss or corruption | Corrupts config, deletes wrong data, silent failures |
+| P1 | Core command broken, blocking workflow | Main command crashes, output format broken |
+| P2 | Confusing behavior or error message | Misleading error, unclear help text, wrong exit code |
+| P3 | Minor friction | Extra flag for common operation, verbose output |
+| P4 | Backlog | Nice-to-have features, exploratory |
+
+**For libraries/SDKs:**
+
+| Priority | Meaning | Example |
+|---|---|---|
+| P0 | Breaking change in published API, data loss | Removed public method, corrupts caller state |
+| P1 | Incorrect behavior in core functionality | Wrong return value, silent error swallowing |
+| P2 | Missing docs, poor error messages | Unclear API, confusing type signatures |
+| P3 | Minor API ergonomics | Better defaults, convenience methods |
+| P4 | Backlog | Speculative features, internal refactors |
+
+**For personal/internal projects:**
+
+| Priority | Meaning | Example |
+|---|---|---|
+| P0 | Blocks all other work | Build broken, environment unusable |
+| P1 | Core functionality broken | Main feature doesn't work, data issues |
+| P2 | Meaningful improvement | New feature, notable bug fix |
+| P3 | Minor polish | UI tweak, code cleanup |
+| P4 | Backlog | Ideas, experiments |
+
+### Scope awareness
+
+When creating beads, consider complexity alongside priority. A self-contained
+fix in one file is a different bead from a multi-file refactor, even if they
+address the same problem. Smaller, focused beads are easier for agents to
+complete in a single context window. If a bead's scope exceeds what you can
+complete in your current session, break it into sub-beads before starting.
+
+## Create Fields Beyond --description
+
+`bd create` supports fields that add structured, searchable context. Use them
+when the trigger condition applies. An empty `--notes ""` is worse than omitting.
+
+| Field | Trigger | Decision Test |
+|---|---|---|
+| `--description` | Always | -- |
+| `--notes` | Discovered something non-obvious during investigation | "Would a future agent hit this same surprise?" |
+| `--design` | Chose between alternatives | "Is there a 'why not the other way?' question?" |
+| `--acceptance` | Done-when isn't obvious from the title | "Could two agents disagree on whether this is complete?" |
+| `--spec-id` | A planning doc is driving this work | "Is there a doc that explains why this bead exists?" |
+
+**Examples using this project's prefix:**
+
+```
+--notes="[Realistic gotcha for this project, e.g.: Redis pool must be >=5 for
+concurrent workers. Default of 3 causes intermittent failures under load.]"
+
+--design="[Realistic design choice, e.g.: Redis pub/sub over WebSockets because
+deployment has no sticky sessions.]"
+
+--acceptance="[Realistic criteria, e.g.: Lighthouse >=90, loads in <2s on 3G
+throttle, works in Safari 16+.]"
+
+--spec-id="docs/plans/[relevant-plan-file].md"
+```
+
+## Enriching Beads During Work
+
+Don't wait until creation and close to add context. Use `bd update` at specific
+moments during implementation to build structured, searchable metadata.
+
+| Moment during work | Action | Instead of |
+|---|---|---|
+| Made a design decision | `bd update <id> --design "chose X because Y"` | Commenting "decided to use X because Y" |
+| Found an edge case | `bd update <id> --append-notes "edge case: Z"` | Commenting "note: also affects Z" |
+| Realized "done" criteria changed | `bd update <id> --acceptance "new criteria"` | Commenting "realized we also need Y" |
+| Created a related doc | `bd update <id> --spec-id "docs/..."` | Commenting "see docs/plans/foo.md" |
+| Scope became clearer | `bd update <id> --add-label concern` | Not updating labels at all |
+
+## When to Use Comments vs Fields
+
+> **Decision test:** Would this information still be useful if all comments were
+> deleted? If yes — it belongs in a structured field, not a comment.
+
+**Comments are right for:**
+- Session handoff notes: "Stopped at step 3, X works, Y needs Z"
+- Questions or blockers: "Need clarification on IE11 support"
+- Progress checkpoints: "Phase 1 complete, starting Phase 2"
+- External references: "Related: github.com/..."
+- Post-close addenda: "Found edge case after closing, see [prefix]-xxx"
+
+**Comments are wrong for (use fields instead):**
+
+| Instead of this comment... | ...use this update |
+|---|---|
+| "Decided to use Redis because no sticky sessions" | `bd update <id> --design "Redis pub/sub — no sticky sessions"` |
+| "Note: config falls back to env vars in Docker" | `bd update <id> --append-notes "Config falls back to env vars when no file (Docker)"` |
+| "Done when Lighthouse >= 90" | `bd update <id> --acceptance "Lighthouse >= 90, <2s on 3G"` |
+
 ## Session Discipline
 
 - `bd show <id>` and read close_reason before starting work
 - Check `bd list --status=in_progress` at session start
-- Use `bd comments add <id> "..."` for session notes
+- Use `bd comments add <id> "..."` for session handoff notes
+- Use `bd update` fields for structured metadata (design, notes, acceptance)
 - Close beads before committing
 - Run `bd dolt push` before ending session (if remote configured)
+- Consider context window scope when claiming work — if a bead requires
+  touching many files or systems, consider breaking it into sub-beads
 
 ## Beads + Ephemeral Tasks
 
@@ -272,6 +571,12 @@ in a future session? Is there a decision worth recording?
 - In beads: `bd comments add <id> "Doc: path/to/doc.md"`
 - In commits: [commit format from Q3]
 - In plans: Reference bead IDs the plan addresses
+
+## Convention Health
+
+Periodically audit bead quality: Are descriptions structured? Are close reasons
+rich? Are labels consistent? If conventions feel stale or agents aren't following
+them, re-run `/beads:onboard` to upgrade with improved guidance.
 ```
 
 ### File 3: AGENTS.md (beads section)
@@ -315,7 +620,10 @@ Always wrap the generated section in these exact markers:
 ### Creating Issues
 
 Always include: `--type`, `--priority`, `--labels`, `--description`.
+Use `--notes`, `--design`, `--acceptance` when trigger conditions apply
+(see reference.md for triggers and decision tests).
 Valid labels: `.beads/conventions/labels.md`
+Description structure by type: `.beads/conventions/reference.md`
 
 ### Close Outcome Format
 
@@ -325,10 +633,18 @@ Valid labels: `.beads/conventions/labels.md`
 
 - Read close_reason before working a bead to avoid re-solving
 - Check for abandoned work: `bd list --status=in_progress`
-- Use comments for session notes (survives compaction)
+- Use comments for session handoff notes (survives compaction)
+- Use `bd update` fields for structured metadata during work
 - Close beads before committing
 - Only add blocking deps when work truly cannot start
 - Don't invent labels - use `.beads/conventions/labels.md`
+
+### During Work
+
+- Use `bd update <id> --design "..."` when you make a non-obvious choice
+- Use `bd update <id> --append-notes "..."` when you discover edge cases
+- Use comments for session progress, questions, and handoffs
+- Full lifecycle guide: `.beads/conventions/reference.md`
 
 [If Q5 = yes:]
 ### Beads + Tasks
@@ -355,6 +671,28 @@ the top. If CLAUDE.md doesn't exist, create it with:
 @AGENTS.md
 ```
 
+### File 5: `.beads/conventions/.onboard-state.yaml`
+
+Write a state file for re-onboard detection. This file is NOT loaded by agents
+during normal work — it's only read by the onboard command on re-run.
+
+```yaml
+# Generated by /beads:onboard — do not edit manually
+version: "v3"
+timestamp: "[ISO 8601 timestamp of generation]"
+answers:
+  project_description: "[Q1 answer text]"
+  project_type: "[detected: production-app|cli-tool|library|personal-project]"
+  area_labels:
+    - "[label]: [description]"
+  commit_format: "[Q3 selected format]"
+  code_change_policy: "[Q4 answer: changelog-worthy|all-changes|multi-session-only]"
+  beads_tasks_integration: "[Q5 answer: yes|no|unsure]"
+  close_template: "[Q6 answer: default|custom|simple]"
+  close_template_fields:
+    - "[field names from selected template]"
+```
+
 ## Phase 4: Validation
 
 After generating all files:
@@ -364,9 +702,10 @@ After generating all files:
 
 | File | Purpose |
 |---|---|
-| `.beads/conventions/labels.md` | Label taxonomy - [N] areas + [dimensions] |
-| `.beads/conventions/reference.md` | Close template, creation rules, session discipline |
-| `AGENTS.md` | Scannable enforcement layer - agents read this every session |
+| `.beads/conventions/labels.md` | Label taxonomy — [N] areas + [dimensions] |
+| `.beads/conventions/reference.md` | Quality reference — close template, description structure, priority, lifecycle |
+| `.beads/conventions/.onboard-state.yaml` | Re-onboard state (version, answers) |
+| `AGENTS.md` | Scannable enforcement layer — agents read this every session |
 | `CLAUDE.md` | @AGENTS.md reference (if created/updated) |
 
 3. Highlight the label taxonomy (list the area labels).
@@ -378,6 +717,15 @@ After generating all files:
 6. Suggest: "Run `bd doctor` to verify full project health."
 7. Remind: "These conventions are now active. Agents will follow them for every
    bead created in this project. Review and adjust as needed."
+8. Offer milestone bead: "Want me to create a reminder bead to revisit
+   conventions after your first 30 beads? (Priority 3, surfaces in `bd ready`
+   when the time is right.)"
+   - If yes: `bd create --title="Re-evaluate project conventions" --type=chore
+     --priority=3 --description="After 30+ beads, re-run /beads:onboard to
+     refine conventions based on actual usage. Check: Are descriptions
+     structured? Close reasons rich? Labels consistent? Priority assignments
+     calibrated?" --labels=workflow:brainstorm`
+   - If no: skip silently.
 
 ## Important
 
