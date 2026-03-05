@@ -49,8 +49,13 @@ Before starting the interview, detect the current project state.
    - If no markers but beads content found: will wrap replacement in markers.
    - If no AGENTS.md: will create it with markers.
 5. Check if CLAUDE.md exists and whether it references `@AGENTS.md`.
-6. Run `bd doctor 2>&1 || true` (capture output, don't show it yet). Note errors
-   and warnings to surface as recommendations after generation.
+   - If CLAUDE.md has substantial content beyond `@AGENTS.md` (more than 5 non-empty
+     lines after removing the `@AGENTS.md` reference), flag it for Phase 4 guidance.
+     Store the content summary (line count, what it covers) for the recommendation.
+6. Run `bd doctor --agent 2>&1 || bd doctor 2>&1 || true` (try `--agent` first
+   for rich agent-facing output, fall back to plain `bd doctor` for older versions).
+   Capture output, don't show it yet. Note errors and warnings to surface as
+   recommendations after generation.
 7. Detect project state for Phase 1 detection strategy:
    - **Existing project:** significant code exists (>5 source files or package manager
      config like package.json, go.mod, Cargo.toml, pyproject.toml).
@@ -687,6 +692,13 @@ Always wrap the generated section in these exact markers:
 
 > This project uses [beads](https://github.com/steveyegge/beads) for task tracking.
 
+**MANDATORY**: Read these files before creating, updating, or closing any issue:
+1. `.beads/conventions/reference.md` — issue lifecycle, field triggers, close format
+2. `.beads/conventions/labels.md` — valid label taxonomy
+
+Do NOT create issues from memory or pattern-match from examples above.
+The conventions docs are the source of truth.
+
 [Code change policy from Q4]
 
 ### Commit Format
@@ -756,10 +768,6 @@ Never use semicolons or single-line formatting. See reference.md for full guidan
 
 Beads for cross-session persistence. Tasks for within-session execution.
 
-### Details
-
-- Label taxonomy: `.beads/conventions/labels.md`
-- Full reference: `.beads/conventions/reference.md`
 <!-- END BEADS INTEGRATION -->
 ```
 
@@ -819,10 +827,32 @@ After generating all files:
    - Team mode not configured → "Consider `bd init --team` for multi-user sync"
    - Editor hooks missing → "Consider `bd setup claude` or `bd setup cursor`"
    - Other doctor warnings → list them
-6. Suggest: "Run `bd doctor` to verify full project health."
-7. Remind: "These conventions are now active. Agents will follow them for every
+6. **If CLAUDE.md has substantial content (flagged in Phase 0):**
+   Surface this recommendation with reasoning:
+
+   "Your CLAUDE.md has [N lines] of project-specific content (covering [summary]).
+   Beads writes conventions to AGENTS.md because it's tool-agnostic — AGENTS.md
+   is the open standard that works across Claude Code, Cursor, Codex, and other
+   AI coding tools. Your CLAUDE.md uses `@AGENTS.md` to pull those conventions in.
+
+   The issue: when CLAUDE.md also has project instructions (build commands,
+   architecture notes, workflow rules), agents read both sources and can get
+   mixed signals when instructions overlap or conflict with the beads conventions.
+
+   Recommendation: Move project-specific instructions into AGENTS.md (outside
+   the beads markers) so there's one authoritative source. Keep CLAUDE.md
+   minimal — just `@AGENTS.md` plus any personal preferences or Claude
+   Code-specific settings.
+
+   Want me to show you what's in CLAUDE.md so you can decide what to move?"
+
+   - If user says yes: display the CLAUDE.md content and let them decide what
+     to migrate. Do NOT modify or delete CLAUDE.md content without explicit approval.
+   - If user declines: move on. This is a recommendation, not a gate.
+7. Suggest: "Run `bd doctor` to verify full project health."
+8. Remind: "These conventions are now active. Agents will follow them for every
    bead created in this project. Review and adjust as needed."
-8. Offer milestone bead. Adapt the explanation based on project state:
+9. Offer milestone bead. Adapt the explanation based on project state:
 
    **If first-time onboard (no existing beads):**
    "This onboard created conventions, but since this project has no existing
