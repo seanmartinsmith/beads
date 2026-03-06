@@ -755,6 +755,7 @@ Never use semicolons or single-line formatting. See reference.md for full guidan
 - Close beads before committing
 - Only add blocking deps when work truly cannot start
 - Don't invent labels - use `.beads/conventions/labels.md`
+- Do NOT use `bd edit` - it opens $EDITOR (interactive). Use `bd update <id> --field "value"` instead
 
 ### During Work
 
