@@ -362,11 +362,38 @@ Notes: [optional gotchas]"
 [Also generate one filled-in example using this project's prefix and realistic
 content, showing the same bash syntax with literal newlines]
 
-**Bad examples:**
-- `"Done"` - no context, unsearchable
-- `"Fixed it"` - no details for future agents
-- `"Summary: x; Change: y; Files: z"` - semicolons on one line, unreadable
-- Single newlines without blank lines - won't render as separate sections
+**Minimum close reason (the floor):** Every close must include at least
+Summary + Change + Files. These three fields make the close searchable and
+navigable. Verify, Risk, and Notes are added when the change is non-trivial
+(multi-file changes, risky areas, changes that affect other systems).
+
+"Closed" or "Done" with no context is never acceptable — it's lost project
+memory. The cost of a structured close reason is near zero; the value compounds
+every time a future agent searches for the same problem.
+
+**Quality gradient — from bad to good:**
+
+Bad: `"Closed"` — zero context, unsearchable, wasted opportunity
+Bad: `"Fixed it"` — no details, no files, no way to verify
+Bad: `"Summary: x; Change: y; Files: z"` — semicolons on one line, unreadable
+Bad: Single newlines without blank lines — won't render as separate sections
+
+Minimum (acceptable for small fixes):
+```
+Summary: Fix off-by-one in pagination offset
+Change: Adjusted offset calc in buildQuery() to use 0-based index
+Files: internal/query/builder.go
+```
+
+Full (standard for meaningful changes):
+[the filled-in example above]
+
+**When to include Verify/Risk/Notes:**
+- **Verify:** when the fix could regress (include the test command or manual check)
+- **Risk:** when the change touches shared code, has edge cases, or could break
+  something non-obvious
+- **Notes:** when you discovered something surprising that took time to figure
+  out — save that learning for the next agent
 
 ## Creating Issues
 
@@ -384,101 +411,180 @@ Search before creating: `bd search "query"`
 
 ## Description Structure
 
-Structure descriptions by issue type. Without explicit section guidance, agents
-default to one-line descriptions that are unsearchable and useless for future
-sessions.
+Structure descriptions by issue type. Every bead description must be **dense and
+actionable** — a future agent picking up this work cold should understand what to
+do, why it matters, and where to look. One-line descriptions are never acceptable.
 
-### Epic
-Include when relevant: Context, Core Issues, Phases [NOW/SOON/LATER], Key
-Decisions, Related beads
+The test: "If I `bd search` for this problem in 6 months, will this bead surface
+with enough context to act on?"
+
+Each type has **required sections** (always include) and **optional sections**
+(include when applicable). Required sections are the quality floor — they make
+descriptions searchable and handoff-ready. Optional sections add depth for
+complex work.
 
 ### Bug
-Include when relevant: Observed behavior, Expected behavior, Steps to reproduce,
-Environment
+
+**Required:**
+- **Observed:** What actually happens (specific, reproducible behavior)
+- **Expected:** What should happen instead
+- **Steps to reproduce:** Numbered steps another agent can follow
+
+**Optional** (include when the bug warrants it):
+- **Environment:** Platform, version, config that affects reproduction
+- **Impact:** Who/what is affected, severity beyond the immediate symptom
+- **Root cause hypothesis:** If you have a theory, state it with evidence
+
+Decision test for optional sections: "Would a different agent waste time
+rediscovering this context?"
 
 ### Feature
-Include when relevant: Motivation (why this matters), Acceptance criteria, Scope
-boundary (what is NOT included)
+
+**Required:**
+- **Motivation:** Why this matters — what problem it solves or value it delivers
+- **Acceptance criteria:** Concrete, checkable conditions for "done"
+- **Scope boundary:** What is explicitly NOT included (prevents scope creep)
+
+**Optional** (include for non-trivial features):
+- **Design decisions:** "Why X over Y?" with rationale — prevents future agents
+  from re-evaluating alternatives you already considered
+- **Technical context:** Current state of code being modified, key files
+- **Success criteria:** How to verify the feature works end-to-end
+
+Decision test for optional sections: "Is there a 'why not the other way?'
+question a future agent would ask?"
 
 ### Task
-Include when relevant: Context (why now, not later), Scope, Done-when
+
+**Required:**
+- **Context:** Why this task exists now, not later — what triggered it
+- **Scope:** What this covers (files, systems, boundaries)
+- **Done-when:** Concrete completion signal a different agent could verify
+
+**Optional** (include for multi-step tasks):
+- **Key files:** Paths to the files being modified
+- **Technical context:** Current state, relevant patterns, gotchas
+- **Approach:** High-level steps if the path isn't obvious from scope
+
+Decision test for optional sections: "Would a fresh agent need more than
+the title to start working?"
+
+### Epic
+
+**Required:**
+- **Why this matters:** The motivation — what problem this initiative solves
+- **Core issues:** The concrete work items this epic tracks
+- **Phases:** [NOW] immediate / [SOON] next / [LATER] future (may change)
+
+**Optional** (include for architectural or multi-session epics):
+- **Design decisions:** Multiple "Why X over Y?" entries with rationale
+- **Success criteria:** How to know the initiative achieved its goal
+- **In scope / Out of scope:** Explicit boundaries to prevent drift
+- **Technical context:** Current state of the systems being changed
+
+Decision test for optional sections: "Could two agents disagree on whether
+this epic is complete or what it covers?"
 
 ### Chore
-Include when relevant: What + why now (not just "update deps" — state the reason,
-e.g., "because CVE-2026-xxxx affects production")
+
+**Required:**
+- **What:** The specific change being made
+- **Why now:** The trigger — not just "update deps" but "because CVE-2026-xxxx
+  affects production" or "because v3 drops support for our Node version"
+
+**Optional:**
+- **Scope:** What's included in this update if touching multiple things
 
 ### Examples
 
 [Generate one complete `bd create` command per type using the project's actual
 prefix and labels. Descriptions must be filled in with realistic content for this
-project, not placeholder text. These are the examples agents pattern-match from.]
+project, not placeholder text. These are the examples agents pattern-match from.
+Every required section must appear in each example. Show the density — concise
+but complete.]
 
 **Bug example:**
 ```
 bd create --title="[realistic bug title for this project]" --type=bug --priority=1 \
   --labels=area:[detected-area],ux \
-  --description="Observed: [specific behavior in this project's context]
+  --description="Observed: [specific behavior — what actually happens, with error
+messages or symptoms]
 
-Expected: [correct behavior]
+Expected: [what should happen instead — be precise]
 
 Steps to reproduce:
 1. [step using this project's actual commands/UI]
 2. [step]
+3. [observe: specific symptom]
 
-Environment: [relevant platform/browser/version]"
+Impact: [who/what is affected — users, other features, data integrity]"
 ```
 
 **Feature example:**
 ```
 bd create --title="[realistic feature for this project]" --type=feature --priority=2 \
   --labels=area:[detected-area] \
-  --description="Motivation: [why this matters for this project's users]
+  --description="Motivation: [why this matters — what problem it solves for users,
+not just 'it would be nice']
 
 Acceptance criteria:
-- [concrete criterion using this project's context]
+- [concrete, verifiable criterion using this project's context]
+- [concrete criterion — another agent could check this off]
 - [concrete criterion]
 
-Scope boundary: Does NOT include [explicit exclusion]"
+Scope boundary: Does NOT include [explicit exclusion — prevents scope creep]
+
+Design decision: [if applicable — 'Why X over Y? Because Z.' Saves future agents
+from re-evaluating alternatives you already considered]"
 ```
 
 **Task example:**
 ```
 bd create --title="[realistic task for this project]" --type=task --priority=2 \
   --labels=area:[detected-area] \
-  --description="Context: [why this task is needed now]
+  --description="Context: [why this task exists now — what triggered it, not just
+what needs doing]
 
-Scope: [what this covers]
+Scope: [what this covers — files, systems, boundaries]
 
-Done-when: [concrete completion signal]"
+Done-when: [concrete signal — 'tests pass' or 'command outputs X' or 'file
+contains Y', not 'it works']
+
+Key files: [paths to the files being modified, so the next agent knows where
+to look]"
 ```
 
 **Chore example:**
 ```
 bd create --title="[realistic chore for this project]" --type=chore --priority=3 \
   --labels=area:[detected-area] \
-  --description="Update [specific dependency] because [specific reason — CVE,
-breaking change in downstream, compatibility with new version of X].
+  --description="What: Update [specific dependency] from [version] to [version].
 
-Scope: [what's included in this update]"
+Why now: [specific trigger — CVE-2026-xxxx affects production, breaking change
+in downstream dependency, compatibility requirement for new version of X].
+
+Scope: [what's included — just the dep bump, or also migration of deprecated APIs]"
 ```
 
 **Epic example:**
 ```
 bd create --title="[realistic epic for this project]" --type=epic --priority=1 \
   --labels=area:epic \
-  --description="Context: [why this initiative exists]
+  --description="Why this matters: [the problem this initiative solves — grounded
+in user/project impact, not aspiration]
 
 Core Issues:
-- [issue 1]
-- [issue 2]
+- [concrete issue with brief description]
+- [concrete issue with brief description]
 
 Phases:
-[NOW] [immediate work]
+[NOW] [immediate work — what's being done first and why]
 [SOON] [next steps after NOW completes]
-[LATER] [future work, may change]
+[LATER] [future work, may change based on what NOW/SOON reveal]
 
 Key Decisions:
-- [decision with rationale]
+- [decision with rationale — 'Chose X because Y. Considered Z but rejected
+  because W.']
 
 Related: [prefix]-xxx, [prefix]-yyy"
 ```
@@ -626,6 +732,19 @@ Beads and Tasks serve different levels of the same workflow:
 | **Granularity** | Changelog-worthy changes | 1-3 files, completable in one focused stretch |
 | **Dependencies** | Full DAG (blocks, relates, parent-child) | Simple DAG (blockedBy/blocks) |
 
+### The lifecycle: descriptions → tasks → close reasons
+
+Descriptions, tasks, and close reasons form a connected workflow — not three
+separate concerns:
+
+1. **Description defines the work:** what to do, why it matters, scope
+2. **Tasks decompose the work:** how to implement, in what order
+3. **Close reason captures the outcome:** what tasks accomplished, what changed
+
+The close reason is richer when tasks tracked what happened during the session.
+Without tasks, the close reason has to reconstruct what happened from memory.
+With tasks, the completed task list becomes the skeleton of the close reason.
+
 ### The integration pattern
 
 1. **Find work:** `bd ready` → pick a bead
@@ -633,8 +752,8 @@ Beads and Tasks serve different levels of the same workflow:
 3. **Break it down:** read the bead description, create 3-7 Tasks referencing
    the bead ID in each task subject
 4. **Execute:** work through Tasks, mark each `completed` as you go
-5. **Close the bead:** `bd close <id> --reason="..."` — the close_reason
-   captures what the Tasks accomplished (handoff from execution to history)
+5. **Close the bead:** `bd close <id> --reason="..."` — summarize what the
+   Tasks accomplished. The task list feeds directly into Summary and Change.
 
 ### When to create Tasks for a bead
 
