@@ -32,6 +32,7 @@ pkg/
 .claude/worktrees/
 .claude/*.log
 .claude/*.lock
+.claude/handoff-*.md
 
 # Codex CLI - local marker
 .codex
