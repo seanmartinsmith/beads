@@ -34,6 +34,9 @@ pkg/
 .claude/*.lock
 .claude/handoff-*.md
 
+# Windows shell gotcha: `2>nul` creates a literal file here
+/nul
+
 # Codex CLI - local marker
 .codex
 

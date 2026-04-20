@@ -139,6 +139,64 @@ bd import .beads/issues.jsonl  # Sync Dolt database
 
 Or use the git hooks in `examples/git-hooks/` for automation.
 
+### Upstream Sync + Fork Contribution Workflow
+
+The local fork (`sms/beads`) stays aligned with upstream (`gastownhall/beads`, remote `origin`) via three rules. Follow them to keep `main` mergeable and PRs clean.
+
+**Rule 1 — `main` = upstream + narrow personal work**
+
+- Periodically `git fetch origin && git rebase origin/main`. Upstream commits pull in clean; any of your local commits that duplicate merged upstream work auto-drop via patch-id match.
+- Only two kinds of commits belong on local `main`:
+  - Work that will become an upstream PR (kept on `main` for daily builds; duplicate commits land again on a clean PR branch)
+  - Personal-only work that doesn't affect the `bd` binary (bead data updates, audit docs, local notes)
+- Never keep binary-affecting personal-only commits on `main`. If you need a local-only binary change, put it on a dedicated `personal/*` branch.
+
+**Rule 2 — PR branches come off `origin/main`, never off local `main`**
+
+```bash
+git fetch origin
+git checkout -b fix/N-description origin/main
+# work, commit
+git push sms fix/N-description
+gh pr create --repo gastownhall/beads --base main --head seanmartinsmith:fix/N-description
+```
+
+This guarantees the PR diff contains only your change — no `.claude/` files, no `nul`, no handoff docs, no unrelated local-main commits. Required for every contribution.
+
+**Rule 3 — Backup before rebasing**
+
+Before `git rebase origin/main` on `main`:
+
+```bash
+git tag backup/pre-upstream-sync HEAD              # rollback insurance
+git worktree add ../beads-rebase -b rebase/upstream-sync HEAD
+cd ../beads-rebase && git rebase origin/main        # rebase in isolation
+# verify: make install-force && full test sweep
+cd ../beads && git reset --hard rebase/upstream-sync
+git worktree remove ../beads-rebase
+git branch -d rebase/upstream-sync
+git push sms main                                   # push backup after verify
+```
+
+The `sms/main` remote is a backup of local `main`, never a PR source. PRs always come from purpose-built feature branches as in Rule 2.
+
+**Install after divergence**
+
+Once `main` is ahead of `origin/main` (because of personal commits or pre-merge PR work), `make install` will block via `check-up-to-date`. Use `make install-force`. See `bd memories install-flow` for project install conventions.
+
+### Title Conventions for Agent Efficacy
+
+Full rules live in `.beads/conventions/reference.md`. Short version:
+
+**Titles carry triage signal. Descriptions are the drill target.**
+
+Agent workflow is `scan → drill → act`. A well-formed title lets an agent decide "drill or skip" from the `bd ready` / `bd list` view alone — no need to open the body. A well-formed description structures the drill target by type (Problem / Root Cause / Fix / Test Plan / Acceptance Criteria for bugs; Problem / Context / Proposed Fix / Acceptance / Scope Guards for features).
+
+Pattern: `<scope>: <verb> <subject> [qualifier]`
+
+Good: `bug: bd gate create rejects 'gate' as invalid issue type`, `upstream: extend session tracking to create and claim events`
+Bad: `Fix bug`, `Update file X`, `Refactor` — no scope, no subject, no purpose.
+
 ## Current Project Status
 
 Run `bd stats` to see overall progress.
