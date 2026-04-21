@@ -14,10 +14,13 @@ import (
 )
 
 // ClaimIssue atomically claims an issue using compare-and-swap semantics.
+// The session parameter records the claiming Claude Code session in
+// claimed_by_session (overwritten on re-claim). Empty string records
+// no session.
 // Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
-func (s *EmbeddedDoltStore) ClaimIssue(ctx context.Context, id string, actor string) error {
+func (s *EmbeddedDoltStore) ClaimIssue(ctx context.Context, id string, actor, session string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		_, err := issueops.ClaimIssueInTx(ctx, tx, id, actor)
+		_, err := issueops.ClaimIssueInTx(ctx, tx, id, actor, session)
 		return err
 	})
 }
