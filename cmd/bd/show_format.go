@@ -246,6 +246,9 @@ func formatIssueLongExtras(issue *types.Issue, formatTime func(time.Time) string
 	if issue.CreatedBySession != "" {
 		closeParts = append(closeParts, fmt.Sprintf("  Created by session: %s", issue.CreatedBySession))
 	}
+	if issue.ClaimedBySession != "" {
+		closeParts = append(closeParts, fmt.Sprintf("  Claimed by session: %s", issue.ClaimedBySession))
+	}
 	if issue.ClosedAt != nil {
 		closeParts = append(closeParts, fmt.Sprintf("  Closed at: %s", formatTime(*issue.ClosedAt)))
 	}

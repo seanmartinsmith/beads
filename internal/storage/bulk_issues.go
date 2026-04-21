@@ -12,7 +12,7 @@ type BulkIssueStore interface {
 	DeleteIssues(ctx context.Context, ids []string, cascade bool, force bool, dryRun bool) (*types.DeleteIssuesResult, error)
 	DeleteIssuesBySourceRepo(ctx context.Context, sourceRepo string) (int, error)
 	UpdateIssueID(ctx context.Context, oldID, newID string, issue *types.Issue, actor string) error
-	ClaimIssue(ctx context.Context, id string, actor string) error
+	ClaimIssue(ctx context.Context, id string, actor, session string) error
 	PromoteFromEphemeral(ctx context.Context, id string, actor string) error
 	GetNextChildID(ctx context.Context, parentID string) (string, error)
 	RenameCounterPrefix(ctx context.Context, oldPrefix, newPrefix string) error

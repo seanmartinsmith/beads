@@ -231,7 +231,7 @@ create, update, show, or close operation).`,
 				fmt.Fprintf(os.Stderr, "Warning: could not get ready issues: %v\n", err)
 			} else if len(readyIssues) > 0 {
 				nextIssue := readyIssues[0]
-				err := store.ClaimIssue(ctx, nextIssue.ID, actor)
+				err := store.ClaimIssue(ctx, nextIssue.ID, actor, session)
 				if err == nil {
 					claimedNextIssue = nextIssue
 					if jsonOutput {
