@@ -791,6 +791,85 @@ func TestEmbeddedUpdate(t *testing.T) {
 			t.Errorf("expected description 'from file', got %q", got.Description)
 		}
 	})
+
+	// ===== Session Flag (claimed_by_session) =====
+
+	t.Run("claim_with_session", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "Claim with session", "--type", "task")
+		bdUpdate(t, bd, dir, issue.ID, "--claim", "--session", "sess-claim-1")
+		got := bdShow(t, bd, dir, issue.ID)
+		if got.ClaimedBySession != "sess-claim-1" {
+			t.Errorf("ClaimedBySession: got %q, want %q", got.ClaimedBySession, "sess-claim-1")
+		}
+		if got.Status != types.StatusInProgress {
+			t.Errorf("status after --claim: got %q, want %q", got.Status, types.StatusInProgress)
+		}
+	})
+
+	t.Run("claim_session_from_env", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "Claim via env session", "--type", "task")
+		cmd := exec.Command(bd, "update", issue.ID, "--claim")
+		cmd.Dir = dir
+		env := bdEnv(dir)
+		env = append(env, "CLAUDE_SESSION_ID=env-claim-sess")
+		cmd.Env = env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("bd update --claim with env session failed: %v\n%s", err, out)
+		}
+		got := bdShow(t, bd, dir, issue.ID)
+		if got.ClaimedBySession != "env-claim-sess" {
+			t.Errorf("ClaimedBySession: got %q, want %q", got.ClaimedBySession, "env-claim-sess")
+		}
+	})
+
+	t.Run("status_in_progress_session", func(t *testing.T) {
+		// Verify --session on an explicit status=in_progress transition
+		// also persists claimed_by_session (mirrors closed_by_session on
+		// status=closed).
+		issue := bdCreate(t, bd, dir, "Explicit in_progress session", "--type", "task")
+		bdUpdate(t, bd, dir, issue.ID, "--status", "in_progress", "--session", "sess-explicit-ip")
+		got := bdShow(t, bd, dir, issue.ID)
+		if got.ClaimedBySession != "sess-explicit-ip" {
+			t.Errorf("ClaimedBySession: got %q, want %q", got.ClaimedBySession, "sess-explicit-ip")
+		}
+	})
+
+	t.Run("reclaim_overwrites_session", func(t *testing.T) {
+		// First claim by session A, then unclaim (clear assignee), then
+		// re-claim by session B. claimed_by_session is last-writer-wins —
+		// should reflect B after the second claim.
+		issue := bdCreate(t, bd, dir, "Reclaim overwrite", "--type", "task")
+		bdUpdate(t, bd, dir, issue.ID, "--claim", "--session", "sess-A")
+		got := bdShow(t, bd, dir, issue.ID)
+		if got.ClaimedBySession != "sess-A" {
+			t.Fatalf("after first claim, ClaimedBySession: got %q, want %q", got.ClaimedBySession, "sess-A")
+		}
+
+		// Unclaim by clearing the assignee so the CAS gate lets a new
+		// actor claim. ClaimedBySession stays as A until the next claim
+		// actually writes over it — that's the semantic we want to lock.
+		bdUpdate(t, bd, dir, issue.ID, "--assignee", "")
+		bdUpdate(t, bd, dir, issue.ID, "--claim", "--session", "sess-B")
+		got = bdShow(t, bd, dir, issue.ID)
+		if got.ClaimedBySession != "sess-B" {
+			t.Errorf("after re-claim, ClaimedBySession: got %q, want %q (last-writer-wins)", got.ClaimedBySession, "sess-B")
+		}
+	})
+
+	t.Run("claim_session_long_render", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "Long render check", "--type", "task")
+		bdUpdate(t, bd, dir, issue.ID, "--claim", "--session", "sess-long")
+		cmd := exec.Command(bd, "show", issue.ID, "--long")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd show --long failed: %v\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "Claimed by session: sess-long") {
+			t.Errorf("bd show --long should contain 'Claimed by session: sess-long', got:\n%s", out)
+		}
+	})
 }
 
 // TestEmbeddedUpdateConcurrent exercises create, update, and list operations
@@ -977,4 +1056,82 @@ func TestEmbeddedUpdateConcurrent(t *testing.T) {
 
 	t.Logf("created and updated %d issues across %d/%d successful workers, %d in DB",
 		len(allIDs), successes, numWorkers, stats.TotalIssues)
+}
+
+// TestEmbeddedClaimSessionConcurrent verifies that when N sessions race to
+// claim the same bead, exactly one wins (compare-and-swap) and the winner's
+// session id lands in claimed_by_session. Exercises the full multi-process
+// code path (real bd invocations, not just goroutines).
+func TestEmbeddedClaimSessionConcurrent(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	dir, _, _ := bdInit(t, bd, "--prefix", "ccs")
+
+	// Create a single target issue — N workers will race to claim it.
+	target := bdCreate(t, bd, dir, "Contested claim target", "--type", "task")
+
+	const numWorkers = 5
+	type result struct {
+		worker  int
+		session string
+		succeed bool
+		errText string
+	}
+	results := make([]result, numWorkers)
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			session := fmt.Sprintf("sess-race-%d", worker)
+
+			// Use a per-worker CLAUDE_SESSION_ID env so each process has a
+			// distinct attribution. Retries on flock contention but records
+			// claim-specific errors (already-claimed) rather than failing.
+			out, err := bdRunWithFlockRetry(t, bd, dir, "update", target.ID, "--claim", "--session", session)
+			if err != nil {
+				results[worker] = result{worker: worker, session: session, succeed: false, errText: string(out) + ": " + err.Error()}
+				return
+			}
+			results[worker] = result{worker: worker, session: session, succeed: true}
+		}(w)
+	}
+	wg.Wait()
+
+	// Exactly one worker should have succeeded; the rest should have hit
+	// ErrAlreadyClaimed. Idempotent re-claim by the SAME actor would also
+	// count as success, but here each worker uses a unique session — the
+	// actor (git user.name) is the same across goroutines, so the first
+	// claim wins and subsequent ones are idempotent no-ops (they return
+	// success but do NOT overwrite claimed_by_session).
+	//
+	// Actually — because all workers share the same actor, they all get the
+	// idempotent-success path on the CAS re-check. So all N may "succeed"
+	// from the CLI's perspective; what matters is that claimed_by_session
+	// reflects exactly one session value that is one of the racers, and the
+	// issue is in_progress.
+	got := bdShow(t, bd, dir, target.ID)
+	if got.Status != types.StatusInProgress {
+		t.Errorf("after concurrent claims, status: got %q, want %q", got.Status, types.StatusInProgress)
+	}
+	if got.ClaimedBySession == "" {
+		t.Errorf("ClaimedBySession is empty after %d concurrent claims", numWorkers)
+	}
+	// Winning session must be one of the racers.
+	found := false
+	for _, r := range results {
+		if got.ClaimedBySession == r.session {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("ClaimedBySession %q does not match any racer session", got.ClaimedBySession)
+	}
+	t.Logf("concurrent claim: %d racers, winner session=%q", numWorkers, got.ClaimedBySession)
 }

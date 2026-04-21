@@ -62,14 +62,22 @@ create, update, show, or close operation).`,
 			}
 			updates["status"] = status
 
-			// If status is being set to closed, include session if provided
-			if status == "closed" {
+			// Capture --session / $CLAUDE_SESSION_ID on the lifecycle
+			// transitions that have dedicated attribution columns:
+			//   status=closed       -> closed_by_session
+			//   status=in_progress  -> claimed_by_session (overwrites on re-claim)
+			if status == "closed" || status == "in_progress" {
 				session, _ := cmd.Flags().GetString("session")
 				if session == "" {
 					session = os.Getenv("CLAUDE_SESSION_ID")
 				}
 				if session != "" {
-					updates["closed_by_session"] = session
+					switch status {
+					case "closed":
+						updates["closed_by_session"] = session
+					case "in_progress":
+						updates["claimed_by_session"] = session
+					}
 				}
 			}
 		}
@@ -314,7 +322,13 @@ create, update, show, or close operation).`,
 
 			// Handle claim operation atomically using compare-and-swap semantics
 			if claimFlag {
-				if err := issueStore.ClaimIssue(ctx, result.ResolvedID, actor); err != nil {
+				// Capture the current session so --claim persists
+				// claimed_by_session alongside the CAS-based claim.
+				claimSession, _ := cmd.Flags().GetString("session")
+				if claimSession == "" {
+					claimSession = os.Getenv("CLAUDE_SESSION_ID")
+				}
+				if err := issueStore.ClaimIssue(ctx, result.ResolvedID, actor, claimSession); err != nil {
 					fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
 					result.Close()
 					continue
@@ -604,7 +618,7 @@ func init() {
 	updateCmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
 	updateCmd.Flags().String("parent", "", "New parent issue ID (reparents the issue, use empty string to remove parent)")
 	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)")
-	updateCmd.Flags().String("session", "", "Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID env var)")
+	updateCmd.Flags().String("session", "", "Claude Code session ID for --claim, status=in_progress, or status=closed transitions (or set CLAUDE_SESSION_ID env var)")
 	// Time-based scheduling flags (GH#820)
 	// Examples:
 	//   --due=+6h           Due in 6 hours

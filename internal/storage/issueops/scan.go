@@ -13,7 +13,7 @@ import (
 // use this constant to avoid column-list drift between scan sites.
 const IssueSelectColumns = `id, content_hash, title, description, design, acceptance_criteria, notes,
 	       status, priority, issue_type, assignee, estimated_minutes,
-	       created_at, created_by, created_by_session, owner, updated_at, started_at, closed_at, external_ref, spec_id,
+	       created_at, created_by, created_by_session, owner, updated_at, started_at, claimed_by_session, closed_at, external_ref, spec_id,
 	       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason, closed_by_session,
 	       sender, ephemeral, no_history, wisp_type, pinned, is_template,
 	       await_type, await_id, timeout_ns, waiters,
@@ -36,7 +36,7 @@ func ScanIssueFrom(s IssueScanner) (*types.Issue, error) {
 	var createdAtStr, updatedAtStr sql.NullString // TEXT columns - must parse manually
 	var startedAt, closedAt, compactedAt, dueAt, deferUntil sql.NullTime
 	var estimatedMinutes, originalSize, timeoutNs sql.NullInt64
-	var createdBy, createdBySession sql.NullString
+	var createdBy, createdBySession, claimedBySession sql.NullString
 	var assignee, externalRef, specID, compactedAtCommit, owner sql.NullString
 	var contentHash, sourceRepo, closeReason, closedBySession sql.NullString
 	var workType, sourceSystem sql.NullString
@@ -49,7 +49,7 @@ func ScanIssueFrom(s IssueScanner) (*types.Issue, error) {
 		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&createdAtStr, &createdBy, &createdBySession, &owner, &updatedAtStr, &startedAt, &closedAt, &externalRef, &specID,
+		&createdAtStr, &createdBy, &createdBySession, &owner, &updatedAtStr, &startedAt, &claimedBySession, &closedAt, &externalRef, &specID,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason, &closedBySession,
 		&sender, &ephemeral, &noHistory, &wispType, &pinned, &isTemplate,
 		&awaitType, &awaitID, &timeoutNs, &waiters,
@@ -91,6 +91,9 @@ func ScanIssueFrom(s IssueScanner) (*types.Issue, error) {
 	}
 	if createdBySession.Valid {
 		issue.CreatedBySession = createdBySession.String
+	}
+	if claimedBySession.Valid {
+		issue.ClaimedBySession = claimedBySession.String
 	}
 	if closedBySession.Valid {
 		issue.ClosedBySession = closedBySession.String

@@ -191,13 +191,15 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 // ClaimIssue atomically claims an issue using compare-and-swap semantics.
 // It sets the assignee to actor and status to "in_progress" only if the issue
 // currently has no assignee. Returns storage.ErrAlreadyClaimed if already claimed.
+// The session parameter records the claiming Claude Code session in
+// claimed_by_session (overwritten on re-claim). Empty string records no session.
 // Delegates SQL work to issueops.ClaimIssueInTx; handles Dolt-specific concerns
 // (wisp routing, DOLT_ADD/COMMIT, cache invalidation).
-func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) error {
+func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor, session string) error {
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
 	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
 	if s.isActiveWisp(ctx, id) {
-		return s.claimWisp(ctx, id, actor)
+		return s.claimWisp(ctx, id, actor, session)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -206,7 +208,7 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
+	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor, session); err != nil {
 		return err
 	}
 

@@ -41,7 +41,8 @@ type Issue struct {
 	CreatedBy        string     `json:"created_by,omitempty"`         // Who created this issue (GH#748)
 	CreatedBySession string     `json:"created_by_session,omitempty"` // Claude Code session that created this issue
 	UpdatedAt        time.Time  `json:"updated_at"`
-	StartedAt        *time.Time `json:"started_at,omitempty"` // When this issue transitioned to in_progress (GH#2796)
+	StartedAt        *time.Time `json:"started_at,omitempty"`         // When this issue transitioned to in_progress (GH#2796)
+	ClaimedBySession string     `json:"claimed_by_session,omitempty"` // Claude Code session that currently holds this issue (last-writer-wins on re-claim)
 	ClosedAt         *time.Time `json:"closed_at,omitempty"`
 	CloseReason      string     `json:"close_reason,omitempty"`      // Reason provided when closing
 	ClosedBySession  string     `json:"closed_by_session,omitempty"` // Claude Code session that closed this issue
