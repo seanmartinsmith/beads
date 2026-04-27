@@ -32,20 +32,24 @@ Examples:
 			FatalErrorRespectJSON("failed to get history: %v", err)
 		}
 
-		// Apply limit if specified
+		// Empty-history short-circuit handles both formats: --json gets []
+		// (so consumers piping to jq don't break), human format gets prose.
+		if len(history) == 0 {
+			if jsonOutput {
+				outputJSON(history)
+				return
+			}
+			fmt.Printf("No history found for issue %s\n", issueID)
+			return
+		}
+
+		// Apply limit only to non-empty history; slicing an empty slice is a no-op.
 		if historyLimit > 0 && historyLimit < len(history) {
 			history = history[:historyLimit]
 		}
 
-		// Honor --json before the empty-history early-return so consumers
-		// always get valid JSON ([]) regardless of whether history exists.
 		if jsonOutput {
 			outputJSON(history)
-			return
-		}
-
-		if len(history) == 0 {
-			fmt.Printf("No history found for issue %s\n", issueID)
 			return
 		}
 

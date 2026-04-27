@@ -189,6 +189,27 @@ func TestEmbeddedHistory(t *testing.T) {
 		}
 	})
 
+	// --limit combined with --json on empty history must still produce [].
+	// Guards against future reordering that might apply limit semantics
+	// before the empty-check and skip the JSON branch.
+	t.Run("nonexistent_issue_json_with_limit_returns_empty_array", func(t *testing.T) {
+		cmd := exec.Command(bd, "history", "--json", "--limit", "2", "hi-nonexistent999")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd history --json --limit 2 failed: %v\n%s", err, out)
+		}
+		s := strings.TrimSpace(string(out))
+		var entries []map[string]interface{}
+		if err := json.Unmarshal([]byte(s), &entries); err != nil {
+			t.Fatalf("expected valid JSON for empty history with --limit, got prose:\n%s\n(parse error: %v)", s, err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("expected empty array for nonexistent issue with --limit, got %d entries", len(entries))
+		}
+	})
+
 	// ===== Wrong number of args =====
 
 	t.Run("no_args_fails", func(t *testing.T) {
