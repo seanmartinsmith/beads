@@ -1,6 +1,6 @@
 # session attribution: PR1 strategy + reply for #3583
 
-> **Status**: design complete; paused pending Gas City compatibility audit before reply post + plan writing.
+> **Status**: design + audits complete; ready to post reply.
 > **Scope**: how we respond on gastownhall/beads#3583, what PR1 commits to architecturally, and what we defer.
 > **Companion beads**: `bd-edi` (execution), `bd-xdc` (decision record), `bt-edi` (paired bt-side hygiene followup).
 
@@ -14,18 +14,21 @@ You are picking up mid-handoff between strategy alignment and PR1 implementation
 3. GH issue `#3583` filed 2026-04-28 with events-table proposal, both phasing alternatives, @maphew tagged
 4. Both maintainers replied 2026-05-01 (maphew 20:58 UTC; coffeegoddd 22:18 UTC)
 5. This design doc captures: maintainer cognition map, three-layer scope split, three architectural fork resolutions, draft reply text, bd-edi comment text
+6. **Gas City + Gas Town local audits complete 2026-05-03** — both LOW risk, two new constraints surfaced (see "audit findings" section); wasteland transitively covered (no direct bd coupling)
 
 **Pending:**
-- Reply on `#3583` not posted (draft below in "draft reply text" section)
-- bd-edi bead comment not added (text below in "bd-edi comment to add" section)
-- Gas City clone + compatibility audit (sms doing in parallel — see "parallel work" section)
-- PR1 implementation plan not written (depends on Gas City audit outcome)
+- Reply on `#3583` not posted (draft below in "draft reply text" section, updated with audit findings)
+- Final bd-edi bead comment with post-audit state (text below)
+- PR1 implementation plan not written (next session, via `superpowers:writing-plans`)
 
-**Your job:**
+**Your job (next session):**
 1. Read this doc end-to-end before doing anything
-2. Check Gas City audit findings — look for bd-edi comments dated after 2026-05-01, or `bd show bd-edi` for status
-3. If audit clean (no surprising coupling): invoke `superpowers:writing-plans` to convert this design into the executable PR1 plan, then post the draft reply, then add the bd-edi comment, then proceed
-4. If audit surfaced real coupling: revise the "PR1 architectural commitments" section below in light of findings, get user re-approval, *then* write the plan
+2. Confirm reply has been posted (check `gh issue view 3583 --comments`); if not, post the draft from "draft reply text" section
+3. Confirm post-audit bd-edi comment is added; if not, add it from the "bd-edi comment to add" section
+4. Invoke `superpowers:writing-plans` to convert this design (incl. audit findings) into the executable PR1 plan. Plan must respect:
+   - Migration idempotency (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS session VARCHAR(255)` — Gas Town independently CREATEs `wisp_events`)
+   - Derived `closed_by_session` view tolerates "closed but no event" (Gas Town reaper bypasses bd.CloseIssue)
+   - bd v1.x semver — Gas Town pins `v1.0.0`; PR1 ships as `v1.1.0` (additive struct fields are minor)
 
 **Where everything lives:**
 - This doc: `docs/superpowers/specs/2026-05-01-session-attribution-pr1-strategy-design.md`
@@ -70,6 +73,59 @@ dustin's "would break Gas City" reaction is to layer 3 (his words: "a new issue 
 
 dustin's Discord guidance — "we are not looking to extend the surface area of beads anymore" — is a constraint we can echo back. layer 1 is surface stabilization (finishing `closed_by_session`, which is already partially shipped). layer 2 is surface expansion. dustin himself sketched layer 2 in Discord then flagged "this approach is a bit more work also." he gave us permission to defer layer 2 in his own framing.
 
+## audit findings (2026-05-03, both Gas City + Gas Town local audits)
+
+Reports at:
+- `.beads/tmp/audit-gascity-bd-coupling-2026-05-03.md`
+- `.beads/tmp/audit-gastown-bd-coupling-2026-05-03.md`
+
+**Both LOW risk — PR1 hypothesis "strictly additive" confirmed.**
+
+### Gas City — fully clean
+
+- Zero coupling to `events` / `wisp_events` tables (no SQL, no struct imports, no CLI surface)
+- `closed_by_session` is unread anywhere (zero matches across all file types)
+- No bd Go-type imports — Gas City has its own `internal/beads/` subset structs; `encoding/json` ignores unknown fields
+- No `--session` flag usage today (future opt-in opportunity, not a PR1 requirement)
+- Direct SQL surfaces: `internal/api/convoy_sql.go` (issues/dependencies/labels, explicit column projections, no `SELECT *`); `examples/.../reaper.sh` (wisps/mail/config writes); one `SELECT * FROM issues` in `jsonl-export.sh` writes name-keyed JSON (additive-tolerant)
+- **PR1 effect on Gas City: none. No code changes required to absorb migration.**
+
+### Gas Town — clean read paths, two new constraints PR1 must respect
+
+- Deep coupling: imports `github.com/steveyegge/beads@v1.0.0` in 30+ files; 206 `bd` CLI invocations; raw SQL via `bd sql` and direct MySQL connection (gt Dolt server, port 3307)
+- BUT: zero reads of `*_by_session` columns. Single occurrence (`internal/doltserver/wisps_migrate.go:369`) is a column declaration in Gas Town's own wisps DDL, never read or written
+- BUT: zero reads of bd `Event.Actor` from any production code path; the `Event` fields Gas Town actually consumes are `EventType`, `NewValue`, `OldValue`, `CreatedAt`, `ID`, `IssueID`
+- BUT: `Storage.CloseIssue(ctx, id, reason, actor, session)` — Gas Town already passes session as 5th arg; signature unchanged in PR1
+
+**Constraint A: migration must be idempotent.** Gas Town independently CREATEs `wisp_events` on its own Dolt server (`internal/doltserver/wisps_migrate.go:444-457`) without a `session` column. If bd's PR1 migration uses bare `ALTER TABLE ... ADD COLUMN`, it fails when the table pre-exists from Gas Town's path. **Required**: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS session VARCHAR(255)` (or column-existence check).
+
+**Constraint B: derived `closed_by_session` view must tolerate "closed but no event".** Gas Town's reaper (`internal/reaper/reaper.go:670-678`) closes stale issues via raw `UPDATE issues SET status='closed', closed_at=NOW(), close_reason=...` — bypasses `bd.CloseIssue`, so no `closed` row lands in `events`. PR1's derived view must return empty/NULL for these issues, not error. Matches today's behavior (current `closed_by_session` column is empty for reaper-closed issues anyway), so it's not a regression — just a constraint the view definition must honor.
+
+**Forward-looking (post-PR1, Gas Town side, not PR1-blocking):**
+- Add `session` to wisp_events DDL (one-line change) so fresh installs match
+- Add `session` to wisp_events INSERT column lists (data-fidelity for migrated agent beads)
+- Update or delete the stale code-comment references at `internal/beads/beads.go:1545,1568` (point to non-existent `decision 009-session-events-architecture.md`)
+
+### Decision doc `009-session-events-architecture.md` — does not exist
+
+Confirmed across Gas Town, Gas City, and beads itself. Two stale code-comment references in Gas Town point at a doc that was never written. The decision content lives in `bd-xdc` (and the strategy spec itself). Optional follow-up: write a real `docs/adr/0003-session-events-architecture.md` in beads post-PR1 and update Gas Town's stale comments.
+
+### Wasteland — transitively covered
+
+`gh search code` against `gastownhall/wasteland` (federation protocol for Gas Towns):
+- No `github.com/steveyegge/beads` import
+- No `closed_by_session` / `wisp_events` references
+- No `FROM events` / `FROM wisps` / `FROM issues` queries
+- No `exec.Command("bd"...)` shellouts
+
+Wasteland's Dolt interactions are wasteland-internal (federation transport), not bd-coupling. Any bd schema risk affecting wasteland flows through Gas Town first, which is clean.
+
+### YAGNI opt-out flag — pulled from PR1
+
+The `core.capture-session: false` config flag had zero use case in either Gas City or Gas Town. Audit confirms YAGNI flag was correct. **Removed from PR1 acceptance criteria** below.
+
+---
+
 ## PR1 architectural commitments
 
 **Fork 1: multi-writer wiring → distributed.**
@@ -102,17 +158,38 @@ dustin's Discord guidance — "we are not looking to extend the surface area of 
 
 > Note: maphew's claim about multiple direct event-insert paths in current main (create/close helpers, labels, comments, transaction comments, rename, promote/demote, bulk ops) is the empirical source for this commitment. We trust it pending our own audit during plan-writing in the next session — that audit produces the canonical call-site list for the plan.
 
+**Fork 4: migration idempotency (audit-derived).**
+
+- migration uses `ALTER TABLE ... ADD COLUMN IF NOT EXISTS session VARCHAR(255)` (or equivalent column-existence pre-check)
+- reason: Gas Town independently CREATEs `wisp_events` on its own Dolt server before bd's migration runs against that instance; bare `ADD COLUMN` would fail
+- migration must be re-runnable across mixed substrate states
+- acceptance test: run migration twice on a Dolt instance pre-seeded with Gas-Town-style `wisp_events` (no `session` column) — second run is a no-op, not an error
+
+**Fork 5: derived view tolerates "closed but no event" (audit-derived).**
+
+- bd's derived `closed_by_session` lookup must return empty/NULL for issues with `closed_at IS NOT NULL` but no corresponding `closed` event row
+- reason: Gas Town's reaper (`internal/reaper/reaper.go:670-678`) closes stale issues via raw `UPDATE issues SET status='closed', closed_at=NOW()` — bypasses `bd.CloseIssue`, no `closed` event written
+- pre-PR1 behavior: `closed_by_session` column is empty for reaper-closed issues today, so this is preserving existing semantics, not introducing new behavior
+- acceptance test: insert issue with `status='closed', closed_at=NOW()` directly (no event); `bd show --json` returns `closed_by_session: ""` or null, no error
+
 ## what's in PR1
 
-- migration: nullable `session VARCHAR(255)` on `events` + `wisp_events`
+- migration: nullable `session VARCHAR(255)` on `events` + `wisp_events`, **idempotent** (`IF NOT EXISTS`)
 - distributed wiring through every call site that records an event
 - session resolution at cmd/bd layer: `--session > BEADS_SESSION_ID > CLAUDE_SESSION_ID > empty`
-- opt-out via `core.capture-session: false` config flag (default true) — *flagged YAGNI in doc-review; defer decision pending Gas City audit, see "open questions deferred" below*
 - `closed_by_session` preserved with events as source of truth; legacy field names computed at read time; `bd show --json` field shape bit-identical
-- tests: every event type captures session; both tables parity; previously-gapped `bd ready --claim` covered; env precedence; opt-out (if flag stays in scope)
+- derived view tolerates "closed but no event" (returns empty/NULL, doesn't error)
+- tests:
+  - every event type captures session
+  - both `events` and `wisp_events` parity
+  - previously-gapped `bd ready --claim` path captures session
+  - env precedence: `--session > BEADS_SESSION_ID > CLAUDE_SESSION_ID > empty`
+  - migration re-run on Gas-Town-style `wisp_events` (no `session` column) is a no-op
+  - issue with `closed_at` but no closed event yields empty `closed_by_session` (no error)
 - docs: CLAUDE.md cross-project provenance section updated to reflect substrate change while keeping interface-stable field names
+- semver: ships as `v1.1.0` (additive struct fields are minor); Gas Town pins `v1.0.0`, picks up cleanly via `go get -u`
 
-> **Migration safety note**: sms operates against a populated shared Dolt server. Plan-writing session should include a pre-merge migration probe step (run on a snapshot, confirm no Dolt-specific drift class issues; cf. `bd-y5f` historical drift incident). Adding a nullable column is the safe class of migration, but Dolt has surprised us before.
+> **Migration safety note**: sms operates against a populated shared Dolt server. Plan-writing session should include a pre-merge migration probe step (run on a snapshot, confirm no Dolt-specific drift class issues; cf. `bd-y5f` historical drift incident). Adding a nullable column with `IF NOT EXISTS` is the safe class of migration, but Dolt has surprised us before.
 
 ## explicit non-goals for PR1
 
@@ -124,6 +201,9 @@ dustin's Discord guidance — "we are not looking to extend the surface area of 
 - `bd list --session` filter / `bd stats --group-by=session`
 - backfilling pre-existing events with session
 - cross-connector session translation (Cursor/Codex/Cline → BEADS_SESSION_ID)
+- ~~opt-out flag (`core.capture-session: false`)~~ — pulled per audit findings (no use case in either Gas City or Gas Town); env-absence already satisfies opt-out
+- Gas Town `wisp_events` DDL update / INSERT-list updates — separate Gas-Town-side PR after PR1 merges
+- ADR file `docs/adr/0003-session-events-architecture.md` — optional follow-up to formalize the decision content (currently in `bd-xdc`)
 
 each is its own concern in its own PR or issue.
 
@@ -141,72 +221,117 @@ four moves, in order:
 ```
 thanks both for the detailed reads.
 
-quick re-anchor before specifics: the Discord conversation that shaped
-this issue (dolt #beads, 4/28) was explicitly framed around dustin's
-"we are not looking to extend the surface area of beads anymore"
-guidance. PR1 here is about stabilizing an existing surface, not
-extending one — closed_by_session has been on the issues table since
-b362b3682 / decision 009-session-events-architecture.md, but only one
-of three lifecycle events captures session today. that's what #3578
-made painful (bd ready --claim silently un-attributed) and what this
-proposal is trying to finish, not introduce.
+quick re-anchor before specifics: PR1 is about stabilizing an existing
+surface, not extending one — closed_by_session has been on the issues
+table since b362b3682, but only one of three lifecycle events captures
+session today. #3578 (bd ready --claim silently un-attributed) helped
+me identify closed_by_session was on the issues table and my Discord
+conversation with @coffeegoddd helped me shape the scope. but, this
+proposal is trying to correct existing architecture, not introduce any
+new features.
 
-@maphew — appreciate the detailed read, and thanks for the prior
-review on #3401/#3405. you're right that "single wire-up at
-RecordFullEventInTable" was sloppy framing on my part. concrete
+before getting into specifics: i ran local audits on Gas City and Gas
+Town to verify the "strictly additive" claim against real downstream
+code, plus a code-search probe on wasteland (federation protocol).
+both Gas City and Gas Town came back LOW risk; wasteland has no
+direct bd coupling. detailed findings + new constraints below.
+
+@maphew — thanks for the detailed read + the prior review on
+#3401/#3405. "single wire-up at RecordFullEventInTable" was sloppy
+framing on my part; the multi-writer surface is real. concrete
 answers:
 
-- multi-writer surface: distributed wiring. pass `session` through
-  every event writer signature; no centralization refactor in PR1.
-  centralizing event insertion would be a feature-driven architectural
-  change, which contradicts the "stabilize existing surface" framing.
-  if a natural chokepoint emerges during implementation i'll surface
-  it for discussion before refactoring rather than pre-deciding.
-- wisp_events parity: caught, adding to acceptance criteria. migration
-  covers both tables, schema parity tests for both, every event writer
-  family updates regardless of target table.
-- closed_by_session disposition: lean keep-as-view (computed from
-  events at read time) over cache (denormalize back to issues). cache
-  reintroduces the source-of-truth ambiguity we're trying to escape;
-  the view approach keeps events as the single source. JOIN cost on an
-  indexed events table is trivial. fine to revisit if a hot-path read
-  need shows up later, but PR1 ships with events as the source of
-  truth and the legacy field names preserved by read-time
-  computation.
+- multi-writer surface: distributed wiring. `session` threaded
+  through every call site that records an event; no centralization
+  refactor in PR1 — that's a feature-driven architectural change
+  that contradicts the "stabilize existing surface" framing. if a
+  natural chokepoint emerges during implementation (5+ writers
+  gaining the same parameter via the same intermediate function),
+  i'll surface it for discussion before refactoring.
+- wisp_events parity: in acceptance criteria. migration covers both
+  tables, schema parity tests on both, every writer family updates
+  regardless of target table.
+- closed_by_session disposition: keep-as-view over cache. cache
+  reintroduces the source-of-truth ambiguity we're trying to
+  escape; view keeps events as the single source, JOIN cost trivial
+  on an indexed events table. bd show --json output bit-identical.
 
-@coffeegoddd — re-reading my own issue title, i think the "normalized
-identity + sessions design" phrasing landed wrong. the actual PR1
-proposal is much smaller than that suggests:
+@coffeegoddd — the "normalized identity + sessions design" phrasing
+in the issue title oversold the proposal. PR1 is much smaller:
 
 - add nullable `session VARCHAR(255)` to events and wisp_events
 - no new tables
-- no claim-mechanics changes (your "new issue claims system" concern —
-  claim semantics from #3578 are unchanged; we're only adding capture
-  of WHO claimed in WHICH session, parallel to the existing actor
-  capture)
+- no claim-mechanics changes — claim semantics from #3578 are
+  unchanged; we're only adding capture of WHO claimed in WHICH
+  session, parallel to the existing actor capture
 
-the identities + sessions tables you sketched in Discord (4/28
-4:47 PM) is real and likely the right layer-2 destination, but you
-flagged it there as "this approach is a bit more work" — i agree, and
-i think it benefits from your direct involvement on identity lifecycle
-semantics + Gas City sign-off rather than rolling into PR1. happy to
-file a separate issue for that under your lead when the timing's
-right.
+the identities + sessions tables you sketched in Discord (4/28 4:47
+PM) is the right layer-2 destination, but you flagged it there as
+"this approach is a bit more work." that benefits from your direct
+involvement on identity lifecycle semantics + Gas City alignment
+rather than rolling into PR1. happy to file a separate issue under
+your lead when the timing's right.
 
-on Gas City compatibility specifically — PR1 is strictly additive:
-column additions on events/wisp_events, no schema removals,
-closed_by_session preserved as JOIN-view so the issues-table read
-shape stays bit-identical from outside. existing Gas City queries
-against issues or events tables continue to work unchanged. happy to
-share the migration SQL + view definition before merge for your
-review against Gas City's coupling.
+Gas City audit (gastownhall/gascity@HEAD, local static audit):
 
-if PR1 scope as outlined works for both of you i'll open a clean
-feature branch and start implementation. if either of you want me to
-refine specifics (multi-writer call sites, view shape, migration
-safety details) before code lands, happy to iterate here first. layer
-2 stays a separate conversation under your lead, dustin, when the
-time's right.
+- zero direct coupling to events/wisp_events (no SQL, no struct
+  imports, no CLI surface)
+- closed_by_session unread across all file types
+- no bd Go-type imports — Gas City uses its own internal/beads/
+  subset structs; encoding/json ignores unknown fields, so additive
+  bd output flows through unchanged
+- direct SQL touches issues/dependencies/labels in
+  `internal/api/convoy_sql.go` (explicit column projections, no
+  SELECT *) and wisps/mail/config in `examples/.../reaper.sh` —
+  all unaffected by column additions on events/wisp_events
+
+PR1 effect on Gas City: none.
+
+Gas Town audit (gastownhall/gastown@HEAD, local static audit):
+
+deeper coupling than Gas City — imports the beads SDK in 30+ files,
+206 bd CLI invocations, raw SQL via `bd sql` and a direct MySQL
+connection to its own Dolt server. read paths are clean (no
+`*_by_session` reads, no `Event.Actor` reads from production code),
+but the audit surfaced two real constraints PR1 must respect:
+
+1. **migration must be idempotent.** Gas Town independently CREATEs
+   wisp_events on its own Dolt server (port 3307) without a
+   `session` column (`internal/doltserver/wisps_migrate.go:444-457`).
+   PR1's migration uses `ALTER TABLE … ADD COLUMN IF NOT EXISTS
+   session VARCHAR(255)` so it's a no-op when the column already
+   exists.
+2. **derived closed_by_session tolerates "closed but no event".**
+   Gas Town's reaper (`internal/reaper/reaper.go:670-678`) closes
+   stale issues via raw `UPDATE issues SET status='closed',
+   closed_at=NOW()`, bypassing bd.CloseIssue — no closed event
+   written. the derived view returns empty/NULL for these, matching
+   today's behavior (the column is empty for reaper-closed issues
+   currently anyway). not a regression, just a constraint the view
+   has to honor.
+
+both are in PR1's acceptance criteria with explicit tests.
+
+post-PR1 forward-looking (Gas Town side, separate PR, not
+PR1-blocking): add `session` to Gas Town's wisp_events DDL and
+INSERT column lists in `wisps_migrate.go` so fresh installs match
+and agent-bead → wisp migration preserves session attribution. one-
+or two-line changes; happy to open that as a Gas Town PR if useful.
+
+`Storage.CloseIssue` signature: Gas Town already passes session as
+the 5th positional arg today. PR1 doesn't change the signature —
+only what bd does internally with the value (writes events.session
+instead of issues.closed_by_session). Gas Town behavior unchanged.
+
+semver: PR1 ships as v1.1.0 (additive struct fields are minor under
+Go module semantics). Gas Town pins v1.0.0 in go.mod, picks up
+cleanly via `go get -u`.
+
+happy to share migration SQL, view definition, and full audit
+reports if useful. otherwise: if PR1 scope works for both of you,
+i'll open a clean feature branch and start implementation. layer 2
+stays a separate conversation under your lead, dustin, when the
+timing's right.
 ```
 
 tone: lowercase casual, first person singular, contractions natural, conversational. matches sms's existing voice on `#3509` and other PRs.
@@ -273,47 +398,42 @@ readable via `cass transcript` if rationale beyond the design doc is
 needed.
 ```
 
-## parallel work in progress (sms-side, not this session)
+## audit history (executed 2026-05-03)
 
-sms is cloning Gas City to audit its actual coupling against bd's events/issues schema. Goals:
+sms cloned `gastownhall/gascity` and `gastownhall/gastown` and ran static coupling audits in fresh CC sessions in each workspace. Reports at `.beads/tmp/audit-{gascity,gastown}-bd-coupling-2026-05-03.md`. Wasteland (`gastownhall/wasteland`) probed via `gh search code` — no direct bd coupling, transitively covered via Gas Town.
 
-1. **Verify "additive only" claim is true.** Run the proposed migration locally against a Gas City instance; confirm no Gas City reads break. Specifically test:
-   - any Gas City SQL that does `SELECT *` against `events`, `wisp_events`, or `issues`
-   - any positional column reads (rare but possible)
-   - any code paths that reflect on schema columns dynamically
-2. **Surface real coupling we don't know about.** Anything Gas City depends on that we haven't accounted for becomes a new acceptance criterion or non-goal.
-3. **Dogfood our own builds.** Empirical evidence for the reply: "ran the migration locally against Gas City and these queries still work" is much stronger than "trust us, additive."
-4. **Side benefit.** sms has been meaning to try Gas City anyway — this side quest pays double.
+Audit prompts (for reference / future reuse): `.beads/tmp/audit-prompt-{gascity,gastown}.md`.
 
-Output: a comment on `bd-edi` with audit findings, dated after 2026-05-01. The next session reads that comment to know if PR1 commitments hold, need revision, or are blocked.
+Outcome: both LOW risk. Two new constraints surfaced (migration idempotency, derived-view tolerance for reaper-bypass) — folded into Forks 4 and 5 above.
 
 ## next-session entry point
 
 When a fresh session opens to write the PR1 plan:
 
-1. **Read this doc end-to-end.** Especially the cold-start orientation at top.
-2. **Check Gas City audit status.** `bd show bd-edi` — look for comments dated after 2026-05-01 mentioning Gas City. If none yet, ask sms whether to proceed without (post reply with "additive promise + invite review" framing) or wait.
-3. **If audit clean:**
-   - Post the draft reply text from this doc (verbatim or with sms's edits) to `#3583`
-   - Add the bd-edi comment text from this doc to `bd-edi`
-   - Invoke `superpowers:writing-plans` with this design doc as input. Produce the executable PR1 implementation plan: migration files, canonical call-site enumeration (do the audit maphew's claim implies), view definition, test coverage, documentation updates.
-4. **If audit surfaced real coupling:**
-   - Pause. Do not post reply. Do not write plan.
-   - Revise this doc's "PR1 architectural commitments" section in light of findings.
-   - Get sms re-approval.
-   - Then proceed to step 3.
+1. **Read this doc end-to-end** — especially the cold-start orientation at top and the audit findings section.
+2. **Confirm reply has been posted** on `#3583` (check `gh issue view 3583 --comments`); if not, post the draft from "draft reply text" section below.
+3. **Confirm the post-audit bd-edi comment is added** (check `bd show bd-edi` for a 2026-05-03 comment); if not, add it from the "bd-edi comment to add" section.
+4. **Invoke `superpowers:writing-plans`** with this design doc as input. Plan must respect:
+   - All five forks above (1–5)
+   - Migration idempotency (`IF NOT EXISTS`) — Fork 4
+   - Derived-view tolerance for closed-no-event — Fork 5
+   - bd v1.x semver: ship as `v1.1.0`
+   - Pre-merge migration probe step (cf. `bd-y5f` drift class)
+5. The audit findings section is canonical for "what we know about downstream coupling." Don't re-audit; reference it.
 
-## open questions deferred to next session
+## settled questions (resolved this session)
 
-- **Opt-out config flag (`core.capture-session: false`)**: doc-review flagged as YAGNI. Pulling it tightens the proposal and avoids contradicting our "no surface expansion" framing. Kept in scope pending Gas City audit — if GC audit surfaces a real config-flag use case, it stays. If not, pull it from PR1 scope and the bd-edi acceptance criteria. **Default action absent new info: pull it.**
-- **SQL `VIEW` vs in-code JOIN** for `closed_by_session` derivation: implementation detail, settled in plan.
-- **Centralization of event insertion**: deferred unless implementation reveals a natural chokepoint per the threshold above.
+- **Opt-out config flag (`core.capture-session: false`)**: pulled from PR1 scope. Audit found zero use case in Gas City or Gas Town; env-absence already satisfies opt-out semantics.
+- **SQL `VIEW` vs in-code JOIN** for `closed_by_session` derivation: implementation detail, settle in plan. Both work; either is fine. Plan-writer's call.
+- **Centralization of event insertion**: deferred unless implementation reveals 5+ writers gaining the same parameter via the same intermediate function.
+- **Decision doc `009-session-events-architecture.md`**: confirmed never written. Decision content lives in `bd-xdc`. Optional follow-up: write a real `docs/adr/0003-session-events-architecture.md` post-PR1.
 
 ## acceptance criteria (this design)
 
 - [x] design doc committed to repo
-- [x] user reviews + approves design
-- [x] cold-start handoff blocks added (top + parallel work + next-session entry point)
-- [ ] bd-edi comment captured for durability (after this section, executed in this session)
-- [ ] reply text posted to `#3583` (deferred to next session, post-GC audit)
-- [ ] PR1 implementation plan written via `superpowers:writing-plans` (deferred to next session)
+- [x] user reviews + approves design (rounds 1 + 2 incl. audit findings)
+- [x] cold-start handoff blocks added (top + audit history + next-session entry point)
+- [x] Gas City + Gas Town audits complete; wasteland transitively covered
+- [x] bd-edi comment captured for durability (added 2026-05-01; updated 2026-05-03 with post-audit state)
+- [ ] reply text posted to `#3583` (this session — see "draft reply text" below)
+- [ ] PR1 implementation plan written via `superpowers:writing-plans` (next session)
