@@ -467,11 +467,11 @@ func doltBuildSQLInClause(ids []string) (string, []interface{}) {
 // Helper functions
 // =============================================================================
 
-func recordEvent(ctx context.Context, tx *sql.Tx, issueID string, eventType types.EventType, actor, oldValue, newValue string) error {
+func recordEvent(ctx context.Context, tx *sql.Tx, issueID string, eventType types.EventType, actor, session, oldValue, newValue string) error {
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, issueID, eventType, actor, oldValue, newValue)
+		INSERT INTO events (issue_id, event_type, actor, session, old_value, new_value)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, issueID, eventType, actor, session, oldValue, newValue)
 	return wrapExecError("record event", err)
 }
 
