@@ -41,7 +41,7 @@ func CloseIssueInTx(ctx context.Context, tx *sql.Tx, id string, reason, actor, s
 		return nil, fmt.Errorf("issue not found: %s", id)
 	}
 
-	if err := RecordEventInTable(ctx, tx, eventTable, id, types.EventClosed, actor, reason); err != nil {
+	if err := RecordEventInTable(ctx, tx, eventTable, id, types.EventClosed, actor, "", reason); err != nil {
 		return nil, fmt.Errorf("failed to record event: %w", err)
 	}
 

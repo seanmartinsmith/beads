@@ -90,7 +90,7 @@ func CreateIssueInTx(ctx context.Context, tx *sql.Tx, bc *BatchContext, issue *t
 	}
 
 	if isNew {
-		if err := RecordEventInTable(ctx, tx, eventTable, issue.ID, types.EventCreated, actor, ""); err != nil {
+		if err := RecordEventInTable(ctx, tx, eventTable, issue.ID, types.EventCreated, actor, "", ""); err != nil {
 			return fmt.Errorf("failed to record event for %s: %w", issue.ID, err)
 		}
 	}

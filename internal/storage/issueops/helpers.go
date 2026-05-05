@@ -102,13 +102,14 @@ func InsertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 }
 
 // RecordEventInTable records an event in the specified events table.
+// session may be empty when no session attribution is configured.
 //
 //nolint:gosec // G201: table is a hardcoded constant ("events" or "wisp_events")
-func RecordEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, newValue string) error {
+func RecordEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, session, newValue string) error {
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, table), issueID, eventType, actor, "", newValue)
+		INSERT INTO %s (issue_id, event_type, actor, session, old_value, new_value)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, table), issueID, eventType, actor, session, "", newValue)
 	if err != nil {
 		return fmt.Errorf("record event in %s: %w", table, err)
 	}
