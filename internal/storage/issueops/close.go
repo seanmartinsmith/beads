@@ -18,6 +18,12 @@ type CloseResult struct {
 // and recording the close event. Routes to the correct table (issues/wisps)
 // automatically. The caller is responsible for Dolt versioning if needed.
 //
+// Session attribution is dual-written: events.session (the source of truth
+// for the read path post-bd-edi PR1; see GetIssueInTx) AND
+// issues.closed_by_session (the legacy column, retained for downstream SQL
+// consumers that read it directly). Stop-writing the legacy column is
+// deferred to a follow-up cleanup tracked at bd-6g6.
+//
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func CloseIssueInTx(ctx context.Context, tx *sql.Tx, id string, reason, actor, session string) (*CloseResult, error) {
 	isWisp := IsActiveWispInTx(ctx, tx, id)
@@ -25,6 +31,9 @@ func CloseIssueInTx(ctx context.Context, tx *sql.Tx, id string, reason, actor, s
 
 	now := time.Now().UTC()
 
+	// Legacy column write: closed_by_session is no longer authoritative
+	// (events.session is the source of truth on read), but the column write
+	// is preserved for backward compat. Tracked at bd-6g6.
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
 		WHERE id = ?
