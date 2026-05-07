@@ -279,7 +279,7 @@ func squashMolecule(ctx context.Context, s storage.DoltStorage, root *types.Issu
 		// Auto-close the root if it's a wisp — squash completes the molecule lifecycle
 		if root.Ephemeral {
 			reason := fmt.Sprintf("Squashed: %d steps → digest %s", len(children), result.DigestID)
-			if err := tx.CloseIssue(ctx, root.ID, reason, actorName, ""); err != nil {
+			if err := tx.CloseIssue(ctx, root.ID, reason, actorName, resolveSession()); err != nil {
 				return fmt.Errorf("failed to close wisp root %s: %w", root.ID, err)
 			}
 			// Clear ephemeral so the closed root stops being re-emitted by every wisp-table export cycle.

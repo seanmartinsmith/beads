@@ -101,9 +101,10 @@ var labelAddCmd = &cobra.Command{
 			FatalErrorRespectJSON("'provides:' labels are reserved for cross-project capabilities. Hint: use 'bd ship %s' instead", strings.TrimPrefix(label, "provides:"))
 		}
 
+		labelSession := resolveSession()
 		processBatchLabelOperation(issueIDs, label, "added", jsonOutput,
 			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
-				return tx.AddLabel(ctx, issueID, lbl, act, "")
+				return tx.AddLabel(ctx, issueID, lbl, act, labelSession)
 			})
 	},
 }
@@ -131,9 +132,10 @@ var labelRemoveCmd = &cobra.Command{
 			resolvedIDs = append(resolvedIDs, fullID)
 		}
 		issueIDs = resolvedIDs
+		labelSession := resolveSession()
 		processBatchLabelOperation(issueIDs, label, "removed", jsonOutput,
 			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
-				return tx.RemoveLabel(ctx, issueID, lbl, act, "")
+				return tx.RemoveLabel(ctx, issueID, lbl, act, labelSession)
 			})
 	},
 }
@@ -287,9 +289,10 @@ var labelPropagateCmd = &cobra.Command{
 
 		// Add label to each child in a single transaction (AddLabel is idempotent)
 		commitMsg := fmt.Sprintf("bd: propagate label '%s' from %s to %d children", label, parentID, len(children))
+		labelSession := resolveSession()
 		err = transact(ctx, store, commitMsg, func(tx storage.Transaction) error {
 			for _, child := range children {
-				if err := tx.AddLabel(ctx, child.ID, label, actor, ""); err != nil {
+				if err := tx.AddLabel(ctx, child.ID, label, actor, labelSession); err != nil {
 					return fmt.Errorf("add label '%s' on %s: %w", label, child.ID, err)
 				}
 			}

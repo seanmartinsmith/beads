@@ -612,7 +612,7 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 								continue
 							}
 							reason := fmt.Sprintf("ADO work item %s deleted", idStr)
-							if cerr := store.CloseIssue(ctx, localID, reason, actor, ""); cerr != nil {
+							if cerr := store.CloseIssue(ctx, localID, reason, actor, resolveSession()); cerr != nil {
 								msg := fmt.Sprintf("Failed to close %s for deleted ADO #%s: %v", localID, idStr, cerr)
 								warnings = append(warnings, msg)
 								if !jsonOutput {

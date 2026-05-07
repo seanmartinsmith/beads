@@ -235,7 +235,7 @@ Examples:
 		}
 
 		// Close the issue using CloseIssue (id, reason, actor, session)
-		if err := targetStore.CloseIssue(ctx, resolvedID, "Responded", actor, ""); err != nil {
+		if err := targetStore.CloseIssue(ctx, resolvedID, "Responded", actor, resolveSession()); err != nil {
 			FatalErrorRespectJSON("closing bead: %v", err)
 		}
 
@@ -306,7 +306,7 @@ Examples:
 		}
 
 		// Close the issue
-		if err := targetStore.CloseIssue(ctx, resolvedID, closeReason, actor, ""); err != nil {
+		if err := targetStore.CloseIssue(ctx, resolvedID, closeReason, actor, resolveSession()); err != nil {
 			FatalErrorRespectJSON("closing bead: %v", err)
 		}
 

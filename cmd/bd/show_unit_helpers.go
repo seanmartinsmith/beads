@@ -28,6 +28,7 @@ func validateIssueClosable(id string, issue *types.Issue, force bool) error {
 }
 
 func applyLabelUpdates(ctx context.Context, st storage.DoltStorage, issueID, actor string, setLabels, addLabels, removeLabels []string) error {
+	session := resolveSession()
 	// Set labels (replaces all existing labels)
 	if len(setLabels) > 0 {
 		currentLabels, err := st.GetLabels(ctx, issueID)
@@ -35,12 +36,12 @@ func applyLabelUpdates(ctx context.Context, st storage.DoltStorage, issueID, act
 			return err
 		}
 		for _, label := range currentLabels {
-			if err := st.RemoveLabel(ctx, issueID, label, actor, ""); err != nil {
+			if err := st.RemoveLabel(ctx, issueID, label, actor, session); err != nil {
 				return err
 			}
 		}
 		for _, label := range setLabels {
-			if err := st.AddLabel(ctx, issueID, label, actor, ""); err != nil {
+			if err := st.AddLabel(ctx, issueID, label, actor, session); err != nil {
 				return err
 			}
 		}
@@ -48,14 +49,14 @@ func applyLabelUpdates(ctx context.Context, st storage.DoltStorage, issueID, act
 
 	// Add labels
 	for _, label := range addLabels {
-		if err := st.AddLabel(ctx, issueID, label, actor, ""); err != nil {
+		if err := st.AddLabel(ctx, issueID, label, actor, session); err != nil {
 			return err
 		}
 	}
 
 	// Remove labels
 	for _, label := range removeLabels {
-		if err := st.RemoveLabel(ctx, issueID, label, actor, ""); err != nil {
+		if err := st.RemoveLabel(ctx, issueID, label, actor, session); err != nil {
 			return err
 		}
 	}

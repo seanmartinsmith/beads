@@ -114,7 +114,7 @@ var closeEligibleEpicsCmd = &cobra.Command{
 		// Actually close the epics
 		closedIDs := []string{}
 		for _, epicStatus := range eligibleEpics {
-			err := store.CloseIssue(ctx, epicStatus.Epic.ID, "All children completed", "system", "")
+			err := store.CloseIssue(ctx, epicStatus.Epic.ID, "All children completed", "system", resolveSession())
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", epicStatus.Epic.ID, err)
 				continue

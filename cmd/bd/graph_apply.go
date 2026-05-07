@@ -235,9 +235,10 @@ func executeGraphApply(ctx context.Context, plan *GraphApplyPlan) (*GraphApplyRe
 		}
 
 		// Persist labels.
+		labelSession := resolveSession()
 		for i, node := range plan.Nodes {
 			for _, label := range node.Labels {
-				if err := tx.AddLabel(ctx, issues[i].ID, label, actor, ""); err != nil {
+				if err := tx.AddLabel(ctx, issues[i].ID, label, actor, labelSession); err != nil {
 					return fmt.Errorf("node %q: adding label %q: %w", node.Key, label, err)
 				}
 			}

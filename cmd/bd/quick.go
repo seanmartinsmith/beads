@@ -51,8 +51,9 @@ Example:
 		}
 
 		// Add labels if specified (silently ignore failures)
+		labelSession := resolveSession()
 		for _, label := range labels {
-			_ = store.AddLabel(ctx, issue.ID, label, actor, "")
+			_ = store.AddLabel(ctx, issue.ID, label, actor, labelSession)
 		}
 
 		commandDidWrite.Store(true)

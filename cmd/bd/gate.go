@@ -412,7 +412,7 @@ Use --reason to provide context for why the gate was resolved.`,
 		}
 
 		// Close the gate
-		if err := store.CloseIssue(ctx, gateID, reason, actor, ""); err != nil {
+		if err := store.CloseIssue(ctx, gateID, reason, actor, resolveSession()); err != nil {
 			FatalError("closing gate: %v", err)
 		}
 
@@ -845,7 +845,7 @@ func checkBeadGate(_ context.Context, awaitID string) (bool, string) {
 
 // closeGate closes a gate issue with the given reason
 func closeGate(_ interface{}, gateID, reason string) error {
-	if err := store.CloseIssue(rootCtx, gateID, reason, actor, ""); err != nil {
+	if err := store.CloseIssue(rootCtx, gateID, reason, actor, resolveSession()); err != nil {
 		return err
 	}
 	commandDidWrite.Store(true)

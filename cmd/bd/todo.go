@@ -161,8 +161,8 @@ var doneTodoCmd = &cobra.Command{
 				continue
 			}
 
-			// Close the issue (session is empty string for CLI operations)
-			if err := getStore().CloseIssue(ctx, issueID, reason, getActorWithGit(), ""); err != nil {
+			// Close the issue
+			if err := getStore().CloseIssue(ctx, issueID, reason, getActorWithGit(), resolveSession()); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to close %s: %v\n", issueID, err)
 				continue
 			}

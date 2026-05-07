@@ -329,7 +329,7 @@ func runBatchOp(ctx context.Context, tx storage.Transaction, op batchOp) (batchO
 		if len(op.args) > 1 {
 			reason = strings.Join(op.args[1:], " ")
 		}
-		if err := tx.CloseIssue(ctx, id, reason, actorName, ""); err != nil {
+		if err := tx.CloseIssue(ctx, id, reason, actorName, resolveSession()); err != nil {
 			return result, err
 		}
 		result.Target = id

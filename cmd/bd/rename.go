@@ -77,7 +77,7 @@ func runRename(cmd *cobra.Command, args []string) error {
 	// Update the issue ID
 	oldIssue.ID = newID
 	actor := getActorWithGit()
-	if err := store.UpdateIssueID(ctx, oldID, newID, oldIssue, actor, ""); err != nil {
+	if err := store.UpdateIssueID(ctx, oldID, newID, oldIssue, actor, resolveSession()); err != nil {
 		return fmt.Errorf("failed to rename issue: %w", err)
 	}
 
