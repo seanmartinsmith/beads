@@ -145,3 +145,66 @@ func TestEmbeddedPromote(t *testing.T) {
 		}
 	})
 }
+
+// TestSessionAttribution_Comment verifies that the session-aware comment-event
+// path (Storage.AddComment → AddCommentEventInTx → INSERT INTO events) writes
+// the supplied session value to events.session. Two sub-tests cover the two
+// surfaces that drive AddComment in PR1's scope:
+//
+//  1. Storage-method directly — proves the lowest-level contract.
+//  2. bd promote cobra path — proves the bd-8kt fix (resolveSession() threading
+//     into the compact/promote AddComment call sites) actually round-trips.
+//
+// Note: bd comment (the user-facing comment cobra command) does NOT go through
+// Storage.AddComment. It goes through AddIssueComment, which writes to the
+// comments table only and is not session-aware by API design. That's a
+// separate structural gap (closer to outcome C than bd-fwb shape) and is not
+// in PR1's scope to close.
+//
+// Refs: bd-edi (PR1 Phase 7), bd-8kt (the call-site escapees this test
+// validates the fix for), gastownhall/beads#3583.
+func TestSessionAttribution_Comment(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	dir, beadsDir, _ := bdInit(t, bd, "--prefix", "sc")
+
+	t.Run("storage_method_round_trips_session", func(t *testing.T) {
+		// Directly invoke the session-aware storage method against a fresh
+		// permanent issue. Asserts events.session for the resulting commented
+		// event row. This is the lowest-level contract: callers that thread
+		// session through must see it land.
+		issue := bdCreate(t, bd, dir, "AddComment storage round-trip", "--type", "task")
+		store := openStore(t, beadsDir, "sc")
+		if err := store.AddComment(t.Context(), issue.ID, "tester", "storage-sess", "round-trip event"); err != nil {
+			t.Fatalf("AddComment: %v", err)
+		}
+		got := queryEventSessionSQL(t, beadsDir, issue.ID, "commented")
+		if got != "storage-sess" {
+			t.Errorf("expected events.session=storage-sess, got %q", got)
+		}
+	})
+
+	t.Run("bd_promote_cobra_round_trips_session_via_flag", func(t *testing.T) {
+		// bd promote runs PromoteFromEphemeral and then writes a 'Promoted
+		// from wisp to permanent bead' comment via Storage.AddComment. Pre-
+		// bd-8kt that call site hardcoded "" for session; post-bd-8kt it
+		// passes resolveSession(). This sub-test exercises the now-fixed
+		// path and asserts the comment event carries --session.
+		wisp := bdCreate(t, bd, dir, "Promote with session", "--ephemeral")
+		cmd := exec.Command(bd, "promote", wisp.ID, "--session", "promote-sess")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd promote --session failed: %v\n%s", err, out)
+		}
+		got := queryEventSessionSQL(t, beadsDir, wisp.ID, "commented")
+		if got != "promote-sess" {
+			t.Errorf("expected events.session=promote-sess, got %q", got)
+		}
+	})
+}
