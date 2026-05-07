@@ -90,8 +90,8 @@ create, update, show, or close operation).`,
 		claimNext, _ := cmd.Flags().GetBool("claim-next")
 
 		// Resolve session ID via the standard precedence: --session flag,
-		// then BEADS_SESSION_ID/CLAUDE_SESSION_ID env vars (gated by
-		// core.capture-session opt-in).
+		// then BEADS_SESSION_ID/CLAUDE_CODE_SESSION_ID/CLAUDE_SESSION_ID env
+		// vars (gated by core.capture-session opt-in).
 		session := resolveSession()
 
 		ctx := rootCtx

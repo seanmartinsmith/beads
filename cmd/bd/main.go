@@ -464,11 +464,19 @@ func getActorWithGit() string {
 }
 
 // resolveSession returns the session identifier for event attribution.
-// Priority: --session flag > BEADS_SESSION_ID env > CLAUDE_SESSION_ID env > "".
+// Priority: --session flag > BEADS_SESSION_ID > CLAUDE_CODE_SESSION_ID > CLAUDE_SESSION_ID > "".
 //
 // Two-layer opt-in: the --session flag is always honored, but environment
 // variables are read only when core.capture-session is true. Default behavior
 // (config off, no flag) returns "" — indistinguishable from pre-attribution.
+//
+// CLAUDE_CODE_SESSION_ID is the official session identifier auto-populated by
+// Claude Code 2.1.132+ on every Bash subprocess (matches the session_id passed
+// to hooks). It supersedes the older CLAUDE_SESSION_ID convention but the
+// latter is retained as a manual-override fallback for upstream tooling that
+// sets it directly. Auto-populated env vars make the opt-in gate (core.capture-session)
+// MORE important, not less — without it, every bd call inside Claude Code
+// would auto-capture, violating the "no unattended logging" anchor.
 func resolveSession() string {
 	// Explicit flag always wins, regardless of opt-in config.
 	if session != "" {
@@ -476,18 +484,26 @@ func resolveSession() string {
 	}
 
 	// Env vars require opt-in to prevent unattended capture in environments
-	// where CLAUDE_SESSION_ID is set globally but the user has not opted in.
+	// where CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID are set automatically
+	// (Claude Code 2.1.132+ sets the former on every Bash subprocess) but the
+	// user has not opted in to attribution.
 	if !config.GetBool("core.capture-session") {
 		return ""
 	}
 
-	// Primary env var.
+	// Primary env var (project-specific, mirrors BEADS_ACTOR pattern).
 	if beadsSession := os.Getenv("BEADS_SESSION_ID"); beadsSession != "" {
 		return beadsSession
 	}
 
-	// Deprecated/secondary env var. Kept indefinitely for compatibility with
-	// upstream tooling that sets CLAUDE_SESSION_ID.
+	// Official Claude Code session identifier (auto-populated since 2.1.132).
+	if claudeCodeSession := os.Getenv("CLAUDE_CODE_SESSION_ID"); claudeCodeSession != "" {
+		return claudeCodeSession
+	}
+
+	// Manual-override fallback. Kept indefinitely for upstream tooling
+	// (Gas Town automation, Steve's scripts) that sets CLAUDE_SESSION_ID
+	// directly. Superseded by CLAUDE_CODE_SESSION_ID for Claude Code contexts.
 	if claudeSession := os.Getenv("CLAUDE_SESSION_ID"); claudeSession != "" {
 		return claudeSession
 	}
@@ -526,7 +542,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&changeDir, "directory", "C", "", "Change to this directory before running the command (like git -C)")
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
 	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BEADS_ACTOR, git user.name, $USER)")
-	rootCmd.PersistentFlags().StringVar(&session, "session", "", "Session identifier for event attribution (always honored; env vars require core.capture-session=true)")
+	rootCmd.PersistentFlags().StringVar(&session, "session", "", "Session identifier for event attribution (always honored; env vars BEADS_SESSION_ID, CLAUDE_CODE_SESSION_ID, CLAUDE_SESSION_ID require core.capture-session=true)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 	rootCmd.PersistentFlags().String("format", "", "Output format (json). Alias for --json")
 	_ = rootCmd.PersistentFlags().MarkHidden("format") // Hidden alias for CLI ergonomics
