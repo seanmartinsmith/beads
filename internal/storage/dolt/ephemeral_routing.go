@@ -264,7 +264,7 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 // it atomically: insert into wisps, copy auxiliary data, delete from issues.
 //
 // Called by UpdateIssue when no_history=true or wisp=true is set on a regular issue.
-func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
+func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[string]interface{}, actor, session string) error {
 	// Read the current issue from the issues table.
 	issue, err := scanIssueFromTable(ctx, s.db, "issues", id)
 	if err != nil {
@@ -323,9 +323,9 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 
 	// Record a demotion event in wisp_events.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO wisp_events (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, id, types.EventUpdated, actor, "", "demoted to wisp"); err != nil {
+		INSERT INTO wisp_events (issue_id, event_type, actor, session, old_value, new_value)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, id, types.EventUpdated, actor, session, "", "demoted to wisp"); err != nil {
 		log.Printf("demote %s: failed to record demotion event: %v", id, err)
 	}
 

@@ -152,7 +152,7 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 	_, settingNoHistory := updates["no_history"]
 	_, settingWisp := updates["wisp"]
 	if settingNoHistory || settingWisp {
-		return s.DemoteToWisp(ctx, id, updates, actor)
+		return s.DemoteToWisp(ctx, id, updates, actor, "")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
