@@ -384,7 +384,8 @@ func TestEmbeddedClose(t *testing.T) {
 		cmd := exec.Command(bd, "close", issue.ID)
 		cmd.Dir = dir
 		env := bdEnv(dir)
-		env = append(env, "CLAUDE_SESSION_ID=env-sess")
+		// Env-var session capture requires opt-in via core.capture-session.
+		env = append(env, "BD_CORE_CAPTURE_SESSION=true", "CLAUDE_SESSION_ID=env-sess")
 		cmd.Env = env
 		out, err := cmd.CombinedOutput()
 		if err != nil {
