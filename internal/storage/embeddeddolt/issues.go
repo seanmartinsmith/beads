@@ -65,7 +65,7 @@ func (s *EmbeddedDoltStore) ReopenIssue(ctx context.Context, id string, reason s
 		return err
 	}
 	if reason != "" {
-		if err := s.AddComment(ctx, id, actor, reason); err != nil {
+		if err := s.AddComment(ctx, id, actor, "", reason); err != nil {
 			return fmt.Errorf("reopen comment: %w", err)
 		}
 	}

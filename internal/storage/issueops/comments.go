@@ -159,16 +159,17 @@ func ImportIssueCommentInTx(ctx context.Context, tx *sql.Tx, issueID, author, te
 
 // AddCommentEventInTx adds a comment as an event to an issue within a transaction.
 // Routes to events or wisp_events based on wisp status.
+// session may be empty when no session attribution is configured.
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
-func AddCommentEventInTx(ctx context.Context, tx *sql.Tx, issueID, actor, comment string) error {
+func AddCommentEventInTx(ctx context.Context, tx *sql.Tx, issueID, actor, session, comment string) error {
 	isWisp := IsActiveWispInTx(ctx, tx, issueID)
 	_, _, eventTable, _ := WispTableRouting(isWisp)
 
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, event_type, actor, comment)
-		VALUES (?, ?, ?, ?)
-	`, eventTable), issueID, types.EventCommented, actor, comment); err != nil {
+		INSERT INTO %s (issue_id, event_type, actor, session, comment)
+		VALUES (?, ?, ?, ?, ?)
+	`, eventTable), issueID, types.EventCommented, actor, session, comment); err != nil {
 		return fmt.Errorf("add comment event to %s: %w", eventTable, err)
 	}
 	return nil

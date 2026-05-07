@@ -1029,7 +1029,7 @@ func TestDoltStoreEvents(t *testing.T) {
 	}
 
 	// Add a comment event
-	if err := store.AddComment(ctx, issue.ID, "user1", "A comment"); err != nil {
+	if err := store.AddComment(ctx, issue.ID, "user1", "", "A comment"); err != nil {
 		t.Fatalf("failed to add comment: %v", err)
 	}
 

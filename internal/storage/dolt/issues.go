@@ -276,7 +276,7 @@ func (s *DoltStore) ReopenIssue(ctx context.Context, id string, reason string, a
 		return err
 	}
 	if reason != "" {
-		if err := s.AddComment(ctx, id, actor, reason); err != nil {
+		if err := s.AddComment(ctx, id, actor, "", reason); err != nil {
 			return fmt.Errorf("reopen comment: %w", err)
 		}
 	}

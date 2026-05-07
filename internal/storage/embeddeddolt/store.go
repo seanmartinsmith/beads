@@ -726,9 +726,9 @@ func (s *EmbeddedDoltStore) RenameDependencyPrefix(ctx context.Context, oldPrefi
 // storage.AnnotationQueryStore
 // ---------------------------------------------------------------------------
 
-func (s *EmbeddedDoltStore) AddComment(ctx context.Context, issueID, actor, comment string) error {
+func (s *EmbeddedDoltStore) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.AddCommentEventInTx(ctx, tx, issueID, actor, comment)
+		return issueops.AddCommentEventInTx(ctx, tx, issueID, actor, session, comment)
 	})
 }
 
