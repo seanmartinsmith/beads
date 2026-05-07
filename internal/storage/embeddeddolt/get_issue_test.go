@@ -67,6 +67,38 @@ func TestGetIssue(t *testing.T) {
 		}
 	})
 
+	t.Run("closed_by_session_derived_from_events", func(t *testing.T) {
+		// Phase 6 of bd-edi PR1: ClosedBySession is derived from the most
+		// recent 'closed' events row, not the issues.closed_by_session column.
+		te := newTestEnv(t, "cs")
+		ctx := t.Context()
+
+		issue := &types.Issue{
+			ID:        "cs-closed",
+			Title:     "Closed with session",
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+		}
+		if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("CreateIssue: %v", err)
+		}
+		if err := te.store.CloseIssue(ctx, "cs-closed", "done", "tester", "session-from-close"); err != nil {
+			t.Fatalf("CloseIssue: %v", err)
+		}
+
+		got, err := te.store.GetIssue(ctx, "cs-closed")
+		if err != nil {
+			t.Fatalf("GetIssue: %v", err)
+		}
+		if got.Status != types.StatusClosed {
+			t.Fatalf("Status: got %q, want closed", got.Status)
+		}
+		if got.ClosedBySession != "session-from-close" {
+			t.Errorf("ClosedBySession: got %q, want %q (must be derived from events.session, not issues.closed_by_session column)", got.ClosedBySession, "session-from-close")
+		}
+	})
+
 	t.Run("includes_labels", func(t *testing.T) {
 		te := newTestEnv(t, "il")
 		ctx := t.Context()
