@@ -173,7 +173,7 @@ func (t *embeddedTransaction) GetLocalMetadata(ctx context.Context, key string) 
 	return issueops.GetLocalMetadataInTx(ctx, t.tx, key)
 }
 
-func (t *embeddedTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
+func (t *embeddedTransaction) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	return fmt.Errorf("embeddedTransaction: AddComment not implemented")
 }
 

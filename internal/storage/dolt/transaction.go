@@ -889,7 +889,7 @@ func (t *doltTransaction) GetIssueComments(ctx context.Context, issueID string) 
 }
 
 // AddComment adds a comment within the transaction
-func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
+func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	table := "events"
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_events"
@@ -897,9 +897,9 @@ func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, commen
 
 	//nolint:gosec // G201: table is hardcoded
 	_, err := t.tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, event_type, actor, comment)
-		VALUES (?, ?, ?, ?)
-	`, table), issueID, types.EventCommented, actor, comment)
+		INSERT INTO %s (issue_id, event_type, actor, session, comment)
+		VALUES (?, ?, ?, ?, ?)
+	`, table), issueID, types.EventCommented, actor, session, comment)
 	if err == nil {
 		t.dirty.MarkDirty(table)
 	}

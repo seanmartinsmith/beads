@@ -284,7 +284,7 @@ type Transaction interface {
 	GetLocalMetadata(ctx context.Context, key string) (string, error)
 
 	// Comment operations
-	AddComment(ctx context.Context, issueID, actor, comment string) error
+	AddComment(ctx context.Context, issueID, actor, session, comment string) error
 	ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
 }

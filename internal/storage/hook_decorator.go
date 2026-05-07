@@ -306,8 +306,8 @@ func (t *hookTrackingTransaction) RemoveLabel(ctx context.Context, issueID, labe
 	return nil
 }
 
-func (t *hookTrackingTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
-	if err := t.Transaction.AddComment(ctx, issueID, actor, comment); err != nil {
+func (t *hookTrackingTransaction) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
+	if err := t.Transaction.AddComment(ctx, issueID, actor, session, comment); err != nil {
 		return err
 	}
 	if issue, err := t.Transaction.GetIssue(ctx, issueID); err == nil {
