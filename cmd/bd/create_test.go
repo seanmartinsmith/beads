@@ -153,10 +153,10 @@ func TestCreateSuite(t *testing.T) {
 		}
 
 		// Add labels
-		if err := s.AddLabel(ctx, issue.ID, "bug", "test"); err != nil {
+		if err := s.AddLabel(ctx, issue.ID, "bug", "test", ""); err != nil {
 			t.Fatalf("failed to add bug label: %v", err)
 		}
-		if err := s.AddLabel(ctx, issue.ID, "critical", "test"); err != nil {
+		if err := s.AddLabel(ctx, issue.ID, "critical", "test", ""); err != nil {
 			t.Fatalf("failed to add critical label: %v", err)
 		}
 
@@ -597,10 +597,10 @@ func TestCreateSuite(t *testing.T) {
 		if err := s.CreateIssue(ctx, parent, "test"); err != nil {
 			t.Fatalf("failed to create parent: %v", err)
 		}
-		if err := s.AddLabel(ctx, parent.ID, "branch:feature-x", "test"); err != nil {
+		if err := s.AddLabel(ctx, parent.ID, "branch:feature-x", "test", ""); err != nil {
 			t.Fatalf("failed to add label: %v", err)
 		}
-		if err := s.AddLabel(ctx, parent.ID, "epic", "test"); err != nil {
+		if err := s.AddLabel(ctx, parent.ID, "epic", "test", ""); err != nil {
 			t.Fatalf("failed to add label: %v", err)
 		}
 
@@ -634,7 +634,7 @@ func TestCreateSuite(t *testing.T) {
 			t.Fatalf("failed to get parent labels: %v", err)
 		}
 		for _, l := range parentLabels {
-			if err := s.AddLabel(ctx, child.ID, l, "test"); err != nil {
+			if err := s.AddLabel(ctx, child.ID, l, "test", ""); err != nil {
 				t.Fatalf("failed to add inherited label %s: %v", l, err)
 			}
 		}
@@ -670,10 +670,10 @@ func TestCreateSuite(t *testing.T) {
 		if err := s.CreateIssue(ctx, parent, "test"); err != nil {
 			t.Fatalf("failed to create parent: %v", err)
 		}
-		if err := s.AddLabel(ctx, parent.ID, "a", "test"); err != nil {
+		if err := s.AddLabel(ctx, parent.ID, "a", "test", ""); err != nil {
 			t.Fatalf("failed to add label: %v", err)
 		}
-		if err := s.AddLabel(ctx, parent.ID, "b", "test"); err != nil {
+		if err := s.AddLabel(ctx, parent.ID, "b", "test", ""); err != nil {
 			t.Fatalf("failed to add label: %v", err)
 		}
 
@@ -710,7 +710,7 @@ func TestCreateSuite(t *testing.T) {
 
 		// Add all merged labels (AddLabel is idempotent)
 		for l := range merged {
-			if err := s.AddLabel(ctx, child.ID, l, "test"); err != nil {
+			if err := s.AddLabel(ctx, child.ID, l, "test", ""); err != nil {
 				t.Fatalf("failed to add label %s: %v", l, err)
 			}
 		}
@@ -789,10 +789,10 @@ func TestCreateSuite(t *testing.T) {
 		if err := s.CreateIssue(ctx, parent, "test"); err != nil {
 			t.Fatalf("failed to create parent: %v", err)
 		}
-		if err := s.AddLabel(ctx, parent.ID, "branch:main", "test"); err != nil {
+		if err := s.AddLabel(ctx, parent.ID, "branch:main", "test", ""); err != nil {
 			t.Fatalf("failed to add label: %v", err)
 		}
-		if err := s.AddLabel(ctx, parent.ID, "priority:high", "test"); err != nil {
+		if err := s.AddLabel(ctx, parent.ID, "priority:high", "test", ""); err != nil {
 			t.Fatalf("failed to add label: %v", err)
 		}
 
@@ -814,7 +814,7 @@ func TestCreateSuite(t *testing.T) {
 		// With --no-inherit-labels, only add explicit user labels
 		userLabels := []string{"my-label"}
 		for _, l := range userLabels {
-			if err := s.AddLabel(ctx, child.ID, l, "test"); err != nil {
+			if err := s.AddLabel(ctx, child.ID, l, "test", ""); err != nil {
 				t.Fatalf("failed to add label %s: %v", l, err)
 			}
 		}

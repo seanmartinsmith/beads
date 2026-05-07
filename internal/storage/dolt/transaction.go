@@ -718,7 +718,7 @@ func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, depends
 }
 
 // AddLabel adds a label within the transaction
-func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor string) error {
+func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor, session string) error {
 	table := "labels"
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_labels"
@@ -758,7 +758,7 @@ func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]stri
 }
 
 // RemoveLabel removes a label within the transaction
-func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
+func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor, session string) error {
 	table := "labels"
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_labels"

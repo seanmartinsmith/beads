@@ -1428,7 +1428,7 @@ func TestSearchIssues_LabelFilter(t *testing.T) {
 		}
 	}
 
-	if err := store.AddLabel(ctx, labeled.ID, "important", "tester"); err != nil {
+	if err := store.AddLabel(ctx, labeled.ID, "important", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
 

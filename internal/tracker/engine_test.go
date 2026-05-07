@@ -1460,7 +1460,7 @@ func TestEnginePushWithShouldPushCanInspectLabels(t *testing.T) {
 			t.Fatalf("CreateIssue(%s) error: %v", tc.id, err)
 		}
 		if tc.label != "" {
-			if err := store.AddLabel(ctx, tc.id, tc.label, "test-actor"); err != nil {
+			if err := store.AddLabel(ctx, tc.id, tc.label, "test-actor", ""); err != nil {
 				t.Fatalf("AddLabel(%s) error: %v", tc.id, err)
 			}
 		}

@@ -60,8 +60,8 @@ type Storage interface {
 	GetDependencyTree(ctx context.Context, issueID string, maxDepth int, showAllPaths bool, reverse bool) ([]*types.TreeNode, error)
 
 	// Labels
-	AddLabel(ctx context.Context, issueID, label, actor string) error
-	RemoveLabel(ctx context.Context, issueID, label, actor string) error
+	AddLabel(ctx context.Context, issueID, label, actor, session string) error
+	RemoveLabel(ctx context.Context, issueID, label, actor, session string) error
 	GetLabels(ctx context.Context, issueID string) ([]string, error)
 	GetIssuesByLabel(ctx context.Context, label string) ([]*types.Issue, error)
 
@@ -265,8 +265,8 @@ type Transaction interface {
 	GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error)
 
 	// Label operations
-	AddLabel(ctx context.Context, issueID, label, actor string) error
-	RemoveLabel(ctx context.Context, issueID, label, actor string) error
+	AddLabel(ctx context.Context, issueID, label, actor, session string) error
+	RemoveLabel(ctx context.Context, issueID, label, actor, session string) error
 	GetLabels(ctx context.Context, issueID string) ([]string, error)
 
 	// Config operations (for atomic config + issue workflows)

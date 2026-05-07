@@ -721,7 +721,7 @@ func syncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string
 		if _, ok := desiredSet[label]; ok {
 			continue
 		}
-		if err := tx.RemoveLabel(ctx, issueID, label, actor); err != nil {
+		if err := tx.RemoveLabel(ctx, issueID, label, actor, ""); err != nil {
 			return err
 		}
 	}
@@ -729,7 +729,7 @@ func syncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string
 		if _, ok := currentSet[label]; ok {
 			continue
 		}
-		if err := tx.AddLabel(ctx, issueID, label, actor); err != nil {
+		if err := tx.AddLabel(ctx, issueID, label, actor, ""); err != nil {
 			return err
 		}
 	}

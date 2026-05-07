@@ -720,7 +720,7 @@ func TestHighContentionStress(t *testing.T) {
 						failedOps.Add(1)
 					}
 				case 2: // Add label
-					err := store.AddLabel(ctx, issueID, fmt.Sprintf("label-%d-%d", workerID, op), fmt.Sprintf("worker-%d", workerID))
+					err := store.AddLabel(ctx, issueID, fmt.Sprintf("label-%d-%d", workerID, op), fmt.Sprintf("worker-%d", workerID), "")
 					if err != nil {
 						failedOps.Add(1)
 					}
@@ -930,7 +930,7 @@ func TestSerializationConflictRetry(t *testing.T) {
 	for n := range numGoroutines {
 		wg.Go(func() {
 			label := fmt.Sprintf("label-%d", n)
-			if err := store.AddLabel(ctx, issue.ID, label, fmt.Sprintf("worker-%d", n)); err != nil {
+			if err := store.AddLabel(ctx, issue.ID, label, fmt.Sprintf("worker-%d", n), ""); err != nil {
 				errs <- fmt.Errorf("goroutine %d AddLabel(%q): %w", n, label, err)
 			}
 		})

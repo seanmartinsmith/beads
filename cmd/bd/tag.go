@@ -48,7 +48,7 @@ Examples:
 			FatalErrorRespectJSON("%s", err)
 		}
 
-		if err := issueStore.AddLabel(ctx, result.ResolvedID, label, actor); err != nil {
+		if err := issueStore.AddLabel(ctx, result.ResolvedID, label, actor, ""); err != nil {
 			FatalErrorRespectJSON("adding label to %s: %v", id, err)
 		}
 

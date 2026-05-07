@@ -103,7 +103,7 @@ var labelAddCmd = &cobra.Command{
 
 		processBatchLabelOperation(issueIDs, label, "added", jsonOutput,
 			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
-				return tx.AddLabel(ctx, issueID, lbl, act)
+				return tx.AddLabel(ctx, issueID, lbl, act, "")
 			})
 	},
 }
@@ -133,7 +133,7 @@ var labelRemoveCmd = &cobra.Command{
 		issueIDs = resolvedIDs
 		processBatchLabelOperation(issueIDs, label, "removed", jsonOutput,
 			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
-				return tx.RemoveLabel(ctx, issueID, lbl, act)
+				return tx.RemoveLabel(ctx, issueID, lbl, act, "")
 			})
 	},
 }
@@ -289,7 +289,7 @@ var labelPropagateCmd = &cobra.Command{
 		commitMsg := fmt.Sprintf("bd: propagate label '%s' from %s to %d children", label, parentID, len(children))
 		err = transact(ctx, store, commitMsg, func(tx storage.Transaction) error {
 			for _, child := range children {
-				if err := tx.AddLabel(ctx, child.ID, label, actor); err != nil {
+				if err := tx.AddLabel(ctx, child.ID, label, actor, ""); err != nil {
 					return fmt.Errorf("add label '%s' on %s: %w", label, child.ID, err)
 				}
 			}

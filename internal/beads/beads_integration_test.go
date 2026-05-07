@@ -88,7 +88,7 @@ func (h *integrationTestHelper) addDependency(issue1ID, issue2ID string) {
 }
 
 func (h *integrationTestHelper) addLabel(id, label string) {
-	if err := h.store.AddLabel(h.ctx, id, label, "test-actor"); err != nil {
+	if err := h.store.AddLabel(h.ctx, id, label, "test-actor", ""); err != nil {
 		h.t.Fatalf("AddLabel failed: %v", err)
 	}
 }

@@ -934,7 +934,7 @@ func BenchmarkAddLabel(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := store.AddLabel(ctx, issue.ID, fmt.Sprintf("label-%d", i), "bench"); err != nil {
+		if err := store.AddLabel(ctx, issue.ID, fmt.Sprintf("label-%d", i), "bench", ""); err != nil {
 			b.Fatalf("failed to add label: %v", err)
 		}
 	}
@@ -960,7 +960,7 @@ func BenchmarkGetLabels(b *testing.B) {
 	}
 
 	for i := 0; i < 20; i++ {
-		if err := store.AddLabel(ctx, issue.ID, fmt.Sprintf("label-%d", i), "bench"); err != nil {
+		if err := store.AddLabel(ctx, issue.ID, fmt.Sprintf("label-%d", i), "bench", ""); err != nil {
 			b.Fatalf("failed to add label: %v", err)
 		}
 	}

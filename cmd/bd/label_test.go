@@ -33,7 +33,7 @@ func (h *labelTestHelper) createIssue(title string, issueType types.IssueType, p
 }
 
 func (h *labelTestHelper) addLabel(issueID, label string) {
-	if err := h.s.AddLabel(h.ctx, issueID, label, "test-user"); err != nil {
+	if err := h.s.AddLabel(h.ctx, issueID, label, "test-user", ""); err != nil {
 		h.t.Fatalf("Failed to add label '%s': %v", label, err)
 	}
 }
@@ -45,7 +45,7 @@ func (h *labelTestHelper) addLabels(issueID string, labels []string) {
 }
 
 func (h *labelTestHelper) removeLabel(issueID, label string) {
-	if err := h.s.RemoveLabel(h.ctx, issueID, label, "test-user"); err != nil {
+	if err := h.s.RemoveLabel(h.ctx, issueID, label, "test-user", ""); err != nil {
 		h.t.Fatalf("Failed to remove label '%s': %v", label, err)
 	}
 }
@@ -247,7 +247,7 @@ func TestLabelCommands(t *testing.T) {
 			t.Fatalf("expected 3 children, got %d", len(childIssues))
 		}
 		for _, ci := range childIssues {
-			if err := s.AddLabel(ctx, ci.ID, "branch:x", "test-user"); err != nil {
+			if err := s.AddLabel(ctx, ci.ID, "branch:x", "test-user", ""); err != nil {
 				t.Fatalf("failed to propagate label: %v", err)
 			}
 		}
@@ -318,7 +318,7 @@ func TestLabelCommands(t *testing.T) {
 			t.Fatalf("failed to search children: %v", err)
 		}
 		for _, ci := range childIssues {
-			if err := s.AddLabel(ctx, ci.ID, "branch:y", "test-user"); err != nil {
+			if err := s.AddLabel(ctx, ci.ID, "branch:y", "test-user", ""); err != nil {
 				t.Fatalf("failed to propagate label: %v", err)
 			}
 		}

@@ -567,7 +567,7 @@ var createCmd = &cobra.Command{
 
 		// Add labels if specified
 		for _, label := range labels {
-			if err := store.AddLabel(ctx, issue.ID, label, actor); err != nil {
+			if err := store.AddLabel(ctx, issue.ID, label, actor, ""); err != nil {
 				WarnError("failed to add label %s: %v", label, err)
 			} else {
 				postCreateWrites = true

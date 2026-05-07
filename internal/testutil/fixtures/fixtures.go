@@ -205,7 +205,7 @@ func generateIssuesWithConfig(ctx context.Context, store *dolt.DoltStore, cfg Da
 		// Add labels to epics
 		for j := 0; j < rng.Intn(3)+1; j++ {
 			label := commonLabels[rng.Intn(len(commonLabels))]
-			_ = store.AddLabel(ctx, issue.ID, label, "fixture")
+			_ = store.AddLabel(ctx, issue.ID, label, "fixture", "")
 		}
 
 		epicIssues = append(epicIssues, issue)
@@ -253,7 +253,7 @@ func generateIssuesWithConfig(ctx context.Context, store *dolt.DoltStore, cfg Da
 		// Add labels
 		for j := 0; j < rng.Intn(3)+1; j++ {
 			label := commonLabels[rng.Intn(len(commonLabels))]
-			_ = store.AddLabel(ctx, issue.ID, label, "fixture")
+			_ = store.AddLabel(ctx, issue.ID, label, "fixture", "")
 		}
 
 		featureIssues = append(featureIssues, issue)
@@ -301,7 +301,7 @@ func generateIssuesWithConfig(ctx context.Context, store *dolt.DoltStore, cfg Da
 		// Add labels
 		for j := 0; j < rng.Intn(2)+1; j++ {
 			label := commonLabels[rng.Intn(len(commonLabels))]
-			_ = store.AddLabel(ctx, issue.ID, label, "fixture")
+			_ = store.AddLabel(ctx, issue.ID, label, "fixture", "")
 		}
 
 		taskIssues = append(taskIssues, issue)
@@ -474,7 +474,7 @@ func importFromJSONL(ctx context.Context, store *dolt.DoltStore, path string) er
 
 		// Add labels
 		for _, label := range meta.labels {
-			_ = store.AddLabel(ctx, issueID, label, "fixture")
+			_ = store.AddLabel(ctx, issueID, label, "fixture", "")
 		}
 	}
 

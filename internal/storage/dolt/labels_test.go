@@ -42,13 +42,13 @@ func TestGetLabelsForIssues(t *testing.T) {
 	}
 
 	// Add labels
-	if err := store.AddLabel(ctx, issue1.ID, "bug", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue1.ID, "bug", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
-	if err := store.AddLabel(ctx, issue1.ID, "urgent", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue1.ID, "urgent", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
-	if err := store.AddLabel(ctx, issue2.ID, "feature", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue2.ID, "feature", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
 
@@ -108,10 +108,10 @@ func TestGetLabelsForIssues_MixedWispAndPermanent(t *testing.T) {
 		t.Fatalf("create wisp: %v", err)
 	}
 
-	if err := store.AddLabel(ctx, perm.ID, "alpha", "tester"); err != nil {
+	if err := store.AddLabel(ctx, perm.ID, "alpha", "tester", ""); err != nil {
 		t.Fatalf("add label perm: %v", err)
 	}
-	if err := store.AddLabel(ctx, wisp.ID, "beta", "tester"); err != nil {
+	if err := store.AddLabel(ctx, wisp.ID, "beta", "tester", ""); err != nil {
 		t.Fatalf("add label wisp: %v", err)
 	}
 
@@ -209,7 +209,7 @@ func TestGetIssuesByLabel_NoMatches(t *testing.T) {
 	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
 		t.Fatalf("failed to create issue: %v", err)
 	}
-	if err := store.AddLabel(ctx, issue.ID, "existing", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue.ID, "existing", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
 
@@ -248,7 +248,7 @@ func TestAddAndRemoveLabel(t *testing.T) {
 	}
 
 	// Add label
-	if err := store.AddLabel(ctx, issue.ID, "test-label", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue.ID, "test-label", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
 
@@ -262,7 +262,7 @@ func TestAddAndRemoveLabel(t *testing.T) {
 	}
 
 	// Remove label
-	if err := store.RemoveLabel(ctx, issue.ID, "test-label", "tester"); err != nil {
+	if err := store.RemoveLabel(ctx, issue.ID, "test-label", "tester", ""); err != nil {
 		t.Fatalf("failed to remove label: %v", err)
 	}
 
@@ -296,10 +296,10 @@ func TestAddLabel_Duplicate(t *testing.T) {
 	}
 
 	// Add label twice
-	if err := store.AddLabel(ctx, issue.ID, "duplicate", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue.ID, "duplicate", "tester", ""); err != nil {
 		t.Fatalf("failed to add label first time: %v", err)
 	}
-	if err := store.AddLabel(ctx, issue.ID, "duplicate", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue.ID, "duplicate", "tester", ""); err != nil {
 		// Some implementations may error, others may silently ignore
 		t.Logf("second add label result: %v", err)
 	}

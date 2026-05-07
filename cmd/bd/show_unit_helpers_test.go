@@ -46,8 +46,8 @@ func TestApplyLabelUpdates_SetAddRemove(t *testing.T) {
 		t.Fatalf("CreateIssue: %v", err)
 	}
 
-	_ = st.AddLabel(ctx, issue.ID, "old1", "tester")
-	_ = st.AddLabel(ctx, issue.ID, "old2", "tester")
+	_ = st.AddLabel(ctx, issue.ID, "old1", "tester", "")
+	_ = st.AddLabel(ctx, issue.ID, "old2", "tester", "")
 
 	if err := applyLabelUpdates(ctx, st, issue.ID, "tester", []string{"a", "b"}, []string{"b", "c"}, []string{"a"}); err != nil {
 		t.Fatalf("applyLabelUpdates: %v", err)
@@ -83,7 +83,7 @@ func TestApplyLabelUpdates_AddRemoveOnly(t *testing.T) {
 		t.Fatalf("CreateIssue: %v", err)
 	}
 
-	_ = st.AddLabel(ctx, issue.ID, "a", "tester")
+	_ = st.AddLabel(ctx, issue.ID, "a", "tester", "")
 	if err := applyLabelUpdates(ctx, st, issue.ID, "tester", nil, []string{"b"}, []string{"a"}); err != nil {
 		t.Fatalf("applyLabelUpdates: %v", err)
 	}

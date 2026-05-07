@@ -118,7 +118,7 @@ func (h *templateTestHelper) addParentChild(childID, parentID string) {
 }
 
 func (h *templateTestHelper) addLabel(issueID, label string) {
-	if err := h.s.AddLabel(h.ctx, issueID, label, "test-user"); err != nil {
+	if err := h.s.AddLabel(h.ctx, issueID, label, "test-user", ""); err != nil {
 		h.t.Fatalf("Failed to add label: %v", err)
 	}
 }

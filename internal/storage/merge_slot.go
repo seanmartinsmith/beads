@@ -53,7 +53,7 @@ func MergeSlotCreateImpl(ctx context.Context, s Storage, actor string) (*types.I
 	if err := s.CreateIssue(ctx, issue, actor); err != nil {
 		return nil, fmt.Errorf("merge-slot create: %w", err)
 	}
-	if err := s.AddLabel(ctx, slotID, mergeSlotLabel, actor); err != nil {
+	if err := s.AddLabel(ctx, slotID, mergeSlotLabel, actor, ""); err != nil {
 		// Non-fatal: label is cosmetic.
 		_ = err
 	}

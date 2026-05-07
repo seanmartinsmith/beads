@@ -81,10 +81,10 @@ func TestGetIssue(t *testing.T) {
 		if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
 			t.Fatalf("CreateIssue: %v", err)
 		}
-		if err := te.store.AddLabel(ctx, "il-labeled", "bug", "tester"); err != nil {
+		if err := te.store.AddLabel(ctx, "il-labeled", "bug", "tester", ""); err != nil {
 			t.Fatalf("AddLabel: %v", err)
 		}
-		if err := te.store.AddLabel(ctx, "il-labeled", "urgent", "tester"); err != nil {
+		if err := te.store.AddLabel(ctx, "il-labeled", "urgent", "tester", ""); err != nil {
 			t.Fatalf("AddLabel: %v", err)
 		}
 		if err := te.store.Commit(ctx, "add labels"); err != nil {
@@ -147,7 +147,7 @@ func TestGetLabels(t *testing.T) {
 			t.Fatalf("CreateIssue: %v", err)
 		}
 		for _, l := range []string{"zebra", "alpha", "middle"} {
-			if err := te.store.AddLabel(ctx, "gs-sorted", l, "tester"); err != nil {
+			if err := te.store.AddLabel(ctx, "gs-sorted", l, "tester", ""); err != nil {
 				t.Fatalf("AddLabel(%s): %v", l, err)
 			}
 		}
@@ -189,10 +189,10 @@ func TestAddLabel(t *testing.T) {
 			t.Fatalf("CreateIssue: %v", err)
 		}
 		// Add same label twice — should not error.
-		if err := te.store.AddLabel(ctx, "al-idem", "dup", "tester"); err != nil {
+		if err := te.store.AddLabel(ctx, "al-idem", "dup", "tester", ""); err != nil {
 			t.Fatalf("AddLabel (first): %v", err)
 		}
-		if err := te.store.AddLabel(ctx, "al-idem", "dup", "tester"); err != nil {
+		if err := te.store.AddLabel(ctx, "al-idem", "dup", "tester", ""); err != nil {
 			t.Fatalf("AddLabel (second): %v", err)
 		}
 		if err := te.store.Commit(ctx, "add labels"); err != nil {
