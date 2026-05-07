@@ -403,3 +403,84 @@ func TestEmbeddedLabelConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionAttribution_Label verifies that the bd label add and bd label
+// remove cobra paths round-trip a session identifier all the way to
+// events.session for the resulting label_added / label_removed event rows.
+//
+// Both surfaces are session-aware in the public Storage interface (AddLabel
+// and RemoveLabel each take session per the five publicly-aliased signatures
+// landed in Phases 1-4) and label.go correctly threads resolveSession() into
+// both call sites. These tests lock in the contract.
+//
+// Refs: bd-edi (PR1 Phase 7), gastownhall/beads#3583 (the public-aliased
+// signature framing the maintainer review hinges on).
+func TestSessionAttribution_Label(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	dir, beadsDir, _ := bdInit(t, bd, "--prefix", "sl")
+
+	runLabel := func(t *testing.T, args []string, extraEnv ...string) {
+		t.Helper()
+		cmd := exec.Command(bd, args...)
+		cmd.Dir = dir
+		env := bdEnv(dir)
+		env = append(env, extraEnv...)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd %s failed: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+
+	t.Run("add_via_flag", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "label add via flag", "--type", "task")
+		runLabel(t, []string{"label", "add", issue.ID, "feature", "--session", "label-add-flag-sess"})
+		got := queryEventSessionSQL(t, beadsDir, issue.ID, "label_added")
+		if got != "label-add-flag-sess" {
+			t.Errorf("expected events.session=label-add-flag-sess, got %q", got)
+		}
+	})
+
+	t.Run("remove_via_flag", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "label remove via flag", "--type", "task")
+		runLabel(t, []string{"label", "add", issue.ID, "feature"})
+		runLabel(t, []string{"label", "remove", issue.ID, "feature", "--session", "label-remove-flag-sess"})
+		got := queryEventSessionSQL(t, beadsDir, issue.ID, "label_removed")
+		if got != "label-remove-flag-sess" {
+			t.Errorf("expected events.session=label-remove-flag-sess, got %q", got)
+		}
+	})
+
+	t.Run("add_via_claude_code_env_with_opt_in", func(t *testing.T) {
+		// Verifies the resolver chain reaches the label_added path under
+		// the same opt-in gate that close uses. Spot-check; full chain
+		// coverage is in TestSessionAttribution_Close.
+		issue := bdCreate(t, bd, dir, "label add via env", "--type", "task")
+		runLabel(t, []string{"label", "add", issue.ID, "env-label"},
+			"BD_CORE_CAPTURE_SESSION=true",
+			"CLAUDE_CODE_SESSION_ID=label-env-sess",
+		)
+		got := queryEventSessionSQL(t, beadsDir, issue.ID, "label_added")
+		if got != "label-env-sess" {
+			t.Errorf("expected events.session=label-env-sess, got %q", got)
+		}
+	})
+
+	t.Run("add_no_opt_in_drops_env", func(t *testing.T) {
+		// The opt-in gate must apply to the label path too — env vars
+		// without core.capture-session=true are ignored.
+		issue := bdCreate(t, bd, dir, "label add no opt-in", "--type", "task")
+		runLabel(t, []string{"label", "add", issue.ID, "no-optin-label"},
+			"CLAUDE_CODE_SESSION_ID=should-be-dropped",
+		)
+		got := queryEventSessionSQL(t, beadsDir, issue.ID, "label_added")
+		if got != "" {
+			t.Errorf("expected events.session='' (env dropped without opt-in), got %q", got)
+		}
+	})
+}
