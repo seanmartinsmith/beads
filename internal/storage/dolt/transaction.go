@@ -717,7 +717,11 @@ func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, depends
 	return wrapExecError("remove dependency in tx", err)
 }
 
-// AddLabel adds a label within the transaction
+// AddLabel adds a label within the transaction.
+// session is preserved for Transaction-interface conformance; this dolt
+// implementation does not currently write a LabelAdded event row (unlike
+// embeddedTransaction.AddLabel, which delegates to issueops.AddLabelInTx
+// and records the event). Tracked as bd-ffy.
 func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor, session string) error {
 	table := "labels"
 	if t.isActiveWisp(ctx, issueID) {
@@ -757,7 +761,10 @@ func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]stri
 	return labels, rows.Err()
 }
 
-// RemoveLabel removes a label within the transaction
+// RemoveLabel removes a label within the transaction.
+// session is preserved for Transaction-interface conformance; this dolt
+// implementation does not currently write a LabelRemoved event row.
+// Tracked as bd-ffy.
 func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor, session string) error {
 	table := "labels"
 	if t.isActiveWisp(ctx, issueID) {
