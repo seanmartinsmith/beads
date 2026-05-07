@@ -80,7 +80,22 @@ func initGitRepoAt(t *testing.T, dir string) {
 func bdEnv(dir string) []string {
 	var env []string
 	for _, e := range os.Environ() {
+		// Strip BEADS_* so tests can't pick up host-config overrides.
 		if strings.HasPrefix(e, "BEADS_") {
+			continue
+		}
+		// Strip session-attribution env vars so tests can't pick up the
+		// running agent's session ID. Claude Code 2.1.132+ auto-populates
+		// CLAUDE_CODE_SESSION_ID on every Bash subprocess; without this
+		// scrub, any test that asserts a lower-priority env var (e.g.
+		// CLAUDE_SESSION_ID) silently sees the higher-priority one inherited
+		// from the agent and either fails or, worse, passes for the wrong
+		// reason. Tests that want a session value still set it via cmd.Env
+		// append-after — POSIX env semantics give the last value priority.
+		// Tracked as bd-z24.
+		if strings.HasPrefix(e, "CLAUDE_CODE_SESSION_ID=") ||
+			strings.HasPrefix(e, "CLAUDE_SESSION_ID=") ||
+			strings.HasPrefix(e, "BEADS_SESSION_ID=") {
 			continue
 		}
 		env = append(env, e)
