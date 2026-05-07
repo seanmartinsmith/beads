@@ -16,7 +16,7 @@ func GetEventsInTx(ctx context.Context, tx *sql.Tx, issueID string, limit int) (
 	_, _, eventTable, _ := WispTableRouting(IsActiveWispInTx(ctx, tx, issueID))
 
 	query := fmt.Sprintf(`
-		SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
+		SELECT id, issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 		FROM %s
 		WHERE issue_id = ?
 		ORDER BY created_at DESC
@@ -40,11 +40,11 @@ func GetEventsInTx(ctx context.Context, tx *sql.Tx, issueID string, limit int) (
 // querying both events and wisp_events tables.
 func GetAllEventsSinceInTx(ctx context.Context, tx *sql.Tx, since time.Time) ([]*types.Event, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
+		SELECT id, issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 		FROM events
 		WHERE created_at > ?
 		UNION ALL
-		SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
+		SELECT id, issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 		FROM wisp_events
 		WHERE created_at > ?
 		ORDER BY created_at ASC
@@ -61,10 +61,13 @@ func scanEvents(rows *sql.Rows) ([]*types.Event, error) {
 	var events []*types.Event
 	for rows.Next() {
 		var event types.Event
-		var oldValue, newValue, comment sql.NullString
+		var session, oldValue, newValue, comment sql.NullString
 		if err := rows.Scan(&event.ID, &event.IssueID, &event.EventType, &event.Actor,
-			&oldValue, &newValue, &comment, &event.CreatedAt); err != nil {
+			&session, &oldValue, &newValue, &comment, &event.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		if session.Valid {
+			event.Session = session.String
 		}
 		if oldValue.Valid {
 			event.OldValue = &oldValue.String

@@ -977,6 +977,7 @@ type Event struct {
 	IssueID   string    `json:"issue_id"`
 	EventType EventType `json:"event_type"`
 	Actor     string    `json:"actor"`
+	Session   string    `json:"session,omitempty"`
 	OldValue  *string   `json:"old_value,omitempty"`
 	NewValue  *string   `json:"new_value,omitempty"`
 	Comment   *string   `json:"comment,omitempty"`
