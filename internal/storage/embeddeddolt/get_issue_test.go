@@ -99,6 +99,105 @@ func TestGetIssue(t *testing.T) {
 		}
 	})
 
+	t.Run("closed_by_session_open_issue_skips_lookup", func(t *testing.T) {
+		// Open issues should never surface ClosedBySession; the derivation is
+		// gated on Status == closed in GetIssueInTx.
+		te := newTestEnv(t, "co")
+		ctx := t.Context()
+
+		issue := &types.Issue{
+			ID:        "co-open",
+			Title:     "Open issue",
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+		}
+		if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("CreateIssue: %v", err)
+		}
+
+		got, err := te.store.GetIssue(ctx, "co-open")
+		if err != nil {
+			t.Fatalf("GetIssue: %v", err)
+		}
+		if got.ClosedBySession != "" {
+			t.Errorf("ClosedBySession on open issue: got %q, want empty", got.ClosedBySession)
+		}
+	})
+
+	t.Run("closed_by_session_no_event_row_returns_empty", func(t *testing.T) {
+		// Reaper-bypass / doltTransaction.CloseIssue (bd-3pc) pattern: an issue
+		// is marked closed via a raw UPDATE that bypasses the event-recording
+		// helper. No 'closed' event row exists. Per the launch brief §3
+		// absence contract, the derived ClosedBySession surfaces as empty.
+		te := newTestEnv(t, "cn")
+		ctx := t.Context()
+
+		issue := &types.Issue{
+			ID:        "cn-reaper",
+			Title:     "Reaper-style close",
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+		}
+		if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("CreateIssue: %v", err)
+		}
+
+		// Bypass CloseIssue: directly mark closed without recording an event.
+		te.exec(t, ctx,
+			"UPDATE issues SET status = 'closed', closed_at = NOW() WHERE id = ?",
+			"cn-reaper")
+
+		got, err := te.store.GetIssue(ctx, "cn-reaper")
+		if err != nil {
+			t.Fatalf("GetIssue: %v", err)
+		}
+		if got.Status != types.StatusClosed {
+			t.Fatalf("Status: got %q, want closed", got.Status)
+		}
+		if got.ClosedBySession != "" {
+			t.Errorf("ClosedBySession with no close event: got %q, want empty", got.ClosedBySession)
+		}
+	})
+
+	t.Run("closed_by_session_null_event_session_returns_empty", func(t *testing.T) {
+		// Pre-PR1 close pattern: the events row exists but session is NULL
+		// (closed before the bd-edi events.session column was wired up, OR
+		// closed by a path that doesn't carry session attribution). Per the
+		// launch brief §3 absence contract, derived ClosedBySession is empty
+		// when the events.session column is NULL.
+		te := newTestEnv(t, "cz")
+		ctx := t.Context()
+
+		issue := &types.Issue{
+			ID:        "cz-pre",
+			Title:     "Closed pre-PR1",
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+		}
+		if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("CreateIssue: %v", err)
+		}
+		if err := te.store.CloseIssue(ctx, "cz-pre", "done", "tester", "session-will-be-nulled"); err != nil {
+			t.Fatalf("CloseIssue: %v", err)
+		}
+
+		// Simulate pre-PR1 state: NULL out the session on the close event row.
+		te.exec(t, ctx,
+			"UPDATE events SET session = NULL WHERE issue_id = ? AND event_type = 'closed'",
+			"cz-pre")
+
+		got, err := te.store.GetIssue(ctx, "cz-pre")
+		if err != nil {
+			t.Fatalf("GetIssue: %v", err)
+		}
+		if got.ClosedBySession != "" {
+			t.Errorf("ClosedBySession with NULL events.session: got %q, want empty", got.ClosedBySession)
+		}
+	})
+
 	t.Run("includes_labels", func(t *testing.T) {
 		te := newTestEnv(t, "il")
 		ctx := t.Context()
