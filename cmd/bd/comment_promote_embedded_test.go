@@ -208,3 +208,77 @@ func TestSessionAttribution_Comment(t *testing.T) {
 		}
 	})
 }
+
+// TestSessionAttribution_PromotePreservesSession verifies that the session
+// column on existing event rows survives the wisp_events → events boundary
+// crossing during promote. This is the test that would have caught the gap
+// fixed by 0d78608fe ('feat(session): preserve session column on promote/
+// demote round-trip'): pre-fix, the INSERT...SELECT bulk copy didn't include
+// the session column in either projection or column list, silently zeroing
+// out attribution on every event row for the promoted issue.
+//
+// The Phase 3 closure audit missed this because it grepped INSERT...VALUES
+// patterns and didn't catch INSERT...SELECT round-trips. The Phase 4
+// verification grep caught it. This test would have caught it earlier.
+//
+// Demote is not exercised here because DemoteToWisp is dolt-only — the
+// embedded backend supports PromoteFromEphemeral but not its inverse, so
+// demote testing requires a dolt-backed test which is out of scope for the
+// embedded test suite. Phase 4.1 fix at 0d78608fe applies to both
+// directions; promote-only coverage validates the symmetric contract
+// pattern. Demote-side coverage is tracked as a follow-up.
+//
+// Refs: bd-edi (PR1 Phase 7), 0d78608fe (the Phase 4.1 fix this would
+// have caught).
+func TestSessionAttribution_PromotePreservesSession(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	dir, beadsDir, _ := bdInit(t, bd, "--prefix", "spr")
+
+	t.Run("label_event_session_survives_promote", func(t *testing.T) {
+		// Create a wisp, label it with --session (writing a label_added
+		// event to wisp_events with session attribution), then promote.
+		// The promote operation must preserve session as it copies the
+		// event row from wisp_events to events.
+		wisp := bdCreate(t, bd, dir, "promote preserves session", "--ephemeral")
+
+		// Pre-promote: add a label with session attribution. This writes
+		// to wisp_events because the issue is still ephemeral.
+		labelCmd := exec.Command(bd, "label", "add", wisp.ID, "preserve-test",
+			"--session", "wisp-era-session")
+		labelCmd.Dir = dir
+		labelCmd.Env = bdEnv(dir)
+		if out, err := labelCmd.CombinedOutput(); err != nil {
+			t.Fatalf("bd label add failed: %v\n%s", err, out)
+		}
+
+		// Sanity: the event lives in wisp_events with the expected session.
+		// queryEventSessionSQL falls back to wisp_events when events is
+		// empty, so it picks up the wisp-era row directly.
+		preGot := queryEventSessionSQL(t, beadsDir, wisp.ID, "label_added")
+		if preGot != "wisp-era-session" {
+			t.Fatalf("pre-promote: expected wisp_events.session=wisp-era-session, got %q (test setup wrong, not a promote bug)", preGot)
+		}
+
+		// Promote: triggers the INSERT...SELECT from wisp_events to events.
+		promoteCmd := exec.Command(bd, "promote", wisp.ID)
+		promoteCmd.Dir = dir
+		promoteCmd.Env = bdEnv(dir)
+		if out, err := promoteCmd.CombinedOutput(); err != nil {
+			t.Fatalf("bd promote failed: %v\n%s", err, out)
+		}
+
+		// Post-promote: the label_added row now lives in events; assert
+		// session was preserved across the boundary. The Phase 4.1 fix
+		// (0d78608fe) added session to both the SELECT projection and the
+		// INSERT column list; without it, this assertion would see "".
+		postGot := queryEventSessionSQL(t, beadsDir, wisp.ID, "label_added")
+		if postGot != "wisp-era-session" {
+			t.Errorf("post-promote: expected events.session=wisp-era-session (preserved across boundary), got %q", postGot)
+		}
+	})
+}
