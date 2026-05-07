@@ -595,7 +595,12 @@ func (t *doltTransaction) UpdateIssue(ctx context.Context, id string, updates ma
 	return wrapExecError("update issue in tx", err)
 }
 
-// CloseIssue closes an issue within the transaction
+// CloseIssue closes an issue within the transaction.
+// session is threaded to the closed_by_session column on the issues row, but
+// this dolt implementation does not currently write a 'closed' event row
+// (unlike embeddedTransaction.CloseIssue, which delegates to
+// issueops.CloseIssueInTx and records the event). Same structural pattern as
+// the AddLabel/RemoveLabel gap below. Tracked as bd-3pc.
 func (t *doltTransaction) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	table := "issues"
 	if t.isActiveWisp(ctx, id) {
