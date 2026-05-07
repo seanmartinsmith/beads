@@ -38,6 +38,7 @@ var (
 	changeDir  string
 	dbPath     string
 	actor      string
+	session    string
 	store      storage.DoltStorage
 	jsonOutput bool
 
@@ -462,6 +463,38 @@ func getActorWithGit() string {
 	return "unknown"
 }
 
+// resolveSession returns the session identifier for event attribution.
+// Priority: --session flag > BEADS_SESSION_ID env > CLAUDE_SESSION_ID env > "".
+//
+// Two-layer opt-in: the --session flag is always honored, but environment
+// variables are read only when core.capture-session is true. Default behavior
+// (config off, no flag) returns "" — indistinguishable from pre-attribution.
+func resolveSession() string {
+	// Explicit flag always wins, regardless of opt-in config.
+	if session != "" {
+		return session
+	}
+
+	// Env vars require opt-in to prevent unattended capture in environments
+	// where CLAUDE_SESSION_ID is set globally but the user has not opted in.
+	if !config.GetBool("core.capture-session") {
+		return ""
+	}
+
+	// Primary env var.
+	if beadsSession := os.Getenv("BEADS_SESSION_ID"); beadsSession != "" {
+		return beadsSession
+	}
+
+	// Deprecated/secondary env var. Kept indefinitely for compatibility with
+	// upstream tooling that sets CLAUDE_SESSION_ID.
+	if claudeSession := os.Getenv("CLAUDE_SESSION_ID"); claudeSession != "" {
+		return claudeSession
+	}
+
+	return ""
+}
+
 // getOwner returns the human owner for CV attribution.
 // Priority: GIT_AUTHOR_EMAIL env > git config user.email > "" (empty)
 // This is the foundation for HOP CV (curriculum vitae) chains per Decision 008.
@@ -493,6 +526,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&changeDir, "directory", "C", "", "Change to this directory before running the command (like git -C)")
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
 	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BEADS_ACTOR, git user.name, $USER)")
+	rootCmd.PersistentFlags().StringVar(&session, "session", "", "Session identifier for event attribution (always honored; env vars require core.capture-session=true)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 	rootCmd.PersistentFlags().String("format", "", "Output format (json). Alias for --json")
 	_ = rootCmd.PersistentFlags().MarkHidden("format") // Hidden alias for CLI ergonomics

@@ -177,6 +177,12 @@ func Initialize() error {
 	_ = v.BindEnv("identity", "BEADS_IDENTITY") // BindEnv only fails with zero args, which can't happen here
 	v.SetDefault("identity", "")
 
+	// Session attribution opt-in. When false (default), BEADS_SESSION_ID and
+	// CLAUDE_SESSION_ID env vars are ignored by the resolver — only the
+	// explicit --session flag is honored. Protects against accidental capture
+	// in environments where CLAUDE_SESSION_ID is set globally.
+	v.SetDefault("core.capture-session", false)
+
 	// Dolt configuration defaults
 	// Controls whether beads should automatically create Dolt commits after write commands.
 	// Values: off | on
