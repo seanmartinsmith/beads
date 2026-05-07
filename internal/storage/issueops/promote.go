@@ -61,9 +61,10 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx *sql.Tx, id string, actor 
 	}
 
 	// Copy events: wisp_events → events (best-effort).
+	// session is preserved so existing attribution survives the promotion.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-		SELECT issue_id, event_type, actor, old_value, new_value, comment, created_at
+		INSERT IGNORE INTO events (issue_id, event_type, actor, session, old_value, new_value, comment, created_at)
+		SELECT issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 		FROM wisp_events WHERE issue_id = ?
 	`, id); err != nil {
 		log.Printf("promote %s: failed to copy events: %v", id, err)

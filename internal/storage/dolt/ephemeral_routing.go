@@ -236,10 +236,11 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 		}
 	}
 
-	// Copy events via INSERT...SELECT (best-effort: log but don't fail promotion)
+	// Copy events via INSERT...SELECT (best-effort: log but don't fail promotion).
+	// session is preserved so existing attribution survives the promotion.
 	if _, err := s.execContext(ctx, `
-		INSERT IGNORE INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-		SELECT issue_id, event_type, actor, old_value, new_value, comment, created_at
+		INSERT IGNORE INTO events (issue_id, event_type, actor, session, old_value, new_value, comment, created_at)
+		SELECT issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 		FROM wisp_events WHERE issue_id = ?
 	`, id); err != nil {
 		log.Printf("promote %s: failed to copy events (data may be lost): %v", id, err)
@@ -304,9 +305,10 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 	}
 
 	// Copy events: events → wisp_events.
+	// session is preserved so existing attribution survives the demotion.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO wisp_events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-		SELECT issue_id, event_type, actor, old_value, new_value, comment, created_at
+		INSERT IGNORE INTO wisp_events (issue_id, event_type, actor, session, old_value, new_value, comment, created_at)
+		SELECT issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 		FROM events WHERE issue_id = ?
 	`, id); err != nil {
 		log.Printf("demote %s: failed to copy events (data may be lost): %v", id, err)
