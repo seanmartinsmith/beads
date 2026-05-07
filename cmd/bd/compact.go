@@ -722,7 +722,7 @@ func runCompactApply(ctx context.Context, store storage.DoltStorage) {
 	savingBytes := originalSize - compactedSize
 	reductionPct := float64(savingBytes) / float64(originalSize) * 100
 	eventData := fmt.Sprintf("Tier %d compaction: %d → %d bytes (saved %d, %.1f%%)", compactTier, originalSize, compactedSize, savingBytes, reductionPct)
-	if err := store.AddComment(ctx, compactID, actor, "", eventData); err != nil {
+	if err := store.AddComment(ctx, compactID, actor, resolveSession(), eventData); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to record event: %v\n", err)
 		os.Exit(1)
 	}

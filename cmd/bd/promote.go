@@ -68,7 +68,7 @@ Examples:
 		if reason != "" {
 			comment += ": " + reason
 		}
-		if err := store.AddComment(ctx, fullID, actor, "", comment); err != nil {
+		if err := store.AddComment(ctx, fullID, actor, resolveSession(), comment); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to add promotion comment to %s: %v\n", fullID, err)
 		}
 
