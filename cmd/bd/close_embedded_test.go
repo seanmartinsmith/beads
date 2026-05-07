@@ -85,6 +85,40 @@ func querySessionSQL(t *testing.T, beadsDir, id string) string {
 	return session
 }
 
+// queryEventSessionSQL returns events.session for the most recent event row of
+// the given (issue_id, event_type). Used by Phase 7 round-trip tests to verify
+// that session attribution reaches the events table — the column where bd-fwb's
+// pre-fix call site silently dropped session values.
+//
+// Tries the events table first, then wisp_events, mirroring querySessionSQL.
+func queryEventSessionSQL(t *testing.T, beadsDir, issueID, eventType string) string {
+	t.Helper()
+	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	cfg, _ := configfile.Load(beadsDir)
+	database := ""
+	if cfg != nil {
+		database = cfg.GetDoltDatabase()
+	}
+	db, cleanup, err := embeddeddolt.OpenSQL(t.Context(), dataDir, database, "main")
+	if err != nil {
+		t.Fatalf("OpenSQL: %v", err)
+	}
+	defer cleanup()
+	var session string
+	err = db.QueryRowContext(t.Context(),
+		"SELECT COALESCE(session, '') FROM events WHERE issue_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1",
+		issueID, eventType).Scan(&session)
+	if err != nil {
+		err = db.QueryRowContext(t.Context(),
+			"SELECT COALESCE(session, '') FROM wisp_events WHERE issue_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1",
+			issueID, eventType).Scan(&session)
+		if err != nil {
+			t.Fatalf("query events.session for issue=%s event_type=%s: %v", issueID, eventType, err)
+		}
+	}
+	return session
+}
+
 // ===== Close tests =====
 
 func TestEmbeddedClose(t *testing.T) {
@@ -659,4 +693,127 @@ func TestEmbeddedCloseConcurrent(t *testing.T) {
 
 	t.Logf("created and closed %d issues across %d concurrent workers, %d in DB",
 		len(allIDs), numWorkers, stats.TotalIssues)
+}
+
+// TestSessionAttribution_Close verifies that the close path round-trips a
+// session identifier all the way to events.session. This is the test that
+// would have caught bd-fwb (close.go:44 hardcoded "" before faa391c03) — the
+// Phase 4 closure audit and Phase 4 verification grep both missed that
+// call-site escapee because they only inspected the RecordEventInTable
+// signature, not its arguments at each call site.
+//
+// The assertions target events.session (not issues.closed_by_session) because
+// PR1 relocates session-of-close to the events table; closed_by_session is now
+// a derived view. A regression in the call site silently empties events.session
+// while leaving closed_by_session intact, exactly the failure mode bd-fwb hid.
+//
+// Each sub-test exercises one source in the resolver chain
+// (--session > BEADS_SESSION_ID > CLAUDE_CODE_SESSION_ID > CLAUDE_SESSION_ID > "")
+// or the opt-in gate. Cross-cutting precedence tests live in commit #5.
+//
+// Refs: gastownhall/beads#3583 (PR1), bd-fwb (the bug this would have caught).
+func TestSessionAttribution_Close(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	dir, beadsDir, _ := bdInit(t, bd, "--prefix", "ts")
+
+	// closeAndQuery runs bd close with the caller's extraEnv overrides on top
+	// of bdEnv(dir), which already strips session-attribution env vars
+	// inherited from the running agent (see bdEnv comment, bd-z24).
+	closeAndQuery := func(t *testing.T, issueID string, extraEnv ...string) string {
+		t.Helper()
+		cmd := exec.Command(bd, "close", issueID)
+		cmd.Dir = dir
+		env := bdEnv(dir)
+		env = append(env, extraEnv...)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd close %s failed: %v\n%s", issueID, err, out)
+		}
+		return queryEventSessionSQL(t, beadsDir, issueID, "closed")
+	}
+
+	t.Run("flag_always_honored", func(t *testing.T) {
+		// --session bypasses the opt-in gate by design.
+		issue := bdCreate(t, bd, dir, "session flag round-trip", "--type", "task")
+		bdClose(t, bd, dir, issue.ID, "--session", "flag-sess")
+		got := queryEventSessionSQL(t, beadsDir, issue.ID, "closed")
+		if got != "flag-sess" {
+			t.Errorf("expected events.session=flag-sess, got %q", got)
+		}
+	})
+
+	t.Run("beads_env_with_opt_in", func(t *testing.T) {
+		// BEADS_SESSION_ID is the project-specific env var (priority 2).
+		issue := bdCreate(t, bd, dir, "BEADS_SESSION_ID round-trip", "--type", "task")
+		got := closeAndQuery(t, issue.ID,
+			"BD_CORE_CAPTURE_SESSION=true",
+			"BEADS_SESSION_ID=beads-env-sess",
+		)
+		if got != "beads-env-sess" {
+			t.Errorf("expected events.session=beads-env-sess, got %q", got)
+		}
+	})
+
+	t.Run("claude_code_env_with_opt_in", func(t *testing.T) {
+		// CLAUDE_CODE_SESSION_ID is auto-populated by Claude Code 2.1.132+
+		// on every Bash subprocess (priority 3). Resolver chain landed in
+		// 1379c9a1e (bd-8of).
+		issue := bdCreate(t, bd, dir, "CLAUDE_CODE_SESSION_ID round-trip", "--type", "task")
+		got := closeAndQuery(t, issue.ID,
+			"BD_CORE_CAPTURE_SESSION=true",
+			"CLAUDE_CODE_SESSION_ID=claude-code-sess",
+		)
+		if got != "claude-code-sess" {
+			t.Errorf("expected events.session=claude-code-sess, got %q", got)
+		}
+	})
+
+	t.Run("claude_legacy_env_with_opt_in", func(t *testing.T) {
+		// CLAUDE_SESSION_ID is the legacy fallback (priority 4) — kept for
+		// upstream tooling (Gas Town automation, Steve's scripts) that sets
+		// it directly. Superseded by CLAUDE_CODE_SESSION_ID for Claude Code
+		// contexts but retained indefinitely.
+		issue := bdCreate(t, bd, dir, "CLAUDE_SESSION_ID round-trip", "--type", "task")
+		got := closeAndQuery(t, issue.ID,
+			"BD_CORE_CAPTURE_SESSION=true",
+			"CLAUDE_SESSION_ID=claude-legacy-sess",
+		)
+		if got != "claude-legacy-sess" {
+			t.Errorf("expected events.session=claude-legacy-sess, got %q", got)
+		}
+	})
+
+	t.Run("env_without_opt_in_is_dropped", func(t *testing.T) {
+		// The opt-in gate (core.capture-session) protects environments where
+		// CLAUDE_CODE_SESSION_ID is set globally but the user has not opted
+		// in to attribution. Without the gate, every bd call inside Claude
+		// Code would auto-capture, violating the "no unattended logging"
+		// anchor in the PR1 design.
+		issue := bdCreate(t, bd, dir, "env without opt-in", "--type", "task")
+		got := closeAndQuery(t, issue.ID,
+			// Note: no BD_CORE_CAPTURE_SESSION.
+			"CLAUDE_CODE_SESSION_ID=should-be-dropped",
+		)
+		if got != "" {
+			t.Errorf("expected events.session='' (env var dropped without opt-in), got %q", got)
+		}
+	})
+
+	t.Run("flag_works_without_opt_in", func(t *testing.T) {
+		// The flag is the explicit-consent path; it must work even when
+		// core.capture-session is false. This is the contract that distinguishes
+		// the flag from env vars.
+		issue := bdCreate(t, bd, dir, "flag without opt-in", "--type", "task")
+		bdClose(t, bd, dir, issue.ID, "--session", "flag-no-opt-in-sess")
+		got := queryEventSessionSQL(t, beadsDir, issue.ID, "closed")
+		if got != "flag-no-opt-in-sess" {
+			t.Errorf("expected events.session=flag-no-opt-in-sess, got %q", got)
+		}
+	})
 }
