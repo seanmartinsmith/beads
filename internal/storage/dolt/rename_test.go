@@ -97,7 +97,7 @@ func TestUpdateIssueIDUpdatesWispTables(t *testing.T) {
 
 	// Now rename the issue
 	newID := "test-new1"
-	if err := store.UpdateIssueID(ctx, "test-old1", newID, issue, "test"); err != nil {
+	if err := store.UpdateIssueID(ctx, "test-old1", newID, issue, "test", ""); err != nil {
 		t.Fatalf("UpdateIssueID failed: %v", err)
 	}
 
@@ -218,7 +218,7 @@ func TestUpdateIssueIDRenamesWisp(t *testing.T) {
 	// Rename the wisp
 	newID := "test-renamed-wisp"
 	wisp.ID = newID
-	if err := store.UpdateIssueID(ctx, oldID, newID, wisp, "tester"); err != nil {
+	if err := store.UpdateIssueID(ctx, oldID, newID, wisp, "tester", ""); err != nil {
 		t.Fatalf("UpdateIssueID failed: %v", err)
 	}
 
@@ -302,7 +302,7 @@ func TestUpdateIssueIDStillWorksForRegularIssues(t *testing.T) {
 	// Rename it
 	newID := "test-regular-renamed"
 	issue.ID = newID
-	if err := store.UpdateIssueID(ctx, "test-regular-1", newID, issue, "tester"); err != nil {
+	if err := store.UpdateIssueID(ctx, "test-regular-1", newID, issue, "tester", ""); err != nil {
 		t.Fatalf("UpdateIssueID failed: %v", err)
 	}
 
