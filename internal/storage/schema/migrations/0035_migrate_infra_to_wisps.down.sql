@@ -1,5 +1,26 @@
-INSERT IGNORE INTO issues SELECT * FROM wisps
-WHERE issue_type IN ('agent', 'rig', 'role', 'message');
+-- Move infra-type rows from wisps back into issues using the intersection
+-- of columns common to both tables. See up migration for rationale.
+SET SESSION group_concat_max_len = 32768;
+SET @cols = (
+    SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION SEPARATOR ',')
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'issues'
+      AND COLUMN_NAME IN (
+          SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisps'
+      )
+);
+SET @sql = IF(
+    @cols IS NOT NULL AND @cols <> '',
+    CONCAT(
+        'INSERT IGNORE INTO issues (', @cols, ') ',
+        'SELECT ', @cols, ' FROM wisps ',
+        'WHERE issue_type IN (''agent'', ''rig'', ''role'', ''message'')'
+    ),
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 UPDATE issues SET ephemeral = 0
 WHERE issue_type IN ('agent', 'rig', 'role', 'message');
