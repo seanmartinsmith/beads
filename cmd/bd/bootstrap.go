@@ -236,14 +236,21 @@ func applyBootstrapMetadataRepair(beadsDir string, cfg *configfile.Config, apply
 
 // BootstrapPlan describes what bootstrap will do.
 type BootstrapPlan struct {
-	Action      string `json:"action"` // "sync", "restore", "jsonl-import", "init", "none"
-	Reason      string `json:"reason"` // Human-readable explanation
-	BeadsDir    string `json:"beads_dir"`
-	Database    string `json:"database"`
-	SyncRemote  string `json:"sync_remote,omitempty"`
-	BackupDir   string `json:"backup_dir,omitempty"`
-	JSONLFile   string `json:"jsonl_file,omitempty"`
-	HasExisting bool   `json:"has_existing"`
+	Action     string `json:"action"` // "sync", "restore", "jsonl-import", "init", "none"
+	Reason     string `json:"reason"` // Human-readable explanation
+	BeadsDir   string `json:"beads_dir"`
+	Database   string `json:"database"`
+	SyncRemote string `json:"sync_remote,omitempty"`
+	// SyncRemoteSource describes where SyncRemote came from. Used by the sync
+	// action to decide how loud the confirmation prompt needs to be:
+	//   "explicit"     — user set sync.remote in config or via --remote (trusted)
+	//   "git-origin"   — auto-derived from git origin's refs/dolt/data (footgun
+	//                    when origin == upstream on a fork-less clone; see bd-jui)
+	// Empty when Action != "sync".
+	SyncRemoteSource string `json:"sync_remote_source,omitempty"`
+	BackupDir        string `json:"backup_dir,omitempty"`
+	JSONLFile        string `json:"jsonl_file,omitempty"`
+	HasExisting      bool   `json:"has_existing"`
 }
 
 func noWorkspaceBootstrapPayload() map[string]interface{} {
@@ -284,6 +291,7 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 		// normalizeRemoteURL would convert http:// to git+http://,
 		// breaking Dolt remotesapi endpoints (GH#3339).
 		plan.SyncRemote = syncRemote
+		plan.SyncRemoteSource = "explicit"
 		plan.Action = "sync"
 		plan.Reason = "sync.remote configured — will clone from " + syncRemote
 		return plan
@@ -292,10 +300,17 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 	// Auto-detect: probe git origin for Dolt data stored in git
 	// (refs/dolt/data). This only applies to git remotes — Dolt-native
 	// remotes (DoltHub, S3, etc.) must be configured via sync.remote.
+	//
+	// This is the dangerous path that motivated bd-jui: on a fork-less
+	// clone where origin IS upstream, this will happily clone thousands of
+	// upstream issues into the user's database. The sync action's
+	// executeSyncAction now requires explicit confirmation when
+	// SyncRemoteSource == "git-origin"; see prepareSyncConfirmation.
 	if isGitRepo() && !isBareGitRepo() {
 		if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
 			if gitOriginHasDoltDataRef() {
 				plan.SyncRemote = normalizeRemoteURL(originURL)
+				plan.SyncRemoteSource = "git-origin"
 				plan.Action = "sync"
 				plan.Reason = "Found Dolt data on git origin (refs/dolt/data) — will clone from " + originURL
 				return plan
@@ -467,6 +482,13 @@ func printBootstrapPlan(plan BootstrapPlan) {
 		fmt.Printf("Bootstrap plan: clone from remote\n")
 		fmt.Printf("  Remote: %s\n", plan.SyncRemote)
 		fmt.Printf("  Database: %s\n", plan.Database)
+		if plan.SyncRemoteSource == "git-origin" {
+			fmt.Printf("  Source: auto-derived from git origin (no sync.remote configured)\n")
+			fmt.Printf("  Warning: this will import every issue from the remote bd database.\n")
+			fmt.Printf("           If origin is an upstream repo you forgot to fork, you may\n")
+			fmt.Printf("           clone thousands of issues. Re-run with --yes to confirm,\n")
+			fmt.Printf("           or run 'bd init --no-remote' to skip auto-derivation.\n")
+		}
 	case "restore":
 		fmt.Printf("Bootstrap plan: restore from backup\n")
 		fmt.Printf("  Backup dir: %s\n", plan.BackupDir)
@@ -496,8 +518,46 @@ func confirmPrompt(message string, nonInteractive bool) bool {
 	return line == "" || line == "y" || line == "yes"
 }
 
+// confirmAutoDerivedSync gates the bd-jui footgun: a sync action whose
+// sync.remote was auto-derived from git origin. Unlike confirmPrompt, this
+// refuses to silently auto-confirm on a non-TTY stdin; the caller must
+// supply an explicit signal (--yes, --non-interactive, BD_NON_INTERACTIVE=1,
+// CI=true, or an interactive y/Y at a TTY). See bd-jui.
+func confirmAutoDerivedSync(plan BootstrapPlan, nonInteractive bool) bool {
+	if nonInteractive {
+		// Caller provided an explicit affirmative signal (flag/env/CI).
+		// Log to make the auto-confirmed action auditable.
+		fmt.Fprintf(os.Stderr, "Auto-confirming sync from auto-derived origin %s (non-interactive mode).\n", plan.SyncRemote)
+		return true
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		// No explicit signal and no interactive TTY: refuse rather than
+		// silently cloning. This is the case that caused the 4559-issue
+		// incident.
+		fmt.Fprintf(os.Stderr, "Refusing to auto-derive sync.remote from git origin without an interactive TTY.\n")
+		fmt.Fprintf(os.Stderr, "Pass --yes (or set BD_NON_INTERACTIVE=1 / CI=true) to confirm, or run\n")
+		fmt.Fprintf(os.Stderr, "'bd init --no-remote' to skip auto-derivation entirely.\n")
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "Clone bd database from auto-derived origin %s? [y/N] ", plan.SyncRemote)
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(strings.ToLower(line))
+	return line == "y" || line == "yes"
+}
+
 func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config, nonInteractive bool) error {
-	if !confirmPrompt("Proceed?", nonInteractive) {
+	// Auto-derived sync URLs (origin == upstream on fork-less clones) are
+	// the bd-jui footgun: bootstrap will silently clone thousands of
+	// upstream issues. Require an explicit affirmative signal — --yes,
+	// BD_NON_INTERACTIVE=1, CI=true, or an interactive y/Y — and refuse
+	// to silently auto-confirm on a non-TTY stdin. See bd-jui.
+	if plan.Action == "sync" && plan.SyncRemoteSource == "git-origin" {
+		if !confirmAutoDerivedSync(plan, nonInteractive) {
+			fmt.Fprintf(os.Stderr, "Aborted. Re-run with --yes to confirm, or 'bd init --no-remote' to skip auto-derivation.\n")
+			return nil
+		}
+	} else if !confirmPrompt("Proceed?", nonInteractive) {
 		fmt.Fprintf(os.Stderr, "Aborted.\n")
 		return nil
 	}

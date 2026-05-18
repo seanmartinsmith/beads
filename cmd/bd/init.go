@@ -82,6 +82,11 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		fromJSONL, _ := cmd.Flags().GetBool("from-jsonl")
 		initRemote, _ := cmd.Flags().GetString("remote")
 		initRemoteChanged := cmd.Flags().Changed("remote")
+		initNoRemote, _ := cmd.Flags().GetBool("no-remote")
+		if initNoRemote && initRemoteChanged && initRemote != "" {
+			fmt.Fprintf(os.Stderr, "Error: --no-remote and --remote are mutually exclusive\n")
+			os.Exit(1)
+		}
 		// Dolt server connection flags
 		backendFlag, _ := cmd.Flags().GetString("backend")
 		initServerMode, _ := cmd.Flags().GetBool("server")
@@ -361,7 +366,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				// back to a fresh local init against a new remote.
 			} else if earlyRemoteSource == initSyncRemoteConfigured {
 				earlyRemoteHasDoltData = true // sync.remote configured = user intends bootstrap
-			} else if earlyRemoteSource == initSyncRemoteNone && !stealth && isGitRepo() && !isBareGitRepo() {
+			} else if earlyRemoteSource == initSyncRemoteNone && !stealth && !initNoRemote && isGitRepo() && !isBareGitRepo() {
 				if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
 					earlySyncURL = normalizeRemoteURL(originURL)
 					earlyRemoteHasDoltData = gitOriginHasDoltDataRef()
@@ -640,7 +645,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// http:// to git+http:// and break Dolt remotesapi endpoints
 			// configured explicitly by the user (GH#3339).
 			syncFromRemote = true
-		} else if syncRemoteSource == initSyncRemoteNone && !stealth && isGitRepo() && !isBareGitRepo() {
+		} else if syncRemoteSource == initSyncRemoteNone && !stealth && !initNoRemote && isGitRepo() && !isBareGitRepo() {
 			if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
 				syncURL = normalizeRemoteURL(originURL)
 				syncURLFromGitOrigin = true
@@ -1490,6 +1495,7 @@ func init() {
 	initCmd.Flags().String("agents-profile", "", "AGENTS.md profile: 'minimal' (default, pointer to bd prime) or 'full' (complete command reference)")
 	initCmd.Flags().String("agents-file", "", "Custom filename for agent instructions (default: AGENTS.md)")
 	initCmd.Flags().String("remote", "", "Dolt remote URL to clone from and persist as sync.remote")
+	initCmd.Flags().Bool("no-remote", false, "Do not auto-derive sync.remote from git origin (prevents accidental clone of upstream's bd database on fork-less clones)")
 
 	// Non-interactive mode for CI/cloud agents
 	initCmd.Flags().Bool("non-interactive", false, "Skip all interactive prompts (auto-detected in CI or non-TTY environments)")
