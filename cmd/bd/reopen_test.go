@@ -55,7 +55,7 @@ func (h *reopenTestHelper) getIssue(issueID string) *types.Issue {
 }
 
 func (h *reopenTestHelper) addComment(issueID, comment string) {
-	if err := h.s.AddComment(h.ctx, issueID, "test-user", comment); err != nil {
+	if err := h.s.AddComment(h.ctx, issueID, "test-user", comment, ""); err != nil {
 		h.t.Fatalf("Failed to add comment: %v", err)
 	}
 }

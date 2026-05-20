@@ -840,7 +840,7 @@ func TestClaimReadyIssue_UnboundedPopulatesAndReusesBlockedIDsCache(t *testing.T
 	}
 
 	filter := types.WorkFilter{Type: string(types.TypeBug)}
-	claimed, err := store.ClaimReadyIssue(ctx, filter, "tester")
+	claimed, err := store.ClaimReadyIssue(ctx, filter, "tester", "")
 	if err != nil {
 		t.Fatalf("first claim ready issue: %v", err)
 	}
@@ -856,7 +856,7 @@ func TestClaimReadyIssue_UnboundedPopulatesAndReusesBlockedIDsCache(t *testing.T
 	}
 	firstCacheEntry := &firstCache[0]
 
-	claimed, err = store.ClaimReadyIssue(ctx, filter, "tester")
+	claimed, err = store.ClaimReadyIssue(ctx, filter, "tester", "")
 	if err != nil {
 		t.Fatalf("second claim ready issue: %v", err)
 	}
@@ -2004,7 +2004,7 @@ func TestSearchIssues_LabelFilter(t *testing.T) {
 		}
 	}
 
-	if err := store.AddLabel(ctx, labeled.ID, "important", "tester"); err != nil {
+	if err := store.AddLabel(ctx, labeled.ID, "important", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
 

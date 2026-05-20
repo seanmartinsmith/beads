@@ -63,7 +63,7 @@ func (h *listTestHelper) createTestIssues() {
 }
 
 func (h *listTestHelper) addLabel(id, label string) {
-	if err := h.store.AddLabel(h.ctx, id, label, "test-user"); err != nil {
+	if err := h.store.AddLabel(h.ctx, id, label, "test-user", ""); err != nil {
 		h.t.Fatalf("Failed to add label: %v", err)
 	}
 }
@@ -280,9 +280,9 @@ func TestListQueryCapabilitiesSuite(t *testing.T) {
 	}
 
 	// Add labels
-	s.AddLabel(ctx, issue1.ID, "critical", "test-user")
-	s.AddLabel(ctx, issue1.ID, "security", "test-user")
-	s.AddLabel(ctx, issue3.ID, "docs", "test-user")
+	s.AddLabel(ctx, issue1.ID, "critical", "test-user", "")
+	s.AddLabel(ctx, issue1.ID, "security", "test-user", "")
+	s.AddLabel(ctx, issue3.ID, "docs", "test-user", "")
 
 	t.Run("pattern matching - title contains", func(t *testing.T) {
 		results, err := s.SearchIssues(ctx, "", types.IssueFilter{

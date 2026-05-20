@@ -176,10 +176,10 @@ func TestDemoteToWisp_LabelsPreserved(t *testing.T) {
 	id := issue.ID
 
 	// Add labels before demotion.
-	if err := store.AddLabel(ctx, id, "priority-hot", "tester"); err != nil {
+	if err := store.AddLabel(ctx, id, "priority-hot", "tester", ""); err != nil {
 		t.Fatalf("AddLabel: %v", err)
 	}
-	if err := store.AddLabel(ctx, id, "review", "tester"); err != nil {
+	if err := store.AddLabel(ctx, id, "review", "tester", ""); err != nil {
 		t.Fatalf("AddLabel: %v", err)
 	}
 

@@ -16,7 +16,7 @@ type stubStore struct {
 	getIssueFn         func(context.Context, string) (*types.Issue, error)
 	updateIssueFn      func(context.Context, string, map[string]interface{}, string) error
 	applyCompactionFn  func(context.Context, string, int, int, int, string) error
-	addCommentFn       func(context.Context, string, string, string) error
+	addCommentFn       func(context.Context, string, string, string, string) error
 }
 
 func (s *stubStore) CheckEligibility(ctx context.Context, issueID string, tier int) (bool, string, error) {
@@ -47,9 +47,9 @@ func (s *stubStore) ApplyCompaction(ctx context.Context, issueID string, tier in
 	return nil
 }
 
-func (s *stubStore) AddComment(ctx context.Context, issueID, actor, comment string) error {
+func (s *stubStore) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	if s.addCommentFn != nil {
-		return s.addCommentFn(ctx, issueID, actor, comment)
+		return s.addCommentFn(ctx, issueID, actor, session, comment)
 	}
 	return nil
 }
@@ -120,7 +120,7 @@ func TestCompactTier1_Success(t *testing.T) {
 			}
 			return nil
 		},
-		addCommentFn: func(ctx context.Context, id, actor, comment string) error {
+		addCommentFn: func(ctx context.Context, id, actor, session, comment string) error {
 			if !strings.Contains(comment, "saved") {
 				t.Fatalf("unexpected comment %q", comment)
 			}
@@ -158,7 +158,7 @@ func TestCompactTier1_SummaryNotSmaller(t *testing.T) {
 	store := &stubStore{
 		checkEligibilityFn: func(context.Context, string, int) (bool, string, error) { return true, "", nil },
 		getIssueFn:         func(context.Context, string) (*types.Issue, error) { return stubIssue(), nil },
-		addCommentFn: func(ctx context.Context, id, actor, comment string) error {
+		addCommentFn: func(ctx context.Context, id, actor, session, comment string) error {
 			commentCalled = true
 			if !strings.Contains(comment, "Tier 1 compaction skipped") {
 				t.Fatalf("unexpected comment %q", comment)
@@ -403,7 +403,7 @@ func TestCompactTier1_AddCommentError(t *testing.T) {
 		getIssueFn:         func(context.Context, string) (*types.Issue, error) { return stubIssue(), nil },
 		updateIssueFn:      func(context.Context, string, map[string]interface{}, string) error { return nil },
 		applyCompactionFn:  func(context.Context, string, int, int, int, string) error { return nil },
-		addCommentFn:       func(context.Context, string, string, string) error { return errors.New("comment failed") },
+		addCommentFn:       func(context.Context, string, string, string, string) error { return errors.New("comment failed") },
 	}
 	summary := &stubSummarizer{summary: "short"}
 	c := &Compactor{store: store, summarizer: summary, config: &Config{}}
@@ -421,7 +421,7 @@ func TestCompactTier1_SummaryNotSmaller_CommentError(t *testing.T) {
 	store := &stubStore{
 		checkEligibilityFn: func(context.Context, string, int) (bool, string, error) { return true, "", nil },
 		getIssueFn:         func(context.Context, string) (*types.Issue, error) { return stubIssue(), nil },
-		addCommentFn:       func(context.Context, string, string, string) error { return errors.New("comment failed") },
+		addCommentFn:       func(context.Context, string, string, string, string) error { return errors.New("comment failed") },
 	}
 	summary := &stubSummarizer{summary: strings.Repeat("X", 40)}
 	c := &Compactor{store: store, summarizer: summary, config: &Config{}}
@@ -504,7 +504,7 @@ func TestCompactTier1Batch_MixedResults(t *testing.T) {
 			mu.Unlock()
 			return nil
 		},
-		addCommentFn: func(context.Context, string, string, string) error { return nil },
+		addCommentFn: func(context.Context, string, string, string, string) error { return nil },
 	}
 	summary := &stubSummarizer{summary: "short"}
 	c := &Compactor{store: store, summarizer: summary, config: &Config{Concurrency: 2}}

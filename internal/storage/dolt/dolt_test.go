@@ -716,10 +716,10 @@ func TestDoltStoreLabels(t *testing.T) {
 	}
 
 	// Add labels
-	if err := store.AddLabel(ctx, issue.ID, "bug", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue.ID, "bug", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
-	if err := store.AddLabel(ctx, issue.ID, "priority", "tester"); err != nil {
+	if err := store.AddLabel(ctx, issue.ID, "priority", "tester", ""); err != nil {
 		t.Fatalf("failed to add second label: %v", err)
 	}
 
@@ -733,7 +733,7 @@ func TestDoltStoreLabels(t *testing.T) {
 	}
 
 	// Remove label
-	if err := store.RemoveLabel(ctx, issue.ID, "bug", "tester"); err != nil {
+	if err := store.RemoveLabel(ctx, issue.ID, "bug", "tester", ""); err != nil {
 		t.Fatalf("failed to remove label: %v", err)
 	}
 
@@ -1025,7 +1025,7 @@ func TestDoltStoreEvents(t *testing.T) {
 	}
 
 	// Add a comment event
-	if err := store.AddComment(ctx, issue.ID, "user1", "A comment"); err != nil {
+	if err := store.AddComment(ctx, issue.ID, "user1", "A comment", ""); err != nil {
 		t.Fatalf("failed to add comment: %v", err)
 	}
 
@@ -1245,7 +1245,7 @@ func TestDeleteIssuesDryRun(t *testing.T) {
 			}
 		}
 	}
-	if err := store.AddLabel(ctx, "dry-1", "test-label", "tester"); err != nil {
+	if err := store.AddLabel(ctx, "dry-1", "test-label", "tester", ""); err != nil {
 		t.Fatalf("failed to add label: %v", err)
 	}
 

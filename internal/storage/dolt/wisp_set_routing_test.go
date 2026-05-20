@@ -39,7 +39,7 @@ func TestWispIDSetInTx_HardGate(t *testing.T) {
 	if err := store.CreateIssue(ctx, perm, "tester"); err != nil {
 		t.Fatalf("create perm: %v", err)
 	}
-	if err := store.AddLabel(ctx, perm.ID, "foo", "tester"); err != nil {
+	if err := store.AddLabel(ctx, perm.ID, "foo", "tester", ""); err != nil {
 		t.Fatalf("add label to perm: %v", err)
 	}
 
@@ -54,7 +54,7 @@ func TestWispIDSetInTx_HardGate(t *testing.T) {
 	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
 		t.Fatalf("create wisp: %v", err)
 	}
-	if err := store.AddLabel(ctx, wisp.ID, "bar", "tester"); err != nil {
+	if err := store.AddLabel(ctx, wisp.ID, "bar", "tester", ""); err != nil {
 		t.Fatalf("add label to wisp: %v", err)
 	}
 	if !store.isActiveWisp(ctx, wisp.ID) {

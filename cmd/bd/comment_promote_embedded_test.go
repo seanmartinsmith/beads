@@ -84,7 +84,7 @@ func TestEmbeddedComments(t *testing.T) {
 		issue := bdCreate(t, bd, dir, "Event comment target", "--type", "task")
 
 		store := openStore(t, beadsDir, "cm")
-		if err := store.AddComment(t.Context(), issue.ID, "actor", "A comment event"); err != nil {
+		if err := store.AddComment(t.Context(), issue.ID, "actor", "A comment event", ""); err != nil {
 			t.Fatalf("AddComment: %v", err)
 		}
 	})

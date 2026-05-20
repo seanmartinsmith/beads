@@ -33,13 +33,13 @@ func (h *stateTestHelper) createIssue(title string, issueType types.IssueType, p
 }
 
 func (h *stateTestHelper) addLabel(issueID, label string) {
-	if err := h.s.AddLabel(h.ctx, issueID, label, "test-user"); err != nil {
+	if err := h.s.AddLabel(h.ctx, issueID, label, "test-user", ""); err != nil {
 		h.t.Fatalf("Failed to add label '%s': %v", label, err)
 	}
 }
 
 func (h *stateTestHelper) removeLabel(issueID, label string) {
-	if err := h.s.RemoveLabel(h.ctx, issueID, label, "test-user"); err != nil {
+	if err := h.s.RemoveLabel(h.ctx, issueID, label, "test-user", ""); err != nil {
 		h.t.Fatalf("Failed to remove label '%s': %v", label, err)
 	}
 }

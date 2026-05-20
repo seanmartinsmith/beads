@@ -178,7 +178,7 @@ func TestGetLabelsForIssuesInTx_SmallInputLargeWispTable(t *testing.T) {
 	if err := store.CreateIssue(ctx, perm, "tester"); err != nil {
 		t.Fatalf("create perm: %v", err)
 	}
-	if err := store.AddLabel(ctx, perm.ID, "perm-label", "tester"); err != nil {
+	if err := store.AddLabel(ctx, perm.ID, "perm-label", "tester", ""); err != nil {
 		t.Fatalf("add perm label: %v", err)
 	}
 
@@ -193,7 +193,7 @@ func TestGetLabelsForIssuesInTx_SmallInputLargeWispTable(t *testing.T) {
 	if err := store.CreateIssue(ctx, target, "tester"); err != nil {
 		t.Fatalf("create target wisp: %v", err)
 	}
-	if err := store.AddLabel(ctx, target.ID, "target-label", "tester"); err != nil {
+	if err := store.AddLabel(ctx, target.ID, "target-label", "tester", ""); err != nil {
 		t.Fatalf("add target label: %v", err)
 	}
 
@@ -212,7 +212,7 @@ func TestGetLabelsForIssuesInTx_SmallInputLargeWispTable(t *testing.T) {
 		if err := store.CreateIssue(ctx, iss, "tester"); err != nil {
 			t.Fatalf("create noise %d: %v", i, err)
 		}
-		if err := store.AddLabel(ctx, iss.ID, fmt.Sprintf("noise-%d", i), "tester"); err != nil {
+		if err := store.AddLabel(ctx, iss.ID, fmt.Sprintf("noise-%d", i), "tester", ""); err != nil {
 			t.Fatalf("add noise label %d: %v", i, err)
 		}
 		noiseIDs = append(noiseIDs, iss.ID)

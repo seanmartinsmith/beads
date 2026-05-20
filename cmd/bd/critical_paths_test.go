@@ -642,7 +642,7 @@ func TestPostCreateWritesDoltCommit(t *testing.T) {
 		}
 
 		// Add label (post-create write)
-		if err := s.AddLabel(ctx, issue.ID, "important", "test"); err != nil {
+		if err := s.AddLabel(ctx, issue.ID, "important", "test", ""); err != nil {
 			t.Fatalf("Failed to add label: %v", err)
 		}
 

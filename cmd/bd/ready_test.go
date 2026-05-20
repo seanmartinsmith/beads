@@ -454,16 +454,16 @@ func TestGetReadyWork_ExcludeLabels(t *testing.T) {
 			t.Fatalf("CreateIssue %s: %v", iss.ID, err)
 		}
 	}
-	if err := s.AddLabel(ctx, "excl-2", "triage:pending", "test"); err != nil {
+	if err := s.AddLabel(ctx, "excl-2", "triage:pending", "test", ""); err != nil {
 		t.Fatalf("AddLabel excl-2: %v", err)
 	}
-	if err := s.AddLabel(ctx, "excl-3", "wontfix", "test"); err != nil {
+	if err := s.AddLabel(ctx, "excl-3", "wontfix", "test", ""); err != nil {
 		t.Fatalf("AddLabel excl-3: %v", err)
 	}
-	if err := s.AddLabel(ctx, "excl-4", "triage:pending", "test"); err != nil {
+	if err := s.AddLabel(ctx, "excl-4", "triage:pending", "test", ""); err != nil {
 		t.Fatalf("AddLabel excl-4 triage:pending: %v", err)
 	}
-	if err := s.AddLabel(ctx, "excl-4", "backend", "test"); err != nil {
+	if err := s.AddLabel(ctx, "excl-4", "backend", "test", ""); err != nil {
 		t.Fatalf("AddLabel excl-4 backend: %v", err)
 	}
 
