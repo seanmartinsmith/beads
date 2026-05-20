@@ -310,7 +310,7 @@ func bondProtoProto(ctx context.Context, s storage.DoltStorage, protoA, protoB *
 		compoundID = compound.ID
 
 		// Add template label (labels are stored separately, not in issue table)
-		if err := tx.AddLabel(ctx, compoundID, MoleculeLabel, actorName); err != nil {
+		if err := tx.AddLabel(ctx, compoundID, MoleculeLabel, actorName, resolveSession()); err != nil {
 			return fmt.Errorf("adding template label: %w", err)
 		}
 

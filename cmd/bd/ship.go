@@ -120,7 +120,7 @@ func runShip(cmd *cobra.Command, args []string) {
 	}
 
 	// Add provides:<capability> label (use direct store access)
-	if err := store.AddLabel(ctx, issue.ID, providesLabel, actor); err != nil {
+	if err := store.AddLabel(ctx, issue.ID, providesLabel, actor, resolveSession()); err != nil {
 		FatalError("adding label: %v", err)
 	}
 

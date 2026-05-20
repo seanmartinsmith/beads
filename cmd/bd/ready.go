@@ -196,7 +196,7 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		}
 
 		if claimReady {
-			claimed, err := activeStore.ClaimReadyIssue(ctx, filter, actor)
+			claimed, err := activeStore.ClaimReadyIssue(ctx, filter, actor, resolveSession())
 			if err != nil {
 				FatalErrorRespectJSON("%v", err)
 			}

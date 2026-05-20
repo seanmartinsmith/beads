@@ -182,6 +182,12 @@ func Initialize() error {
 	// Values: off | on
 	v.SetDefault("dolt.auto-commit", "on")
 
+	// Session attribution opt-in (bd-edi). Default off: env vars
+	// (BEADS_SESSION_ID, CLAUDE_CODE_SESSION_ID, CLAUDE_SESSION_ID) are NOT
+	// consulted unless this is true. The --session flag is always honored
+	// regardless of this setting.
+	v.SetDefault("core.capture-session", false)
+
 	// Routing configuration defaults
 	v.SetDefault("routing.mode", "")
 	v.SetDefault("routing.default", ".")

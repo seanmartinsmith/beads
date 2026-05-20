@@ -865,8 +865,9 @@ func cookFormula(ctx context.Context, s storage.DoltStorage, f *formula.Formula,
 		}
 
 		// Add labels
+		sessionID := resolveSession()
 		for _, l := range labels {
-			if err := tx.AddLabel(ctx, l.issueID, l.label, actor); err != nil {
+			if err := tx.AddLabel(ctx, l.issueID, l.label, actor, sessionID); err != nil {
 				return fmt.Errorf("failed to add label %s to %s: %w", l.label, l.issueID, err)
 			}
 		}

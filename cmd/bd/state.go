@@ -211,14 +211,15 @@ The --reason flag provides context for the event bead (recommended).`,
 		eventID = childID
 
 		// 2. Remove old label if exists
+		sessionID := resolveSession()
 		if oldLabel != "" {
-			if err := store.RemoveLabel(ctx, fullID, oldLabel, actor); err != nil {
+			if err := store.RemoveLabel(ctx, fullID, oldLabel, actor, sessionID); err != nil {
 				WarnError("failed to remove old label %s: %v", oldLabel, err)
 			}
 		}
 
 		// 3. Add new label
-		if err := store.AddLabel(ctx, fullID, newLabel, actor); err != nil {
+		if err := store.AddLabel(ctx, fullID, newLabel, actor, sessionID); err != nil {
 			FatalErrorRespectJSON("adding label: %v", err)
 		}
 

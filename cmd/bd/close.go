@@ -256,7 +256,7 @@ create, update, show, or close operation).`,
 				fmt.Fprintf(os.Stderr, "Warning: could not get ready issues: %v\n", err)
 			} else if len(readyIssues) > 0 {
 				nextIssue := readyIssues[0]
-				err := postCloseStore.ClaimIssue(ctx, nextIssue.ID, actor)
+				err := postCloseStore.ClaimIssue(ctx, nextIssue.ID, actor, resolveSession())
 				if err == nil {
 					claimedNextIssue = nextIssue
 					mutatedStores[postCloseStore] = struct{}{}

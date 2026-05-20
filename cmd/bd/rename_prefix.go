@@ -316,7 +316,7 @@ func repairPrefixes(ctx context.Context, st storage.DoltStorage, actorName strin
 		}
 
 		// Update the issue in the database
-		if err := st.UpdateIssueID(ctx, oldID, newID, issue, actorName); err != nil {
+		if err := st.UpdateIssueID(ctx, oldID, newID, issue, actorName, resolveSession()); err != nil {
 			return fmt.Errorf("failed to update issue %s -> %s: %w", oldID, newID, err)
 		}
 
@@ -378,7 +378,7 @@ func renamePrefixInDB(ctx context.Context, oldPrefix, newPrefix string, issues [
 			issue.Notes = oldPrefixPattern.ReplaceAllStringFunc(issue.Notes, replaceFunc)
 		}
 
-		if err := store.UpdateIssueID(ctx, oldID, newID, issue, actor); err != nil {
+		if err := store.UpdateIssueID(ctx, oldID, newID, issue, actor, resolveSession()); err != nil {
 			return fmt.Errorf("failed to update issue %s: %w", oldID, err)
 		}
 	}

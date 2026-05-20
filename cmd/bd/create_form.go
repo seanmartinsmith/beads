@@ -209,8 +209,9 @@ func CreateIssueFromFormValues(ctx context.Context, s storage.DoltStorage, fv *c
 	}
 
 	// Add labels if specified
+	sessionID := resolveSession()
 	for _, label := range fv.Labels {
-		if err := s.AddLabel(ctx, issue.ID, label, actor); err != nil {
+		if err := s.AddLabel(ctx, issue.ID, label, actor, sessionID); err != nil {
 			// Log warning but don't fail the entire operation
 			fmt.Fprintf(os.Stderr, "Warning: failed to add label %s: %v\n", label, err)
 		} else {
