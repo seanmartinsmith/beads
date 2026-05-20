@@ -89,11 +89,12 @@ create, update, show, or close operation).`,
 
 		claimNext, _ := cmd.Flags().GetBool("claim-next")
 
-		// Get session ID from flag or environment variable
-		session, _ := cmd.Flags().GetString("session")
-		if session == "" {
-			session = os.Getenv("CLAUDE_SESSION_ID")
-		}
+		// Session attribution flows through the persistent --session flag and
+		// the opt-in resolver chain in resolveSession() (bd-edi / ADR-0003).
+		// The legacy command-local --session flag and the unconditional
+		// CLAUDE_SESSION_ID read have been removed; env vars are honored only
+		// when core.capture-session=true.
+		session := resolveSession()
 
 		ctx := rootCtx
 
@@ -334,7 +335,6 @@ func init() {
 	closeCmd.Flags().Bool("no-auto", false, "With --continue, show next step but don't claim it")
 	closeCmd.Flags().Bool("suggest-next", false, "Show newly unblocked issues after closing")
 	closeCmd.Flags().Bool("claim-next", false, "Automatically claim the next highest priority available issue")
-	closeCmd.Flags().String("session", "", "Claude Code session ID (or set CLAUDE_SESSION_ID env var)")
 	closeCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(closeCmd)
 }

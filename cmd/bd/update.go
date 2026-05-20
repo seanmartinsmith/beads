@@ -62,14 +62,12 @@ create, update, show, or close operation).`,
 			}
 			updates["status"] = status
 
-			// If status is being set to closed, include session if provided
+			// If status is being set to closed, include session if provided.
+			// Uses the bd-edi opt-in resolver chain (persistent --session flag
+			// + env vars under core.capture-session=true).
 			if status == "closed" {
-				session, _ := cmd.Flags().GetString("session")
-				if session == "" {
-					session = os.Getenv("CLAUDE_SESSION_ID")
-				}
-				if session != "" {
-					updates["closed_by_session"] = session
+				if s := resolveSession(); s != "" {
+					updates["closed_by_session"] = s
 				}
 			}
 		}
@@ -607,7 +605,6 @@ func init() {
 	updateCmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
 	updateCmd.Flags().String("parent", "", "New parent issue ID (reparents the issue, use empty string to remove parent)")
 	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)")
-	updateCmd.Flags().String("session", "", "Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID env var)")
 	// Time-based scheduling flags (GH#820)
 	// Examples:
 	//   --due=+6h           Due in 6 hours
