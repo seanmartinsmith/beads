@@ -380,11 +380,14 @@ func TestEmbeddedClose(t *testing.T) {
 	})
 
 	t.Run("close_session_from_env", func(t *testing.T) {
+		// Post-bd-edi semantics: env-var capture requires core.capture-session=true.
+		// The opt-in is set via the BD_CORE_CAPTURE_SESSION env var (viper
+		// auto-binds BD_-prefixed env vars to corresponding config keys).
 		issue := bdCreate(t, bd, dir, "Env session test", "--type", "task")
 		cmd := exec.Command(bd, "close", issue.ID)
 		cmd.Dir = dir
 		env := bdEnv(dir)
-		env = append(env, "CLAUDE_SESSION_ID=env-sess")
+		env = append(env, "BD_CORE_CAPTURE_SESSION=true", "CLAUDE_SESSION_ID=env-sess")
 		cmd.Env = env
 		stdout, stderr, err := runCommandBuffers(t, cmd)
 		if err != nil {
