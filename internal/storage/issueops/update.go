@@ -218,7 +218,10 @@ func UpdateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 	newData, _ := json.Marshal(updates)
 	eventType := DetermineEventType(oldIssue, updates)
 
-	if err := RecordFullEventInTable(ctx, tx, eventTable, id, eventType, actor, string(oldData), string(newData)); err != nil {
+	// session attribution is not threaded through plain UpdateIssue events;
+	// callers that need attribution use CloseIssue/ClaimIssue paths. Recorded
+	// with session="" to match reference branch behavior.
+	if err := RecordFullEventInTable(ctx, tx, eventTable, id, eventType, actor, "", string(oldData), string(newData)); err != nil {
 		return nil, fmt.Errorf("failed to record event: %w", err)
 	}
 
@@ -226,13 +229,16 @@ func UpdateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 }
 
 // RecordFullEventInTable records an event with both old and new values.
+// session may be empty when session attribution is not configured (the
+// default behavior). When non-empty, it is stored on events.session and
+// used as the source of truth for per-event audit reads.
 //
 //nolint:gosec // G201: table is from WispTableRouting ("events" or "wisp_events")
-func RecordFullEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, oldValue, newValue string) error {
+func RecordFullEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, session, oldValue, newValue string) error {
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, table), issueID, eventType, actor, oldValue, newValue)
+		INSERT INTO %s (issue_id, event_type, actor, session, old_value, new_value)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, table), issueID, eventType, actor, session, oldValue, newValue)
 	if err != nil {
 		return fmt.Errorf("record event in %s: %w", table, err)
 	}

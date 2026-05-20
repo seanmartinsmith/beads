@@ -18,6 +18,11 @@ type CloseResult struct {
 // and recording the close event. Routes to the correct table (issues/wisps)
 // automatically. The caller is responsible for Dolt versioning if needed.
 //
+// Session attribution is dual-written: events.session is the source of truth
+// for per-event audit reads (see GetIssueInTx::lookupClosedBySession), and
+// issues.closed_by_session is preserved as a legacy column for downstream SQL
+// consumers that read it directly during the transition window.
+//
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func CloseIssueInTx(ctx context.Context, tx *sql.Tx, id string, reason, actor, session string) (*CloseResult, error) {
 	isWisp := IsActiveWispInTx(ctx, tx, id)
@@ -41,7 +46,7 @@ func CloseIssueInTx(ctx context.Context, tx *sql.Tx, id string, reason, actor, s
 		return nil, fmt.Errorf("issue not found: %s", id)
 	}
 
-	if err := RecordEventInTable(ctx, tx, eventTable, id, types.EventClosed, actor, reason); err != nil {
+	if err := RecordEventInTable(ctx, tx, eventTable, id, types.EventClosed, actor, session, reason); err != nil {
 		return nil, fmt.Errorf("failed to record event: %w", err)
 	}
 

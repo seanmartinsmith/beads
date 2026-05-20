@@ -85,7 +85,10 @@ func CreateIssueInTx(ctx context.Context, tx *sql.Tx, bc *BatchContext, issue *t
 	}
 
 	if isNew {
-		if err := RecordEventInTable(ctx, tx, eventTable, issue.ID, types.EventCreated, actor, ""); err != nil {
+		// session attribution is not threaded through plain CreateIssue
+		// events; matches reference-branch behavior. Recorded with
+		// session="" to preserve the existing semantics.
+		if err := RecordEventInTable(ctx, tx, eventTable, issue.ID, types.EventCreated, actor, "", ""); err != nil {
 			return fmt.Errorf("failed to record event for %s: %w", issue.ID, err)
 		}
 	}

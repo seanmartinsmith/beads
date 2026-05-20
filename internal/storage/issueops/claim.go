@@ -27,8 +27,12 @@ type ClaimResult struct {
 // Routes to the correct table (issues/wisps) automatically.
 // The caller is responsible for Dolt versioning (DOLT_ADD/COMMIT) if needed.
 //
+// session may be empty when session attribution is not configured; when
+// non-empty it is recorded on the claim event. This is the architectural-win
+// path that closes the #3578 gap (bd ready --claim previously un-attributed).
+//
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
-func ClaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string) (*ClaimResult, error) {
+func ClaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor, session string) (*ClaimResult, error) {
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
 
@@ -101,7 +105,7 @@ func ClaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string) (*
 	}
 	newData, _ := json.Marshal(newUpdates)
 
-	if err := RecordFullEventInTable(ctx, tx, eventTable, id, "claimed", actor, string(oldData), string(newData)); err != nil {
+	if err := RecordFullEventInTable(ctx, tx, eventTable, id, "claimed", actor, session, string(oldData), string(newData)); err != nil {
 		return nil, fmt.Errorf("failed to record claim event: %w", err)
 	}
 
@@ -115,7 +119,7 @@ func ClaimReadyIssueInTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	filter types.WorkFilter,
-	actor string,
+	actor, session string,
 	computeBlockedFn func(ctx context.Context, tx *sql.Tx, includeWisps bool) ([]string, error),
 ) (*types.Issue, error) {
 	claimFilter := filter
@@ -129,7 +133,7 @@ func ClaimReadyIssueInTx(
 		return nil, err
 	}
 	for _, issue := range readyIssues {
-		if _, err := ClaimIssueInTx(ctx, tx, issue.ID, actor); err != nil {
+		if _, err := ClaimIssueInTx(ctx, tx, issue.ID, actor, session); err != nil {
 			if errors.Is(err, storage.ErrAlreadyClaimed) || errors.Is(err, storage.ErrNotClaimable) {
 				continue
 			}

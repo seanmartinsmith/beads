@@ -193,11 +193,14 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 // currently has no assignee. Returns storage.ErrAlreadyClaimed if already claimed.
 // Delegates SQL work to issueops.ClaimIssueInTx; handles Dolt-specific concerns
 // (wisp routing, DOLT_ADD/COMMIT, cache invalidation).
-func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) error {
+//
+// session is recorded on the claim event when non-empty; closes the
+// bd ready --claim attribution gap (the architectural-win acceptance path).
+func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor, session string) error {
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
 	// Wisps skip DOLT_COMMIT since they live in dolt_ignored tables.
 	if s.isActiveWisp(ctx, id) {
-		return s.claimWisp(ctx, id, actor)
+		return s.claimWisp(ctx, id, actor, session)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -206,7 +209,7 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
+	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor, session); err != nil {
 		return err
 	}
 
@@ -230,14 +233,15 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 }
 
 // ClaimReadyIssue atomically claims the first ready issue matching filter.
-func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter, actor string) (*types.Issue, error) {
+// session is recorded on the claim event when non-empty.
+func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter, actor, session string) (*types.Issue, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	claimed, err := issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor, s.computeBlockedIDsForReadyWork)
+	claimed, err := issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor, session, s.computeBlockedIDsForReadyWork)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +277,7 @@ func (s *DoltStore) ReopenIssue(ctx context.Context, id string, reason string, a
 		return err
 	}
 	if reason != "" {
-		if err := s.AddComment(ctx, id, actor, reason); err != nil {
+		if err := s.AddComment(ctx, id, actor, "", reason); err != nil {
 			return fmt.Errorf("reopen comment: %w", err)
 		}
 	}
@@ -456,11 +460,13 @@ func doltBuildSQLInClause(ids []string) (string, []interface{}) {
 // Helper functions
 // =============================================================================
 
-func recordEvent(ctx context.Context, tx *sql.Tx, issueID string, eventType types.EventType, actor, oldValue, newValue string) error {
+// recordEvent writes a row into the events table inside an existing tx.
+// session may be empty when session attribution is not configured.
+func recordEvent(ctx context.Context, tx *sql.Tx, issueID string, eventType types.EventType, actor, session, oldValue, newValue string) error {
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, issueID, eventType, actor, oldValue, newValue)
+		INSERT INTO events (issue_id, event_type, actor, session, old_value, new_value)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, issueID, eventType, actor, session, oldValue, newValue)
 	return wrapExecError("record event", err)
 }
 

@@ -223,10 +223,11 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 		log.Printf("promote %s: failed to copy dependencies: %v", id, err)
 	}
 
-	// Copy events via INSERT...SELECT (best-effort: log but don't fail promotion)
+	// Copy events via INSERT...SELECT (best-effort: log but don't fail promotion).
+	// Preserve session attribution across the promote boundary.
 	if _, err := s.execContext(ctx, `
-		INSERT IGNORE INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-		SELECT issue_id, event_type, actor, old_value, new_value, comment, created_at
+		INSERT IGNORE INTO events (issue_id, event_type, actor, session, old_value, new_value, comment, created_at)
+		SELECT issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 		FROM wisp_events WHERE issue_id = ?
 	`, id); err != nil {
 		log.Printf("promote %s: failed to copy events (data may be lost): %v", id, err)
@@ -281,9 +282,10 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 			log.Printf("demote %s: failed to copy dependencies (data may be lost): %v", id, err)
 		}
 
+		// Preserve session attribution on prior events when copying.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT IGNORE INTO wisp_events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-			SELECT issue_id, event_type, actor, old_value, new_value, comment, created_at
+			INSERT IGNORE INTO wisp_events (issue_id, event_type, actor, session, old_value, new_value, comment, created_at)
+			SELECT issue_id, event_type, actor, session, old_value, new_value, comment, created_at
 			FROM events WHERE issue_id = ?
 		`, id); err != nil {
 			log.Printf("demote %s: failed to copy events (data may be lost): %v", id, err)
@@ -297,10 +299,12 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 			log.Printf("demote %s: failed to copy comments (data may be lost): %v", id, err)
 		}
 
+		// Demotion event itself: session="" because DemoteToWisp is at the
+		// UpdateIssue layer which doesn't thread session (matches reference branch).
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO wisp_events (issue_id, event_type, actor, old_value, new_value)
-			VALUES (?, ?, ?, ?, ?)
-		`, id, types.EventUpdated, actor, "", "demoted to wisp"); err != nil {
+			INSERT INTO wisp_events (issue_id, event_type, actor, session, old_value, new_value)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, id, types.EventUpdated, actor, "", "", "demoted to wisp"); err != nil {
 			log.Printf("demote %s: failed to record demotion event: %v", id, err)
 		}
 

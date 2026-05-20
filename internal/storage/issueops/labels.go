@@ -132,7 +132,8 @@ func getLabelsIntoFromTable(ctx context.Context, tx *sql.Tx, labelTable string, 
 // AddLabelInTx adds a label to an issue and records an event within an existing
 // transaction. Automatically routes to wisp tables if the ID is an active wisp.
 // Uses INSERT IGNORE for idempotency.
-func AddLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, issueID, label, actor string) error {
+// session may be empty when session attribution is not configured.
+func AddLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, issueID, label, actor, session string) error {
 	if labelTable == "" || eventTable == "" {
 		isWisp := IsActiveWispInTx(ctx, tx, issueID)
 		_, lt, et, _ := WispTableRouting(isWisp)
@@ -149,8 +150,8 @@ func AddLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, issue
 	}
 	comment := "Added label: " + label
 	//nolint:gosec // G201: eventTable is from WispTableRouting ("events" or "wisp_events")
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (issue_id, event_type, actor, comment) VALUES (?, ?, ?, ?)`, eventTable),
-		issueID, types.EventLabelAdded, actor, comment); err != nil {
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (issue_id, event_type, actor, session, comment) VALUES (?, ?, ?, ?, ?)`, eventTable),
+		issueID, types.EventLabelAdded, actor, session, comment); err != nil {
 		return fmt.Errorf("add label: record event: %w", err)
 	}
 	return nil
@@ -159,9 +160,10 @@ func AddLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, issue
 // RemoveLabelInTx removes a label from an issue and records an event within
 // an existing transaction. Automatically routes to wisp tables if the ID is
 // an active wisp.
+// session may be empty when session attribution is not configured.
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
-func RemoveLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, issueID, label, actor string) error {
+func RemoveLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, issueID, label, actor, session string) error {
 	if labelTable == "" || eventTable == "" {
 		isWisp := IsActiveWispInTx(ctx, tx, issueID)
 		_, lt, et, _ := WispTableRouting(isWisp)
@@ -176,8 +178,8 @@ func RemoveLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, is
 		return fmt.Errorf("remove label: %w", err)
 	}
 	comment := "Removed label: " + label
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (issue_id, event_type, actor, comment) VALUES (?, ?, ?, ?)`, eventTable),
-		issueID, types.EventLabelRemoved, actor, comment); err != nil {
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (issue_id, event_type, actor, session, comment) VALUES (?, ?, ?, ?, ?)`, eventTable),
+		issueID, types.EventLabelRemoved, actor, session, comment); err != nil {
 		return fmt.Errorf("remove label: record event: %w", err)
 	}
 	return nil

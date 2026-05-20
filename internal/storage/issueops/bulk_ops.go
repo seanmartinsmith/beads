@@ -205,14 +205,14 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 }
 
 //nolint:gosec // G201: table names are hardcoded
-func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {
+func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor, session string) error {
 	if IsActiveWispInTx(ctx, tx, oldID) {
-		return updateWispIDInTx(ctx, tx, oldID, newID, issue, actor)
+		return updateWispIDInTx(ctx, tx, oldID, newID, issue, actor, session)
 	}
-	return updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor)
+	return updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor, session)
 }
 
-func updateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {
+func updateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor, session string) error {
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE issues
@@ -227,13 +227,13 @@ func updateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, iss
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, 'renamed', ?, ?, ?)
-	`, newID, actor, oldID, newID)
+		INSERT INTO events (issue_id, event_type, actor, session, old_value, new_value)
+		VALUES (?, 'renamed', ?, ?, ?, ?)
+	`, newID, actor, session, oldID, newID)
 	return err
 }
 
-func updateWispIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {
+func updateWispIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor, session string) error {
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE wisps
@@ -248,9 +248,9 @@ func updateWispIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issu
 	}
 
 	if _, err = tx.ExecContext(ctx, `
-		INSERT INTO wisp_events (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, 'renamed', ?, ?, ?)
-	`, newID, actor, oldID, newID); err != nil {
+		INSERT INTO wisp_events (issue_id, event_type, actor, session, old_value, new_value)
+		VALUES (?, 'renamed', ?, ?, ?, ?)
+	`, newID, actor, session, oldID, newID); err != nil {
 		return err
 	}
 
