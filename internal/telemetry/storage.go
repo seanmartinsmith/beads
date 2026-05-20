@@ -263,24 +263,24 @@ func (s *InstrumentedStorage) GetDependencyTree(ctx context.Context, issueID str
 
 // ── Labels ──────────────────────────────────────────────────────────────────
 
-func (s *InstrumentedStorage) AddLabel(ctx context.Context, issueID, label, actor string) error {
+func (s *InstrumentedStorage) AddLabel(ctx context.Context, issueID, label, actor, session string) error {
 	attrs := []attribute.KeyValue{
 		attribute.String("bd.issue.id", issueID),
 		attribute.String("bd.label", label),
 	}
 	ctx, span, t := s.op(ctx, "AddLabel", attrs...)
-	err := s.inner.AddLabel(ctx, issueID, label, actor)
+	err := s.inner.AddLabel(ctx, issueID, label, actor, session)
 	s.done(ctx, span, t, err, attrs...)
 	return err
 }
 
-func (s *InstrumentedStorage) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
+func (s *InstrumentedStorage) RemoveLabel(ctx context.Context, issueID, label, actor, session string) error {
 	attrs := []attribute.KeyValue{
 		attribute.String("bd.issue.id", issueID),
 		attribute.String("bd.label", label),
 	}
 	ctx, span, t := s.op(ctx, "RemoveLabel", attrs...)
-	err := s.inner.RemoveLabel(ctx, issueID, label, actor)
+	err := s.inner.RemoveLabel(ctx, issueID, label, actor, session)
 	s.done(ctx, span, t, err, attrs...)
 	return err
 }

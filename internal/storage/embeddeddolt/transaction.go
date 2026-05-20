@@ -115,14 +115,14 @@ func (t *embeddedTransaction) GetDependencyRecords(ctx context.Context, issueID 
 	return m[issueID], nil
 }
 
-func (t *embeddedTransaction) AddLabel(ctx context.Context, issueID, label, actor string) error {
+func (t *embeddedTransaction) AddLabel(ctx context.Context, issueID, label, actor, session string) error {
 	t.dirty.MarkDirty("labels")
-	return issueops.AddLabelInTx(ctx, t.tx, "", "", issueID, label, actor)
+	return issueops.AddLabelInTx(ctx, t.tx, "", "", issueID, label, actor, session)
 }
 
-func (t *embeddedTransaction) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
+func (t *embeddedTransaction) RemoveLabel(ctx context.Context, issueID, label, actor, session string) error {
 	t.dirty.MarkDirty("labels")
-	return issueops.RemoveLabelInTx(ctx, t.tx, "", "", issueID, label, actor)
+	return issueops.RemoveLabelInTx(ctx, t.tx, "", "", issueID, label, actor, session)
 }
 
 func (t *embeddedTransaction) GetLabels(ctx context.Context, issueID string) ([]string, error) {
@@ -171,7 +171,7 @@ func (t *embeddedTransaction) GetLocalMetadata(ctx context.Context, key string) 
 	return issueops.GetLocalMetadataInTx(ctx, t.tx, key)
 }
 
-func (t *embeddedTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
+func (t *embeddedTransaction) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	return fmt.Errorf("embeddedTransaction: AddComment not implemented")
 }
 

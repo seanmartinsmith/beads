@@ -573,9 +573,9 @@ func (s *EmbeddedDoltStore) DeleteIssuesBySourceRepo(ctx context.Context, source
 	return count, err
 }
 
-func (s *EmbeddedDoltStore) UpdateIssueID(ctx context.Context, oldID, newID string, issue *types.Issue, actor string) error {
+func (s *EmbeddedDoltStore) UpdateIssueID(ctx context.Context, oldID, newID string, issue *types.Issue, actor, session string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.UpdateIssueIDInTx(ctx, tx, oldID, newID, issue, actor)
+		return issueops.UpdateIssueIDInTx(ctx, tx, oldID, newID, issue, actor, session)
 	})
 }
 
@@ -626,9 +626,9 @@ func (s *EmbeddedDoltStore) FindWispDependentsRecursive(ctx context.Context, ids
 // storage.AnnotationQueryStore
 // ---------------------------------------------------------------------------
 
-func (s *EmbeddedDoltStore) AddComment(ctx context.Context, issueID, actor, comment string) error {
+func (s *EmbeddedDoltStore) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.AddCommentEventInTx(ctx, tx, issueID, actor, comment)
+		return issueops.AddCommentEventInTx(ctx, tx, issueID, actor, session, comment)
 	})
 }
 

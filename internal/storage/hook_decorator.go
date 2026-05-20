@@ -137,8 +137,8 @@ func (h *HookFiringStore) RemoveDependency(ctx context.Context, issueID, depends
 // ── Label mutations ─────────────────────────────────────────────────
 
 // AddLabel adds a label and fires on_update.
-func (h *HookFiringStore) AddLabel(ctx context.Context, issueID, label, actor string) error {
-	if err := h.inner.AddLabel(ctx, issueID, label, actor); err != nil {
+func (h *HookFiringStore) AddLabel(ctx context.Context, issueID, label, actor, session string) error {
+	if err := h.inner.AddLabel(ctx, issueID, label, actor, session); err != nil {
 		return err
 	}
 	h.fireHookByID(ctx, hooks.EventUpdate, issueID)
@@ -146,8 +146,8 @@ func (h *HookFiringStore) AddLabel(ctx context.Context, issueID, label, actor st
 }
 
 // RemoveLabel removes a label and fires on_update.
-func (h *HookFiringStore) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
-	if err := h.inner.RemoveLabel(ctx, issueID, label, actor); err != nil {
+func (h *HookFiringStore) RemoveLabel(ctx context.Context, issueID, label, actor, session string) error {
+	if err := h.inner.RemoveLabel(ctx, issueID, label, actor, session); err != nil {
 		return err
 	}
 	h.fireHookByID(ctx, hooks.EventUpdate, issueID)
@@ -286,8 +286,8 @@ func (t *hookTrackingTransaction) RemoveDependency(ctx context.Context, issueID,
 	return nil
 }
 
-func (t *hookTrackingTransaction) AddLabel(ctx context.Context, issueID, label, actor string) error {
-	if err := t.Transaction.AddLabel(ctx, issueID, label, actor); err != nil {
+func (t *hookTrackingTransaction) AddLabel(ctx context.Context, issueID, label, actor, session string) error {
+	if err := t.Transaction.AddLabel(ctx, issueID, label, actor, session); err != nil {
 		return err
 	}
 	if issue, err := t.Transaction.GetIssue(ctx, issueID); err == nil {
@@ -296,8 +296,8 @@ func (t *hookTrackingTransaction) AddLabel(ctx context.Context, issueID, label, 
 	return nil
 }
 
-func (t *hookTrackingTransaction) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
-	if err := t.Transaction.RemoveLabel(ctx, issueID, label, actor); err != nil {
+func (t *hookTrackingTransaction) RemoveLabel(ctx context.Context, issueID, label, actor, session string) error {
+	if err := t.Transaction.RemoveLabel(ctx, issueID, label, actor, session); err != nil {
 		return err
 	}
 	if issue, err := t.Transaction.GetIssue(ctx, issueID); err == nil {
@@ -306,8 +306,8 @@ func (t *hookTrackingTransaction) RemoveLabel(ctx context.Context, issueID, labe
 	return nil
 }
 
-func (t *hookTrackingTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
-	if err := t.Transaction.AddComment(ctx, issueID, actor, comment); err != nil {
+func (t *hookTrackingTransaction) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
+	if err := t.Transaction.AddComment(ctx, issueID, actor, session, comment); err != nil {
 		return err
 	}
 	if issue, err := t.Transaction.GetIssue(ctx, issueID); err == nil {
@@ -345,7 +345,7 @@ var (
 		AddDependency(context.Context, *types.Dependency, string) error
 	} = (*HookFiringStore)(nil)
 	_ interface {
-		AddLabel(context.Context, string, string, string) error
+		AddLabel(context.Context, string, string, string, string) error
 	} = (*HookFiringStore)(nil)
 	_ interface {
 		AddIssueComment(context.Context, string, string, string) (*types.Comment, error)

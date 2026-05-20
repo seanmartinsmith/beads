@@ -313,14 +313,14 @@ func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, e
 // claimWisp atomically claims a wisp.
 // Delegates SQL work to issueops.ClaimIssueInTx; no Dolt versioning needed
 // since wisps live in dolt_ignored tables.
-func (s *DoltStore) claimWisp(ctx context.Context, id string, actor string) error {
+func (s *DoltStore) claimWisp(ctx context.Context, id string, actor, session string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
+	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor, session); err != nil {
 		return err
 	}
 

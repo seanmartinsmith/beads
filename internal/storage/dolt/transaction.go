@@ -740,8 +740,13 @@ func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, depends
 	return wrapExecError("remove dependency in tx", err)
 }
 
-// AddLabel adds a label within the transaction
-func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor string) error {
+// AddLabel adds a label within the transaction.
+// Note: this implementation skips event writes (label-only). session is
+// accepted to satisfy the Transaction interface; it has no effect here
+// since no event row is written. See bd-edi follow-up notes (tracked at
+// bd-ffy in the reference branch) for the implementation gap.
+func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor, session string) error {
+	_ = session
 	table := "labels"
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_labels"
@@ -780,8 +785,11 @@ func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]stri
 	return labels, rows.Err()
 }
 
-// RemoveLabel removes a label within the transaction
-func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
+// RemoveLabel removes a label within the transaction.
+// session is accepted to satisfy the Transaction interface; no event row
+// is written here. See bd-ffy in the reference branch for the gap note.
+func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor, session string) error {
+	_ = session
 	table := "labels"
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_labels"
@@ -911,8 +919,9 @@ func (t *doltTransaction) GetIssueComments(ctx context.Context, issueID string) 
 	return comments, rows.Err()
 }
 
-// AddComment adds a comment within the transaction
-func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
+// AddComment adds a comment within the transaction.
+// session is recorded on the event when non-empty.
+func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	table := "events"
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_events"
@@ -920,9 +929,9 @@ func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, commen
 
 	//nolint:gosec // G201: table is hardcoded
 	_, err := t.txFor(table).ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, event_type, actor, comment)
-		VALUES (?, ?, ?, ?)
-	`, table), issueID, types.EventCommented, actor, comment)
+		INSERT INTO %s (issue_id, event_type, actor, session, comment)
+		VALUES (?, ?, ?, ?, ?)
+	`, table), issueID, types.EventCommented, actor, session, comment)
 	if err == nil {
 		t.dirty.MarkDirty(table)
 	}

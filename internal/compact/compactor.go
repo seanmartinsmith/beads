@@ -37,7 +37,7 @@ type compactableStore interface {
 	GetIssue(ctx context.Context, issueID string) (*types.Issue, error)
 	UpdateIssue(ctx context.Context, issueID string, updates map[string]interface{}, actor string) error
 	ApplyCompaction(ctx context.Context, issueID string, tier int, originalSize int, compactedSize int, commitHash string) error
-	AddComment(ctx context.Context, issueID, actor, comment string) error
+	AddComment(ctx context.Context, issueID, actor, session, comment string) error
 }
 
 type summarizer interface {
@@ -123,7 +123,7 @@ func (c *Compactor) CompactTier1(ctx context.Context, issueID string) error {
 	compactedSize := len(summary)
 	if compactedSize >= originalSize {
 		warningMsg := fmt.Sprintf("Tier 1 compaction skipped: summary (%d bytes) not shorter than original (%d bytes)", compactedSize, originalSize)
-		if err := c.store.AddComment(ctx, issueID, "compactor", warningMsg); err != nil {
+		if err := c.store.AddComment(ctx, issueID, "compactor", "", warningMsg); err != nil {
 			return fmt.Errorf("failed to record warning: %w", err)
 		}
 		return fmt.Errorf("compaction would increase size (%d → %d bytes), keeping original", originalSize, compactedSize)
@@ -149,7 +149,7 @@ func (c *Compactor) CompactTier1(ctx context.Context, issueID string) error {
 	// Add comment about compaction
 	savingBytes := originalSize - compactedSize
 	comment := fmt.Sprintf("Tier 1 compaction: %d → %d bytes (saved %d)", originalSize, compactedSize, savingBytes)
-	if err := c.store.AddComment(ctx, issueID, "compactor", comment); err != nil {
+	if err := c.store.AddComment(ctx, issueID, "compactor", "", comment); err != nil {
 		return fmt.Errorf("failed to add compaction comment: %w", err)
 	}
 

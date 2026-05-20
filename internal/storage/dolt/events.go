@@ -10,15 +10,16 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// AddComment adds a comment event to an issue
-func (s *DoltStore) AddComment(ctx context.Context, issueID, actor, comment string) error {
+// AddComment adds a comment event to an issue.
+// session may be empty when session attribution is not configured.
+func (s *DoltStore) AddComment(ctx context.Context, issueID, actor, session, comment string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := issueops.AddCommentEventInTx(ctx, tx, issueID, actor, comment); err != nil {
+	if err := issueops.AddCommentEventInTx(ctx, tx, issueID, actor, session, comment); err != nil {
 		return err
 	}
 	return tx.Commit()

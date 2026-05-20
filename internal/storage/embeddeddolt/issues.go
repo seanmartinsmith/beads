@@ -15,19 +15,19 @@ import (
 
 // ClaimIssue atomically claims an issue using compare-and-swap semantics.
 // Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
-func (s *EmbeddedDoltStore) ClaimIssue(ctx context.Context, id string, actor string) error {
+func (s *EmbeddedDoltStore) ClaimIssue(ctx context.Context, id string, actor, session string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		_, err := issueops.ClaimIssueInTx(ctx, tx, id, actor)
+		_, err := issueops.ClaimIssueInTx(ctx, tx, id, actor, session)
 		return err
 	})
 }
 
 // ClaimReadyIssue atomically claims the first ready issue matching filter.
-func (s *EmbeddedDoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter, actor string) (*types.Issue, error) {
+func (s *EmbeddedDoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter, actor, session string) (*types.Issue, error) {
 	var claimed *types.Issue
 	err := s.withConn(ctx, true, func(tx *sql.Tx) error {
 		var err error
-		claimed, err = issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor, computeBlockedIDsWrapper)
+		claimed, err = issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor, session, computeBlockedIDsWrapper)
 		return err
 	})
 	return claimed, err
@@ -65,7 +65,7 @@ func (s *EmbeddedDoltStore) ReopenIssue(ctx context.Context, id string, reason s
 		return err
 	}
 	if reason != "" {
-		if err := s.AddComment(ctx, id, actor, reason); err != nil {
+		if err := s.AddComment(ctx, id, actor, "", reason); err != nil {
 			return fmt.Errorf("reopen comment: %w", err)
 		}
 	}

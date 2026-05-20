@@ -60,8 +60,8 @@ type Storage interface {
 	GetDependencyTree(ctx context.Context, issueID string, maxDepth int, showAllPaths bool, reverse bool) ([]*types.TreeNode, error)
 
 	// Labels
-	AddLabel(ctx context.Context, issueID, label, actor string) error
-	RemoveLabel(ctx context.Context, issueID, label, actor string) error
+	AddLabel(ctx context.Context, issueID, label, actor, session string) error
+	RemoveLabel(ctx context.Context, issueID, label, actor, session string) error
 	GetLabels(ctx context.Context, issueID string) ([]string, error)
 	GetIssuesByLabel(ctx context.Context, label string) ([]*types.Issue, error)
 
@@ -265,8 +265,8 @@ type Transaction interface {
 	GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error)
 
 	// Label operations
-	AddLabel(ctx context.Context, issueID, label, actor string) error
-	RemoveLabel(ctx context.Context, issueID, label, actor string) error
+	AddLabel(ctx context.Context, issueID, label, actor, session string) error
+	RemoveLabel(ctx context.Context, issueID, label, actor, session string) error
 	GetLabels(ctx context.Context, issueID string) ([]string, error)
 
 	// Config operations (for atomic config + issue workflows)
@@ -284,7 +284,7 @@ type Transaction interface {
 	GetLocalMetadata(ctx context.Context, key string) (string, error)
 
 	// Comment operations
-	AddComment(ctx context.Context, issueID, actor, comment string) error
+	AddComment(ctx context.Context, issueID, actor, session, comment string) error
 	ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
 }
