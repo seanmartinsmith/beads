@@ -138,3 +138,9 @@ bd_test
 
 # Beads / Dolt files (added by bd init)
 .beads/proxieddb/
+
+# beadstui (bt) local config + caches
+.bt/
+
+# Windows reserved-name stray file (accidental `> nul` redirect artifact)
+nul
