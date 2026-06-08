@@ -919,6 +919,7 @@ bd list [flags]
       --no-parent                    Exclude child issues (show only top-level issues)
       --no-pinned                    Exclude pinned issues
       --notes-contains string        Filter by notes substring (case-insensitive)
+      --offset int                   Skip the first N matching results (0-based). Only supported under --proxied-server.
       --overdue                      Show only issues with due_at in the past (not closed)
       --parent string                Filter by parent issue ID (shows children of specified issue)
       --pinned                       Show only pinned issues
@@ -2998,7 +2999,7 @@ bd dolt remote
 
 ##### bd dolt remote add
 
-Add a Dolt remote (both SQL server and CLI)
+Add a Dolt remote
 
 ```
 bd dolt remote add <name> <url>
@@ -3006,7 +3007,7 @@ bd dolt remote add <name> <url>
 
 ##### bd dolt remote list
 
-List configured Dolt remotes (SQL server + CLI)
+List configured Dolt remotes
 
 ```
 bd dolt remote list
@@ -3014,16 +3015,10 @@ bd dolt remote list
 
 ##### bd dolt remote remove
 
-Remove a Dolt remote (both SQL server and CLI)
+Remove a Dolt remote
 
 ```
-bd dolt remote remove <name> [flags]
-```
-
-**Flags:**
-
-```
-      --force   Force remove even when SQL and CLI URLs conflict
+bd dolt remote remove <name>
 ```
 
 #### bd dolt set
