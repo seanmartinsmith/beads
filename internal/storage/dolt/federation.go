@@ -2,6 +2,7 @@ package dolt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -112,11 +113,19 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 }
 
 // peerPullOutcome converts a settled peer pull's result into PullFrom's
-// contract: conflicts the settle machinery could not auto-resolve and left in
-// the working set are returned as data for the caller to resolve, anything
-// else stays an error.
+// contract: conflicts the settle machinery could not auto-resolve are returned
+// as data for the caller, anything else stays an error. The SQL route rolls
+// the conflicted merge back before returning, so its conflicts arrive only via
+// MergeConflictsError, captured pre-rollback (bd-578h9.15); the CLI route's
+// subprocess writes conflicts to the on-disk working set where GetConflicts
+// still sees them.
 func (s *DoltStore) peerPullOutcome(ctx context.Context, peer string, pullErr error, conflicts *[]storage.Conflict) error {
 	if pullErr == nil {
+		return nil
+	}
+	var mce *versioncontrolops.MergeConflictsError
+	if errors.As(pullErr, &mce) {
+		*conflicts = mce.Conflicts
 		return nil
 	}
 	if c, conflictErr := s.GetConflicts(ctx); conflictErr == nil && len(c) > 0 {
@@ -335,6 +344,14 @@ func (s *DoltStore) Sync(ctx context.Context, peer string, strategy string) (*Sy
 		// Commit the resolution
 		if err := s.Commit(ctx, fmt.Sprintf("Resolve conflicts from %s using %s strategy", peer, strategy)); err != nil {
 			result.Error = fmt.Errorf("failed to commit conflict resolution: %w", err)
+			return result, result.Error
+		}
+
+		// bd-578h9.11: the conflicted merge skipped the automatic is_blocked
+		// recompute (unresolved rows would have fed it garbage); now that the
+		// resolution is committed, cover the whole merge+resolution window.
+		if err := s.RecomputeBlockedAfterMerge(ctx, beforeCommit); err != nil {
+			result.Error = fmt.Errorf("conflicts resolved but is_blocked recompute failed: %w", err)
 			return result, result.Error
 		}
 	}
