@@ -49,6 +49,13 @@ type EmbeddedDoltStore struct {
 	// (CREATE DATABASE, schema migrations) were skipped and write
 	// transactions are refused (bd-6dnrw.32).
 	readOnly bool
+	// lenientGate marks a store opened for a read-only command
+	// (OpenForReadOnlyCommand): a #4259 remote-migrate gate refusal skips
+	// the migration with a warning instead of failing the open, so read
+	// commands keep working on the current schema until the operator makes
+	// the migrate-or-adopt decision (bd-578h9.5). Unlike readOnly, writes
+	// stay allowed (e.g. the post-command autocommit net).
+	lenientGate bool
 }
 
 // errClosed is returned when a method is called after Close.
@@ -71,7 +78,7 @@ func (s *EmbeddedDoltStore) IsClosed() bool {
 // The dolthub/driver/v2 handles its own concurrency internally. File-level locking
 // is only used during bd init (via util.TryLock in the init command) to protect
 // one-time initialization steps — the store itself does not hold any lock.
-func newStore(ctx context.Context, beadsDir, database, branch string) (*EmbeddedDoltStore, error) {
+func newStore(ctx context.Context, beadsDir, database, branch string, lenientGate bool) (*EmbeddedDoltStore, error) {
 	if database == "" {
 		return nil, fmt.Errorf("embeddeddolt: database name must not be empty (caller should default to %q)", "beads")
 	}
@@ -89,10 +96,11 @@ func newStore(ctx context.Context, beadsDir, database, branch string) (*Embedded
 	}
 
 	s := &EmbeddedDoltStore{
-		dataDir:  dataDir,
-		beadsDir: absBeadsDir,
-		database: database,
-		branch:   branch,
+		dataDir:     dataDir,
+		beadsDir:    absBeadsDir,
+		database:    database,
+		branch:      branch,
+		lenientGate: lenientGate,
 	}
 
 	if err := s.initSchema(ctx); err != nil {
@@ -265,6 +273,20 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 	// schema. Embedded mode (the mode the original report was filed against) syncs
 	// via Dolt remotes too, so it needs the same gate as server mode.
 	if err := schema.CheckRemoteMigrateGate(ctx, conn); err != nil {
+		var gateErr *schema.RemoteMigrateGateError
+		if s.lenientGate && errors.As(err, &gateErr) {
+			// Read-only command: the gate exists to stop in-place
+			// migration, not reads (bd-578h9.5). Warn and continue on
+			// the current schema; write commands still fail the open
+			// with the full migrate-or-adopt guidance.
+			fmt.Fprintf(os.Stderr,
+				"Warning: %v\n"+
+					"  Read-only command: continuing on schema v%d without migrating.\n"+
+					"  To resolve, the ONE designated migrator runs: %s=1 bd migrate && bd dolt push\n"+
+					"  Everyone else adopts the migrated database: bd bootstrap\n",
+				gateErr, gateErr.CurrentVersion, schema.AllowRemoteMigrateEnv)
+			return nil
+		}
 		return err
 	}
 
@@ -568,7 +590,13 @@ func (s *EmbeddedDoltStore) CLIDir() string {
 // implemented in version_control.go via versioncontrolops.
 
 func (s *EmbeddedDoltStore) CommitPending(ctx context.Context, actor string) (bool, error) {
+	// Best-effort descriptive message summarizing the accumulated working-set
+	// changes (bd-6dnrw.11); fall back to a generic one if the query fails.
 	msg := fmt.Sprintf("bd: commit pending changes by %s", actor)
+	_ = s.withConn(ctx, false, func(tx *sql.Tx) error {
+		msg = issueops.BuildBatchCommitMessage(ctx, tx, actor)
+		return nil
+	})
 	if err := s.Commit(ctx, msg); err != nil {
 		if issueops.IsNothingToCommitError(err) {
 			return false, nil
@@ -576,6 +604,19 @@ func (s *EmbeddedDoltStore) CommitPending(ctx context.Context, actor string) (bo
 		return false, err
 	}
 	return true, nil
+}
+
+// HasPendingChanges reports whether the working set has committable changes,
+// excluding dolt_ignore'd tables (e.g. wisp tables, which can sit dirty in
+// dolt_status indefinitely without being committable).
+func (s *EmbeddedDoltStore) HasPendingChanges(ctx context.Context) (bool, error) {
+	var pending bool
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		pending, err = issueops.HasPendingChanges(ctx, tx)
+		return err
+	})
+	return pending, err
 }
 
 // CommitExists is implemented in version_control.go via versioncontrolops.
