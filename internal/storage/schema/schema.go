@@ -102,6 +102,53 @@ func CheckForwardDrift(ctx context.Context, db *sql.DB) error {
 	return checkSchemaSkew(ctx, db)
 }
 
+// SchemaBehindError is returned when a database is opened on a path that
+// cannot migrate it (read-only opens) and its schema version is behind the
+// binary's. Without this check the open succeeds and queries fail later with
+// cryptic unknown-column/table errors (bd-578h9.12).
+type SchemaBehindError struct {
+	DBVersion     int
+	BinaryVersion int
+}
+
+func (e *SchemaBehindError) Error() string {
+	return fmt.Sprintf("schema version mismatch: database is at v%d, binary expects v%d, and the read-only open cannot migrate it; run any bd write command in that workspace to migrate, or set BD_IGNORE_SCHEMA_SKEW=1 to read anyway (queries touching newer schema may fail)",
+		e.DBVersion, e.BinaryVersion)
+}
+
+// IsSchemaBehindError reports whether err (or any error it wraps) is a
+// *SchemaBehindError.
+func IsSchemaBehindError(err error) bool {
+	var e *SchemaBehindError
+	return errors.As(err, &e)
+}
+
+// CheckBehindDrift returns a *SchemaBehindError when the database's schema
+// version is behind the binary's. Used by read-only opens, which skip
+// MigrateUp by design (bd-6dnrw.32) — the paths that previously auto-migrated
+// foreign databases (GH#3231) now need a clear open-time failure instead of
+// unknown-column errors at query time. BD_IGNORE_SCHEMA_SKEW=1 downgrades it
+// to a warning, mirroring forward drift. A fresh DB (version 0) is reported
+// as behind too: it has no readable schema at all.
+func CheckBehindDrift(ctx context.Context, db *sql.DB) error {
+	var currentVersion int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+	).Scan(&currentVersion); err != nil {
+		return fmt.Errorf("schema behind-drift check: %w", err)
+	}
+	if currentVersion >= LatestVersion() {
+		return nil
+	}
+	if os.Getenv("BD_IGNORE_SCHEMA_SKEW") == "1" {
+		fmt.Fprintf(os.Stderr,
+			"Warning: schema skew ignored — database (v%d) is behind binary (v%d) and was opened read-only; some queries may fail\n",
+			currentVersion, LatestVersion())
+		return nil
+	}
+	return &SchemaBehindError{DBVersion: currentVersion, BinaryVersion: LatestVersion()}
+}
+
 type dirtyTableState struct {
 	staged bool
 }
@@ -226,6 +273,19 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	dirtyBefore, err := committableDirtyTables(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("reading pre-migration status: %w", err)
+	}
+	// A previous pass that crashed mid-aux-rekey left its partial UPDATEs
+	// dirty in the working set with the in-progress sentinel still recorded
+	// (bd-578h9.16). Those tables are this pass's own migration state, not
+	// pre-existing user writes: dropping them from dirtyBefore exempts them
+	// from the changed-signature guard (the resumed rekey is about to change
+	// them) and lets stageSchemaTables commit them with the rest of the pass.
+	if resuming, err := auxRekeyResumePending(ctx, db); err != nil {
+		return 0, fmt.Errorf("reading aux rekey sentinel: %w", err)
+	} else if resuming {
+		for _, t := range auxRekeyTables {
+			delete(dirtyBefore, t.name)
+		}
 	}
 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
 	if err != nil {
