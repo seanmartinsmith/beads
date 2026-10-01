@@ -12,9 +12,43 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/servercfg"
+
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/githooksenv"
 )
+
+// The sql-server outlives the shell that started it: an inherited GIT_TRACE=1
+// would poison every server-side git-protocol transfer until restart. The
+// scrub is value-aware (file targets survive) and the hooks override
+// (GH#4272) must be the effective GIT_CONFIG_PARAMETERS entry.
+func TestServerSpawnEnvIsGuarded(t *testing.T) {
+	absPath := "/tmp/git.trace"
+	if runtime.GOOS == "windows" {
+		absPath = `C:\temp\git.trace`
+	}
+	t.Setenv("GIT_TRACE", "1")
+	t.Setenv("GIT_CURL_VERBOSE", "1")
+	t.Setenv("GIT_TRACE2", absPath)
+
+	env := ServerSpawnEnv()
+	keptFileTarget := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GIT_TRACE=") || strings.HasPrefix(kv, "GIT_CURL_VERBOSE=") {
+			t.Errorf("ServerSpawnEnv() kept %q; stderr-directed git tracing must be scrubbed", kv)
+		}
+		if kv == "GIT_TRACE2="+absPath {
+			keptFileTarget = true
+		}
+	}
+	if !keptFileTarget {
+		t.Errorf("ServerSpawnEnv() dropped file-target GIT_TRACE2=%s; only stderr-directed forms may be scrubbed", absPath)
+	}
+	if got := githooksenv.Extract(env); !strings.Contains(got, githooksenv.NoHooksParam) {
+		t.Errorf("ServerSpawnEnv() effective %s = %q, want the no-hooks override (GH#4272)", githooksenv.ParametersEnv, got)
+	}
+}
 
 func TestAllocateEphemeralPort(t *testing.T) {
 	// Should return a valid port in the ephemeral range
@@ -410,6 +444,70 @@ func TestReclaimPortBusyNonDolt(t *testing.T) {
 	}
 }
 
+// TestReclaimPort_NonDoltError_IncludesDiagnostics_GH3516 pins the
+// content of the "non-dolt process" error message: must include the
+// platform-specific listener-discovery hint and the docker / external-
+// server case ("if this is YOUR own Dolt instance ..."). Operators
+// hitting a port collision with their own dolt-in-docker instance
+// previously saw only "non-dolt process (PID N) — free the port" and
+// missed that they could just point bd at the existing server.
+func TestReclaimPort_NonDoltError_IncludesDiagnostics_GH3516(t *testing.T) {
+	dir := t.TempDir()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	occupiedPort := ln.Addr().(*net.TCPAddr).Port
+
+	_, err = reclaimPort("127.0.0.1", occupiedPort, dir)
+	if err == nil {
+		t.Fatal("reclaimPort should fail when a non-dolt process holds the port")
+	}
+	msg := err.Error()
+
+	// Platform-specific listener-discovery hint must appear.
+	expectedListenerCmd := fmt.Sprintf(portConflictHint, occupiedPort)
+	if !strings.Contains(msg, expectedListenerCmd) {
+		t.Errorf("error message missing platform-specific listener hint %q\nfull msg: %s",
+			expectedListenerCmd, msg)
+	}
+
+	// Docker / external-server hint must appear.
+	for _, want := range []string{
+		"YOUR own Dolt instance",
+		"BEADS_DOLT_SERVER_HOST",
+		"BEADS_DOLT_SERVER_PORT",
+		"bd dolt status",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q\nfull msg: %s", want, msg)
+		}
+	}
+}
+
+// TestPortConflictDiagnostics_GH3516 unit-tests the diagnostic helper
+// directly. Makes the contract robust to wording changes in the
+// surrounding error format string — future edits to the wrapper
+// error in reclaimPort don't silently lose the operator-actionable
+// guidance.
+func TestPortConflictDiagnostics_GH3516(t *testing.T) {
+	got := portConflictDiagnostics(3308)
+
+	if !strings.Contains(got, "Identify the listener:") {
+		t.Errorf("missing 'Identify the listener:' header\nfull: %s", got)
+	}
+	if !strings.Contains(got, fmt.Sprintf(portConflictHint, 3308)) {
+		t.Errorf("platform hint not interpolated for port=3308\nfull: %s", got)
+	}
+	if !strings.Contains(got, "BEADS_DOLT_SERVER_PORT=3308") {
+		t.Errorf("env-var hint not parameterized with port=3308\nfull: %s", got)
+	}
+	if !strings.Contains(got, "container") {
+		t.Errorf("missing container/external-server hint\nfull: %s", got)
+	}
+}
+
 func TestMaxDoltServers(t *testing.T) {
 	t.Run("standalone", func(t *testing.T) {
 		orig := os.Getenv("GT_ROOT")
@@ -660,6 +758,76 @@ func TestStopNoStateFiles(t *testing.T) {
 	}
 }
 
+func TestStopWaitsForLifecycleLockWhenStopped(t *testing.T) {
+	dir := t.TempDir()
+	lockF, err := acquireLifecycleLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- Stop(dir) }()
+	select {
+	case err := <-done:
+		releaseLifecycleLock(lockF)
+		t.Fatalf("Stop returned while lifecycle lock was held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseLifecycleLock(lockF)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrServerNotRunning) {
+			t.Fatalf("Stop after lock release = %v, want ErrServerNotRunning", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not resume after lifecycle lock release")
+	}
+}
+
+func TestEnsureRunningDetailedWaitsForLifecycleLock(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_AUTO_START", "0")
+	config.ResetForTesting()
+	t.Cleanup(config.ResetForTesting)
+
+	dir := t.TempDir()
+	cfg := configfile.DefaultConfig()
+	cfg.Backend = configfile.BackendDolt
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltServerPort = 1
+	if err := cfg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	lockF, err := acquireLifecycleLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := EnsureRunningDetailed(dir)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		releaseLifecycleLock(lockF)
+		t.Fatalf("EnsureRunningDetailed returned while lifecycle lock was held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseLifecycleLock(lockF)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("EnsureRunningDetailed unexpectedly succeeded against disabled external server")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureRunningDetailed did not resume after lifecycle lock release")
+	}
+}
+
 // TestStopNotRunningWithCleanupError verifies that Stop returns both the
 // sentinel and cleanup errors when the server is not running but state
 // files can't be removed.
@@ -686,6 +854,31 @@ func TestStopNotRunningWithCleanupError(t *testing.T) {
 	remaining := IgnoreNotRunning(err)
 	if remaining == nil {
 		t.Error("expected cleanup error to be preserved, got nil")
+	}
+}
+
+func TestRestartPreservesStoppedCleanupError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod not effective on Windows")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(lockPath(dir), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidPath(dir), []byte("999999999"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	_, err := Restart(dir)
+	if err == nil {
+		t.Fatal("Restart succeeded despite stale-state cleanup failure")
+	}
+	if !strings.Contains(err.Error(), "stopping Dolt server for restart") {
+		t.Fatalf("Restart error = %v, want preserved stop cleanup failure", err)
 	}
 }
 
@@ -720,6 +913,53 @@ func TestKillStaleServersPreservesOtherRepoServers(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != sameRepoOrphanPID {
 		t.Fatalf("killed=%v, want [%d]", got, sameRepoOrphanPID)
+	}
+	if len(killed) != 1 || killed[0] != sameRepoOrphanPID {
+		t.Fatalf("kill callback got %v, want [%d]", killed, sameRepoOrphanPID)
+	}
+}
+
+// TestKillStaleServersReapsOrphanUnderAmbientServerPort is the regression gate
+// for the ResolveServerModeIgnoringPortEnv carve-out. killStaleServersForDir
+// must keep reaping a same-repo orphan (GH#2430) even when an ambient
+// BEADS_DOLT_SERVER_PORT is set: without the carve-out the port var makes the
+// dir resolve external, the kill path treats the server as somebody else's and
+// declines to reap, and GH#2430 silently regresses.
+//
+// The existing TestKillStaleServersPreservesOtherRepoServers does not cover
+// this -- it never sets the variable, so it only catches the regression on a
+// host that happens to export one.
+func TestKillStaleServersReapsOrphanUnderAmbientServerPort(t *testing.T) {
+	t.Setenv("BEADS_DOLT_AUTO_START", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "3308")
+	t.Setenv("BEADS_DOLT_PORT", "")
+
+	dir := t.TempDir()
+	canonicalPID := 111
+	sameRepoOrphanPID := 222
+	otherRepoPID := 333
+
+	if err := os.WriteFile(pidPath(dir), []byte(strconv.Itoa(canonicalPID)), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var killed []int
+	got, err := killStaleServersForDir(
+		dir,
+		[]int{canonicalPID, sameRepoOrphanPID, otherRepoPID},
+		func(pid int, _ string) bool {
+			return pid == canonicalPID || pid == sameRepoOrphanPID
+		},
+		func(pid int) error {
+			killed = append(killed, pid)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("killStaleServersForDir error: %v", err)
+	}
+	if len(got) != 1 || got[0] != sameRepoOrphanPID {
+		t.Fatalf("killed=%v, want [%d] -- an ambient BEADS_DOLT_SERVER_PORT must not stop the orphan reap (GH#2430)", got, sameRepoOrphanPID)
 	}
 	if len(killed) != 1 || killed[0] != sameRepoOrphanPID {
 		t.Fatalf("kill callback got %v, want [%d]", killed, sameRepoOrphanPID)
@@ -1220,7 +1460,9 @@ func TestRecoverPreV56DoltDir(t *testing.T) {
 		if _, statErr := os.Stat(sentinel); !os.IsNotExist(statErr) {
 			t.Error("expected old .dolt/ contents to be removed during recovery")
 		}
-		t.Skipf("recovery partially completed (dolt init may have failed): %v", err)
+		// Same two causes as TestEnsureDoltInit_WritesMarker's skip: dolt
+		// absent, or no dolt identity under the redirected HOME.
+		t.Skipf("recovery partially completed (dolt not installed, or no dolt identity in HOME=%q): %v", os.Getenv("HOME"), err)
 	}
 	if !recovered {
 		t.Error("expected recovery to be performed")
@@ -1271,8 +1513,10 @@ func TestEnsureDoltInit_WritesMarker(t *testing.T) {
 	// ensureDoltInit should create .dolt/ and write the marker
 	err := ensureDoltInit(doltDir)
 	if err != nil {
-		// dolt might not be installed in test env; skip marker check
-		t.Skipf("dolt init failed (dolt may not be installed): %v", err)
+		// dolt is absent, or the environment has no dolt identity for it to
+		// author the init commit with. TestMain configures one inside the
+		// isolated HOME; see configureDoltIdentity in testmain_test.go.
+		t.Skipf("dolt init failed (dolt not installed, or no dolt identity in HOME=%q): %v", os.Getenv("HOME"), err)
 	}
 
 	markerPath := filepath.Join(doltDir, bdDoltMarker)
@@ -1364,6 +1608,22 @@ func TestSharedServerDir_EnvOverride(t *testing.T) {
 	}
 }
 
+func TestSharedServerPath_EnvOverrideDoesNotCreateDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "not-created")
+	t.Setenv("BEADS_SHARED_SERVER_DIR", dir)
+
+	got, err := SharedServerPath()
+	if err != nil {
+		t.Fatalf("SharedServerPath: %v", err)
+	}
+	if got != dir {
+		t.Fatalf("SharedServerPath = %q, want %q", got, dir)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("SharedServerPath created or touched %q: stat error = %v", dir, err)
+	}
+}
+
 func TestSharedDoltDir_EnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("BEADS_SHARED_SERVER_DIR", tmp)
@@ -1405,6 +1665,145 @@ func TestDefaultConfig_SharedModeFixedPort(t *testing.T) {
 		t.Errorf("shared mode: expected port %d (DefaultSharedServerPort), got %d", DefaultSharedServerPort, cfg.Port)
 	}
 }
+func TestIsSharedServerModeForDirPrecedence(t *testing.T) {
+	writeMode := func(t *testing.T, value string) string {
+		t.Helper()
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"),
+			[]byte("dolt:\n  shared-server: "+value+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return beadsDir
+	}
+
+	t.Run("environment overrides target", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+		if !IsSharedServerModeForDir(writeMode(t, "false")) {
+			t.Fatal("BEADS_DOLT_SHARED_SERVER=1 must override target shared-server=false")
+		}
+	})
+
+	t.Run("target overrides active workspace", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+		// An inherited port env var makes any target external via check 2c,
+		// independent of its shared-server classification.
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+		t.Setenv("BEADS_DOLT_PORT", "")
+		activeDir := writeMode(t, "true")
+		targetDir := writeMode(t, "false")
+		t.Setenv("BEADS_DIR", activeDir)
+		config.ResetForTesting()
+		t.Cleanup(config.ResetForTesting)
+		if err := config.Initialize(); err != nil {
+			t.Fatal(err)
+		}
+		if IsSharedServerModeForDir(targetDir) {
+			t.Fatal("explicit target shared-server=false must override active workspace true")
+		}
+		if got := DefaultConfigForMode(targetDir, false).Mode; got != ServerModeOwned {
+			t.Fatalf("explicit non-shared target mode = %s, want owned despite active shared workspace", got)
+		}
+	})
+
+	t.Run("target true overrides active workspace", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+		activeDir := writeMode(t, "false")
+		targetDir := writeMode(t, "true")
+		t.Setenv("BEADS_DIR", activeDir)
+		config.ResetForTesting()
+		t.Cleanup(config.ResetForTesting)
+		if err := config.Initialize(); err != nil {
+			t.Fatal(err)
+		}
+		if !IsSharedServerModeForDir(targetDir) {
+			t.Fatal("explicit target shared-server=true must override active workspace false")
+		}
+		if got := DefaultConfigForMode(targetDir, true).Mode; got != ServerModeExternal {
+			t.Fatalf("explicit shared target mode = %s, want external despite active non-shared workspace", got)
+		}
+	})
+}
+
+func TestDefaultConfig_SharedRemotesAPIPortIsMachineGlobal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("BEADS_SHARED_SERVER_DIR", filepath.Join(home, ".beads", "shared-server"))
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	t.Setenv("BEADS_DOLT_REMOTESAPI_PORT", "")
+
+	projectBeads := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(projectBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectCfg := configfile.DefaultConfig()
+	projectCfg.DoltRemotesAPIPort = 7001
+	if err := projectCfg.Save(projectBeads); err != nil {
+		t.Fatal(err)
+	}
+	if got := DefaultConfig(projectBeads).RemotesAPIPort; got != 0 {
+		t.Fatalf("shared remotesapi port = %d with no user-global value, want disabled 0 despite project metadata 7001", got)
+	}
+
+	if err := config.SetUserYamlConfig(remotesAPIPortConfigKey, "8001"); err != nil {
+		t.Fatal(err)
+	}
+	configPath, err := config.UserConfigYamlPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configBody, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config.GetUserYamlConfig(remotesAPIPortConfigKey); got != "8001" {
+		t.Fatalf("user-global config %s contains %q but resolved remotesapi port = %q, want 8001", configPath, configBody, got)
+	}
+
+	if got := DefaultConfig(projectBeads).RemotesAPIPort; got != 8001 {
+		t.Fatalf("shared remotesapi port = %d, want user-global 8001 (project metadata must not skew one shared process)", got)
+	}
+	t.Setenv("BEADS_DOLT_REMOTESAPI_PORT", "not-a-port")
+	if got := DefaultConfig(projectBeads).RemotesAPIPort; got != 8001 {
+		t.Fatalf("malformed env resolved remotesapi port = %d, want persisted 8001", got)
+	}
+
+	t.Setenv("BEADS_DOLT_REMOTESAPI_PORT", "9001")
+	if got := DefaultConfig(projectBeads).RemotesAPIPort; got != 9001 {
+		t.Fatalf("shared remotesapi port = %d, want env override 9001", got)
+	}
+
+	t.Setenv("BEADS_DOLT_REMOTESAPI_PORT", "0")
+	if got := DefaultConfig(projectBeads).RemotesAPIPort; got != 0 {
+		t.Fatalf("shared remotesapi port = %d, want explicit env disable 0", got)
+	}
+	t.Setenv("BEADS_DOLT_REMOTESAPI_PORT", "")
+	if err := config.SetUserYamlConfig(remotesAPIPortConfigKey, "0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := DefaultConfig(projectBeads).RemotesAPIPort; got != 0 {
+		t.Fatalf("persisted shared remotesapi port = %d, want explicit disable 0", got)
+	}
+}
+
+func TestDefaultConfig_RemotesAPIPortDisabledByDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_REMOTESAPI_PORT", "")
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := DefaultConfig(beadsDir).RemotesAPIPort; got != 0 {
+		t.Fatalf("unconfigured remotesapi port = %d, want disabled 0", got)
+	}
+}
 
 func TestDefaultConfig_SharedModeGeneralPortOverrides(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
@@ -1440,6 +1839,8 @@ func TestDefaultConfig_SharedModeBeadsDir(t *testing.T) {
 func TestResolveServerMode_Default(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
 	config.ResetForTesting()
 
 	dir := t.TempDir()
@@ -1480,6 +1881,150 @@ func TestResolveServerMode_ExplicitPort(t *testing.T) {
 	}
 }
 
+func TestResolveServerMode_HostInferredExternal(t *testing.T) {
+	// GH#3545: a non-localhost host with no explicit mode or port means
+	// the server lives on another machine — bd cannot own its lifecycle,
+	// so "bd dolt start" must not launch a repo-local server against it.
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	// Same ambient-inheritance fix as TestResolveServerMode_EnvHostBeatsEmbeddedMetadata:
+	// this asserts the host-only DEFAULT port, so an inherited
+	// BEADS_DOLT_SERVER_PORT silently becomes the expected value's competitor.
+	// Pre-dates check 2c -- it fails on origin/main too, on any host that
+	// exports one.
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	config.ResetForTesting()
+
+	dir := t.TempDir()
+	metaCfg := &configfile.Config{
+		DoltServerHost: "10.0.0.5",
+	}
+	if err := metaCfg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	mode := ResolveServerMode(dir)
+	if mode != ServerModeExternal {
+		t.Errorf("expected ServerModeExternal with non-localhost host, got %v", mode)
+	}
+
+	// Host-only config must fall back to the documented default port,
+	// not 0 — there is no local Start() to allocate one for a remote
+	// server (cross-vendor review P1, 2026-08-02).
+	cfg := DefaultConfig(dir)
+	if cfg.Port != configfile.DefaultDoltServerPort {
+		t.Errorf("DefaultConfig.Port = %d, want %d for host-only external config", cfg.Port, configfile.DefaultDoltServerPort)
+	}
+	if cfg.PortSource != PortSourceExternalHostDefault {
+		t.Errorf("DefaultConfig.PortSource = %q, want %q", cfg.PortSource, PortSourceExternalHostDefault)
+	}
+
+	// A stale local port file (bd's bookkeeping for a bd-owned LOCAL
+	// server) must not be paired with the remote host (cross-vendor
+	// review round 4): still expect the documented default.
+	if err := os.WriteFile(portPath(dir), []byte("45123"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg = DefaultConfig(dir)
+	if cfg.Port != configfile.DefaultDoltServerPort {
+		t.Errorf("DefaultConfig.Port = %d, want %d: stale local port file must be ignored for a remote host", cfg.Port, configfile.DefaultDoltServerPort)
+	}
+	if err := os.Remove(portPath(dir)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Localhost host stays owned.
+	metaCfg = &configfile.Config{
+		DoltServerHost: "127.0.0.1",
+	}
+	if err := metaCfg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	if mode := ResolveServerMode(dir); mode != ServerModeOwned {
+		t.Errorf("expected ServerModeOwned with localhost host, got %v", mode)
+	}
+}
+
+func TestResolveServerMode_EnvHostBeatsEmbeddedMetadata(t *testing.T) {
+	// GH#2949 precedent applied to the host env var: a runtime remote
+	// host must beat stale dolt_mode=embedded metadata, and the two mode
+	// resolvers (IsDoltServerMode, ResolveServerMode) must agree — or
+	// data commands select SQL-server storage while lifecycle/port
+	// resolution runs embedded (cross-vendor review round 4).
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "192.0.2.10")
+	// This test is about HOST inference; the port env vars are a different
+	// input and must be neutralized rather than inherited. Without these two
+	// lines the test reads whatever the developer's shell exports: on a rig
+	// with BEADS_DOLT_SERVER_PORT set it failed at the DefaultConfig.Port
+	// assertion below (that failure predates the port-env work and reproduces
+	// on origin/main) and, once check 2c existed, at the proxied-server and
+	// localhost-override assertions too.
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	config.ResetForTesting()
+
+	dir := t.TempDir()
+	metaCfg := &configfile.Config{
+		DoltMode: configfile.DoltModeEmbedded,
+	}
+	if err := metaCfg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	if mode := ResolveServerMode(dir); mode != ServerModeExternal {
+		t.Errorf("expected ServerModeExternal with remote env host over embedded metadata, got %v", mode)
+	}
+	cfg := DefaultConfig(dir)
+	if cfg.Port != configfile.DefaultDoltServerPort {
+		t.Errorf("DefaultConfig.Port = %d, want %d", cfg.Port, configfile.DefaultDoltServerPort)
+	}
+
+	// Proxied-server workspaces are exempt, matching the inference gate.
+	metaCfg = &configfile.Config{
+		DoltMode: configfile.DoltModeProxiedServer,
+	}
+	if err := metaCfg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	if mode := ResolveServerMode(dir); mode == ServerModeExternal {
+		t.Errorf("proxied-server workspace must not be reclassified external by env host; got %v", mode)
+	}
+	// Same exemption, the other inference input: an ambient server port must
+	// not reclassify a proxied workspace either. Check 2c originally lacked
+	// this guard, so a proxied constellation with BEADS_DOLT_SERVER_PORT set
+	// -- ours -- resolved external.
+	func() {
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "3308")
+		defer t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+		if mode := ResolveServerMode(dir); mode == ServerModeExternal {
+			t.Errorf("proxied-server workspace must not be reclassified external by an ambient server port; got %v", mode)
+		}
+	}()
+
+	// An EMPTY env host behaves as unset (matching GetDoltServerHost,
+	// cross-vendor review round 6): the remote metadata host stays
+	// effective, so inference still fires. Suppression requires an
+	// explicit localhost value.
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	metaCfg = &configfile.Config{
+		DoltServerHost: "10.0.0.5",
+	}
+	if err := metaCfg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	if mode := ResolveServerMode(dir); mode != ServerModeExternal {
+		t.Errorf("expected ServerModeExternal: empty env host must not mask the effective remote metadata host, got %v", mode)
+	}
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "localhost")
+	if mode := ResolveServerMode(dir); mode != ServerModeOwned {
+		t.Errorf("expected ServerModeOwned with explicit localhost env override, got %v", mode)
+	}
+}
+
 func TestResolveServerMode_ServerModeEnv(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
@@ -1495,6 +2040,8 @@ func TestResolveServerMode_ServerModeEnv(t *testing.T) {
 func TestResolveServerMode_EmbeddedMode(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
 	config.ResetForTesting()
 
 	dir := t.TempDir()
@@ -1509,6 +2056,39 @@ func TestResolveServerMode_EmbeddedMode(t *testing.T) {
 	mode := ResolveServerMode(dir)
 	if mode != ServerModeEmbedded {
 		t.Errorf("expected ServerModeEmbedded with dolt_mode=embedded, got %v", mode)
+	}
+}
+
+func TestResolveServerMode_EnvPortImpliesExternal(t *testing.T) {
+	// A port arriving via env var (BEADS_DOLT_SERVER_PORT or the legacy
+	// BEADS_DOLT_PORT) is the orchestrator's signal that the server address
+	// is externally managed — GetDoltServerPort() already treats both as
+	// first-class port signals ("orchestrator sets this"). ResolveServerMode
+	// must agree, or a deployment whose port arrives via env var resolves
+	// owned even though bd never launched the server and ensureDoltInit
+	// never ran for it (be-9i0yq.1).
+	tests := []struct {
+		name   string
+		envVar string
+	}{
+		{"BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_SERVER_PORT"},
+		{"BEADS_DOLT_PORT", "BEADS_DOLT_PORT"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+			t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+			t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+			t.Setenv("BEADS_DOLT_PORT", "")
+			t.Setenv(tc.envVar, "13307")
+			config.ResetForTesting()
+
+			dir := t.TempDir()
+			mode := ResolveServerMode(dir)
+			if mode != ServerModeExternal {
+				t.Errorf("expected ServerModeExternal with %s set and no metadata.json, got %v", tc.envVar, mode)
+			}
+		})
 	}
 }
 
@@ -1617,11 +2197,44 @@ func TestResolveServerMode_EmbeddedHonoredWithoutServerEnv(t *testing.T) {
 
 	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
 	config.ResetForTesting()
 
 	got := ResolveServerMode(beadsDir)
 	if got != ServerModeEmbedded {
 		t.Errorf("ResolveServerMode with no server env = %v, want ServerModeEmbedded", got)
+	}
+}
+
+func TestResolveServerMode_EnvPortOverridesStaleEmbedded(t *testing.T) {
+	// GH#2949 precedent applied to the port env var: a runtime
+	// BEADS_DOLT_SERVER_PORT/BEADS_DOLT_PORT must beat stale
+	// dolt_mode=embedded metadata, same as the shared-server, explicit
+	// server-mode, and host env vars above (be-9i0yq.1).
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &configfile.Config{
+		Database: "dolt",
+		Backend:  "dolt",
+		DoltMode: configfile.DoltModeEmbedded,
+	}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "13307")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	config.ResetForTesting()
+
+	got := ResolveServerMode(beadsDir)
+	if got != ServerModeExternal {
+		t.Errorf("ResolveServerMode with env port + stale embedded = %v, want ServerModeExternal", got)
 	}
 }
 
@@ -1706,7 +2319,7 @@ func TestBuildDoltServerArgs(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildDoltServerArgs(tc.host, tc.port, false, "")
+			args := buildDoltServerArgs(tc.host, tc.port, 0, false, "")
 
 			if len(args) == 0 || args[0] != "sql-server" {
 				t.Fatalf("args[0] = %q, want %q; full args: %v",
@@ -1729,6 +2342,9 @@ func TestBuildDoltServerArgs(t *testing.T) {
 			}
 			if got := args[portIdx+1]; got != tc.wantPort {
 				t.Errorf("port = %q, want %q", got, tc.wantPort)
+			}
+			if indexOf(args, "--remotesapi-port") >= 0 {
+				t.Errorf("disabled remotesapi must not add a flag: %v", args)
 			}
 
 			// --loglevel=<level> — the actual fix.
@@ -1765,7 +2381,7 @@ func TestBuildDoltServerArgs(t *testing.T) {
 // runMain). Placing --prof after sql-server silently drops profiling.
 func TestBuildDoltServerArgs_DebugMode(t *testing.T) {
 	const profDir = "/tmp/test-pprof"
-	args := buildDoltServerArgs("127.0.0.1", 3308, true, profDir)
+	args := buildDoltServerArgs("127.0.0.1", 3308, 0, true, profDir)
 
 	// --prof and --prof-path must precede sql-server.
 	subIdx := indexOf(args, "sql-server")
@@ -1812,7 +2428,7 @@ func TestBuildDoltServerArgs_DebugMode(t *testing.T) {
 // The warning loglevel floor is also reasserted here so a future
 // refactor can't silently degrade only the non-debug path.
 func TestBuildDoltServerArgs_NoDebugFlagsWhenDisabled(t *testing.T) {
-	args := buildDoltServerArgs("127.0.0.1", 3308, false, "")
+	args := buildDoltServerArgs("127.0.0.1", 3308, 0, false, "")
 	if indexOf(args, "--prof") >= 0 {
 		t.Errorf("non-debug args should not contain --prof: %v", args)
 	}
@@ -1825,6 +2441,398 @@ func TestBuildDoltServerArgs_NoDebugFlagsWhenDisabled(t *testing.T) {
 	}
 	if logLevel == "debug" {
 		t.Errorf("non-debug mode must not use --loglevel=debug; got: %v", args)
+	}
+}
+
+func TestBuildDoltServerArgs_RemotesAPI(t *testing.T) {
+	args := buildDoltServerArgs("127.0.0.1", 3308, 8081, false, "")
+	idx := indexOf(args, "--remotesapi-port")
+	if idx < 0 || idx+1 >= len(args) || args[idx+1] != "8081" {
+		t.Fatalf("configured remotesapi flag missing or wrong: %v", args)
+	}
+}
+
+func TestVerifyRemotesAPIState(t *testing.T) {
+	if _, err := verifyRemotesAPIState(
+		&Config{RemotesAPIPort: 3308},
+		&State{Running: true, PID: 41, Port: 3308},
+	); err == nil || !strings.Contains(err.Error(), "distinct") {
+		t.Fatalf("equal SQL/remotesapi verification = %v, want distinct-port error", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	state := &State{Running: true, PID: 42, Port: 3308}
+	got, err := verifyRemotesAPIState(&Config{RemotesAPIPort: port}, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RemotesAPIPort != port {
+		t.Fatalf("state remotesapi port = %d, want %d", got.RemotesAPIPort, port)
+	}
+	_ = listener.Close()
+	if _, err := verifyRemotesAPIState(&Config{RemotesAPIPort: port}, state); err == nil ||
+		!strings.Contains(err.Error(), "bd dolt stop && bd dolt start") {
+		t.Fatalf("unreachable remotesapi verification = %v, want stop/start-required error", err)
+	}
+}
+
+// TestBuildDoltServerYAMLConfig verifies the --config counterpart to
+// buildDoltServerArgs: it must round-trip through Dolt's own YAML loader
+// with the same host/port/log-level as the CLI-flag form, plus
+// auto_gc_behavior.archive_level: 0 (the actual Snappy-GC fix,
+// gastownhall/beads#4986) and auto-GC left enabled, plus cfg_dir set to the
+// caller-resolved value (gastownhall/beads#4986 round 2: --config mode
+// skips Dolt's own .doltcfg discovery, so this must be set explicitly).
+func TestBuildDoltServerYAMLConfig(t *testing.T) {
+	body, err := buildDoltServerYAMLConfig("127.0.0.1", 54321, 8081, false, "/tmp/some/.doltcfg")
+	if err != nil {
+		t.Fatalf("buildDoltServerYAMLConfig: %v", err)
+	}
+
+	cfg, err := servercfg.NewYamlConfig(body)
+	if err != nil {
+		t.Fatalf("servercfg.NewYamlConfig could not parse generated config: %v\nconfig:\n%s", err, body)
+	}
+	if got := cfg.Host(); got != "127.0.0.1" {
+		t.Errorf("Host = %q, want %q", got, "127.0.0.1")
+	}
+	if got := cfg.Port(); got != 54321 {
+		t.Errorf("Port = %d, want %d", got, 54321)
+	}
+	if got := cfg.RemotesapiPort(); got == nil || *got != 8081 {
+		t.Errorf("RemotesapiPort = %v, want 8081", got)
+	}
+
+	if got := string(cfg.LogLevel()); got != doltServerLogLevel {
+		t.Errorf("LogLevel = %q, want %q", got, doltServerLogLevel)
+	}
+	if got := cfg.CfgDir(); got != "/tmp/some/.doltcfg" {
+		t.Errorf("CfgDir = %q, want %q", got, "/tmp/some/.doltcfg")
+	}
+
+	gc := cfg.AutoGCBehavior()
+	if gc == nil {
+		t.Fatal("AutoGCBehavior is nil; expected archive_level: 0 to be set")
+	}
+	if got := gc.ArchiveLevel(); got != 0 {
+		t.Errorf("ArchiveLevel = %d, want 0 (Snappy, not zstd)", got)
+	}
+	if !gc.Enable() {
+		t.Error("auto-GC must remain enabled; only the archive level should change")
+	}
+}
+
+// TestBuildDoltServerYAMLConfig_DebugLogLevel asserts debug mode raises the
+// YAML config's log level the same way buildDoltServerArgs does for the
+// CLI-flag form.
+func TestBuildDoltServerYAMLConfig_DebugLogLevel(t *testing.T) {
+	body, err := buildDoltServerYAMLConfig("127.0.0.1", 54321, 0, true, "/tmp/some/.doltcfg")
+	if err != nil {
+		t.Fatalf("buildDoltServerYAMLConfig: %v", err)
+	}
+	cfg, err := servercfg.NewYamlConfig(body)
+	if err != nil {
+		t.Fatalf("servercfg.NewYamlConfig: %v", err)
+	}
+	if got := string(cfg.LogLevel()); got != "debug" {
+		t.Errorf("debug mode LogLevel = %q, want %q", got, "debug")
+	}
+}
+
+// physicalTempDir returns t.TempDir() with symlinks resolved. resolveCfgDir
+// deliberately normalizes doltDir via filepath.EvalSymlinks, and on macOS
+// t.TempDir() lives under /var/folders which is a symlink to
+// /private/var/folders — expected paths must be built from the physical
+// root or the comparison fails on that platform alone.
+func physicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(t.TempDir()): %v", err)
+	}
+	return dir
+}
+
+// TestResolveCfgDir_NeitherExists is the common case: no parent or
+// data-dir .doltcfg found on disk, so resolveCfgDir must default to
+// dataDir/.doltcfg — matching Dolt's own flag-mode default ("Assign the one
+// that exists, defaults to current if neither exist" in setupDoltConfig).
+func TestResolveCfgDir_NeitherExists(t *testing.T) {
+	doltDir := filepath.Join(physicalTempDir(t), "dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		t.Fatalf("mkdir doltDir: %v", err)
+	}
+
+	got, err := resolveCfgDir(doltDir)
+	if err != nil {
+		t.Fatalf("resolveCfgDir: %v", err)
+	}
+	want, err := filepath.Abs(filepath.Join(doltDir, doltCfgDirName))
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+	if got != want {
+		t.Errorf("resolveCfgDir = %q, want %q", got, want)
+	}
+}
+
+// TestResolveCfgDir_ParentExists is the actual bug this fix addresses: a
+// legacy deployment previously run in CLI-flag mode discovered a parent
+// ../.doltcfg (holding privileges.db/branch_control.db). --config mode
+// would otherwise silently ignore it; resolveCfgDir must find it and point
+// cfg_dir there instead of a fresh dataDir/.doltcfg.
+func TestResolveCfgDir_ParentExists(t *testing.T) {
+	root := physicalTempDir(t)
+	doltDir := filepath.Join(root, "dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		t.Fatalf("mkdir doltDir: %v", err)
+	}
+	parentCfg := filepath.Join(root, doltCfgDirName)
+	if err := os.MkdirAll(parentCfg, 0o755); err != nil {
+		t.Fatalf("mkdir parent .doltcfg: %v", err)
+	}
+	// Seed it so this test would fail loudly if resolution pointed elsewhere.
+	if err := os.WriteFile(filepath.Join(parentCfg, "privileges.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed privileges.db: %v", err)
+	}
+
+	got, err := resolveCfgDir(doltDir)
+	if err != nil {
+		t.Fatalf("resolveCfgDir: %v", err)
+	}
+	want, err := filepath.Abs(parentCfg)
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+	if got != want {
+		t.Errorf("resolveCfgDir = %q, want parent %q (existing users/branch-control must not be abandoned)", got, want)
+	}
+}
+
+// TestResolveCfgDir_CurrentExists asserts a data-dir .doltcfg (no parent
+// one) resolves to itself, matching flag-mode's "look in data directory"
+// branch.
+func TestResolveCfgDir_CurrentExists(t *testing.T) {
+	root := physicalTempDir(t)
+	doltDir := filepath.Join(root, "dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		t.Fatalf("mkdir doltDir: %v", err)
+	}
+	currCfg := filepath.Join(doltDir, doltCfgDirName)
+	if err := os.MkdirAll(currCfg, 0o755); err != nil {
+		t.Fatalf("mkdir data-dir .doltcfg: %v", err)
+	}
+
+	got, err := resolveCfgDir(doltDir)
+	if err != nil {
+		t.Fatalf("resolveCfgDir: %v", err)
+	}
+	want, err := filepath.Abs(currCfg)
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+	if got != want {
+		t.Errorf("resolveCfgDir = %q, want %q", got, want)
+	}
+}
+
+// TestResolveCfgDir_BothExistIsAmbiguous mirrors Dolt's own
+// ErrMultipleDoltCfgDirs case: resolveCfgDir must refuse to guess when both
+// a parent and a data-dir .doltcfg exist, rather than silently picking one
+// and risking the same class of silent data loss this fix exists to
+// prevent.
+func TestResolveCfgDir_BothExistIsAmbiguous(t *testing.T) {
+	root := t.TempDir()
+	doltDir := filepath.Join(root, "dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		t.Fatalf("mkdir doltDir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, doltCfgDirName), 0o755); err != nil {
+		t.Fatalf("mkdir parent .doltcfg: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(doltDir, doltCfgDirName), 0o755); err != nil {
+		t.Fatalf("mkdir data-dir .doltcfg: %v", err)
+	}
+
+	_, err := resolveCfgDir(doltDir)
+	if err == nil {
+		t.Fatal("resolveCfgDir: expected an error when both parent and data-dir .doltcfg exist, got nil")
+	}
+	if !errors.Is(err, ErrMultipleDoltCfgDirs) {
+		t.Errorf("resolveCfgDir error = %v, want errors.Is(_, ErrMultipleDoltCfgDirs)", err)
+	}
+}
+
+// TestResolveCfgDir_FileNotDirIgnored asserts a plain file named .doltcfg
+// (not a directory) is not mistaken for a real .doltcfg dir — matches
+// Dolt's own dEnv.FS.Exists(...) check, which also requires isDir.
+func TestResolveCfgDir_FileNotDirIgnored(t *testing.T) {
+	root := physicalTempDir(t)
+	doltDir := filepath.Join(root, "dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		t.Fatalf("mkdir doltDir: %v", err)
+	}
+	// A stray file (not a dir) named .doltcfg next to doltDir must be ignored.
+	if err := os.WriteFile(filepath.Join(root, doltCfgDirName), []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write stray file: %v", err)
+	}
+
+	got, err := resolveCfgDir(doltDir)
+	if err != nil {
+		t.Fatalf("resolveCfgDir: %v", err)
+	}
+	want, err := filepath.Abs(filepath.Join(doltDir, doltCfgDirName))
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+	if got != want {
+		t.Errorf("resolveCfgDir = %q, want default %q (stray non-dir file must be ignored)", got, want)
+	}
+}
+
+// TestResolveCfgDir_SymlinkedDataDirFindsPhysicalParent covers the round-3
+// verification finding (gastownhall/beads#4986): filepath.Join(doltDir,
+// "..", ...) cleans ".." lexically, without touching the filesystem. If
+// doltDir is itself a symlink, that yields the symlink's own lexical
+// parent directory — not the physical parent of whatever directory the
+// symlink actually points at. But the real `dolt` child process's own
+// "../.doltcfg" lookup is a bare relative path resolved against its
+// actual, kernel-tracked cwd, which chdir into a symlink resolves
+// PHYSICALLY on Linux. A naive lexical join therefore misses a parent
+// .doltcfg that sits next to the physical target directory, silently
+// falling back to a fresh $data_dir/.doltcfg — the exact data-loss
+// scenario this whole fix exists to prevent.
+//
+// Layout:
+//
+//	<root>/physical/parent/target/          (the real data directory)
+//	<root>/physical/parent/.doltcfg/         (the REAL parent .doltcfg)
+//	<root>/lexical/doltlink -> .../target    (symlink passed as doltDir)
+//
+// A lexically-parent-of-the-symlink directory (<root>/lexical/.doltcfg) is
+// deliberately never created, so a buggy lexical resolution would find
+// nothing there and fall through to the (also nonexistent, but still
+// wrong) default $data_dir/.doltcfg instead of the real one.
+func TestResolveCfgDir_SymlinkedDataDirFindsPhysicalParent(t *testing.T) {
+	root := t.TempDir()
+
+	physicalParent := filepath.Join(root, "physical", "parent")
+	physicalTarget := filepath.Join(physicalParent, "target")
+	if err := os.MkdirAll(physicalTarget, 0o755); err != nil {
+		t.Fatalf("mkdir physical target: %v", err)
+	}
+	physicalCfgDir := filepath.Join(physicalParent, doltCfgDirName)
+	if err := os.MkdirAll(physicalCfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir physical .doltcfg: %v", err)
+	}
+	// Seed it so this test would fail loudly if resolution missed it.
+	if err := os.WriteFile(filepath.Join(physicalCfgDir, "privileges.db"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed privileges.db: %v", err)
+	}
+
+	lexicalDir := filepath.Join(root, "lexical")
+	if err := os.MkdirAll(lexicalDir, 0o755); err != nil {
+		t.Fatalf("mkdir lexical dir: %v", err)
+	}
+	symlinkedDoltDir := filepath.Join(lexicalDir, "doltlink")
+	if err := os.Symlink(physicalTarget, symlinkedDoltDir); err != nil {
+		t.Skipf("symlink not supported on this platform: %v", err)
+	}
+
+	got, err := resolveCfgDir(symlinkedDoltDir)
+	if err != nil {
+		t.Fatalf("resolveCfgDir: %v", err)
+	}
+
+	wantPhysical, err := filepath.EvalSymlinks(physicalCfgDir)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks(physicalCfgDir): %v", err)
+	}
+	want, err := filepath.Abs(wantPhysical)
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+
+	if got != want {
+		t.Errorf("resolveCfgDir(%q) = %q, want the PHYSICAL parent .doltcfg %q "+
+			"(existing users/branch-control must not be abandoned behind a symlinked data dir)",
+			symlinkedDoltDir, got, want)
+	}
+
+	// Sanity: the naive lexical join must NOT be what we got, or this test
+	// would pass vacuously against a regression.
+	lexicalWrong := filepath.Join(lexicalDir, doltCfgDirName)
+	if got == lexicalWrong {
+		t.Errorf("resolveCfgDir resolved to the lexical-parent-of-the-symlink %q, "+
+			"not the physical parent — this is the exact bug this test guards against", lexicalWrong)
+	}
+}
+
+// TestBuildDoltServerArgsWithConfig mirrors TestBuildDoltServerArgs_DebugMode
+// for the --config launch form: --prof/--prof-path must still precede
+// sql-server (top-level dolt flags), and --config must carry the path
+// unmodified. Per Dolt's own sql-server docs, --config causes all other
+// sql-server flags (host/port/log-level) to be ignored, so this form MUST
+// NOT also pass -H/-P/--loglevel.
+func TestBuildDoltServerArgsWithConfig(t *testing.T) {
+	t.Run("non-debug", func(t *testing.T) {
+		args := buildDoltServerArgsWithConfig("/tmp/dolt-server-config.yaml", false, "")
+		if len(args) == 0 || args[0] != "sql-server" {
+			t.Fatalf("args[0] = %q, want %q; full args: %v", firstOrEmpty(args), "sql-server", args)
+		}
+		cfgIdx := indexOf(args, "--config")
+		if cfgIdx < 0 || cfgIdx+1 >= len(args) {
+			t.Fatalf("missing --config <path> in args: %v", args)
+		}
+		if got := args[cfgIdx+1]; got != "/tmp/dolt-server-config.yaml" {
+			t.Errorf("--config value = %q, want %q", got, "/tmp/dolt-server-config.yaml")
+		}
+		for _, flag := range []string{"-H", "-P", "--loglevel"} {
+			if indexOf(args, flag) >= 0 {
+				t.Errorf("--config mode must not also pass %s (Dolt ignores it, and its presence is misleading): %v", flag, args)
+			}
+		}
+	})
+
+	t.Run("debug mode places --prof before sql-server", func(t *testing.T) {
+		const profDir = "/tmp/test-pprof"
+		args := buildDoltServerArgsWithConfig("/tmp/dolt-server-config.yaml", true, profDir)
+		subIdx := indexOf(args, "sql-server")
+		if subIdx < 0 {
+			t.Fatalf("missing sql-server in args: %v", args)
+		}
+		profIdx := indexOf(args, "--prof")
+		if profIdx < 0 || profIdx >= subIdx {
+			t.Fatalf("--prof must precede sql-server; got: %v", args)
+		}
+		pathIdx := indexOf(args, "--prof-path")
+		if pathIdx < 0 || pathIdx >= subIdx {
+			t.Fatalf("--prof-path must precede sql-server; got: %v", args)
+		}
+		if got := args[pathIdx+1]; got != profDir {
+			t.Errorf("--prof-path value = %q, want %q", got, profDir)
+		}
+	})
+}
+
+func TestDoltServerConfigPath(t *testing.T) {
+	got := doltServerConfigPath("/tmp/some/.beads")
+	want := filepath.Join("/tmp/some/.beads", "dolt-server-config.yaml")
+	if got != want {
+		t.Errorf("doltServerConfigPath = %q, want %q", got, want)
+	}
+}
+
+// TestStateFilePaths_IncludesGeneratedConfig guards against the generated
+// sql-server config leaking as an untracked leftover after Stop/RemoveState.
+func TestStateFilePaths_IncludesGeneratedConfig(t *testing.T) {
+	paths := StateFilePaths("/tmp/some/.beads")
+	if indexOf(paths, doltServerConfigPath("/tmp/some/.beads")) < 0 {
+		t.Errorf("StateFilePaths does not include the generated sql-server config; got: %v", paths)
 	}
 }
 
@@ -1843,7 +2851,9 @@ func TestWaitForReady(t *testing.T) {
 
 	// Spawn a goroutine that delays binding the port. This simulates a
 	// "slow server" -- the TCP listener is not yet bound when waitForReady
-	// is first called.
+	// is first called. Once bound, each accepted connection is sent a fake
+	// MySQL handshake greeting so waitForReady's post-F7 "must be greeted,
+	// not just accepted" check is satisfiable.
 	bindAfter := 200 * time.Millisecond
 	listenerReady := make(chan net.Listener, 1)
 	go func() {
@@ -1853,6 +2863,18 @@ func TestWaitForReady(t *testing.T) {
 			close(listenerReady)
 			return
 		}
+		go func() {
+			for {
+				conn, acceptErr := ln.Accept()
+				if acceptErr != nil {
+					return
+				}
+				go func(c net.Conn) {
+					_, _ = c.Write([]byte{0x08, 0x00, 0x00, 0x00, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a})
+					_ = c.Close()
+				}(conn)
+			}
+		}()
 		listenerReady <- ln
 	}()
 	t.Cleanup(func() {
@@ -1959,5 +2981,149 @@ func TestEnsureGlobalDatabase_ServerNotReachable(t *testing.T) {
 	err := EnsureGlobalDatabase("127.0.0.1", 19999, "root", "")
 	if err == nil {
 		t.Error("expected error when server is not reachable")
+	}
+}
+
+// TestExternalNonLocalhostHost_GH3518 covers the helper that drives the
+// host-aware error-message branching in EnsureRunning. When the
+// configured Dolt server is non-localhost, EnsureRunning's "external
+// server unreachable" path now suggests verifying the external server
+// rather than running `bd dolt start` (which would not help).
+func TestExternalNonLocalhostHost_GH3518(t *testing.T) {
+	t.Run("env host non-localhost returns (host, true)", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_HOST", "192.0.2.10")
+		// IsDoltServerMode now infers from non-localhost host (GH#3545)
+		// so we don't need to set BEADS_DOLT_SERVER_MODE here — that's
+		// the whole point of the sibling fix.
+		config.ResetForTesting()
+		dir := t.TempDir()
+
+		host, ok := externalNonLocalhostHost(dir)
+		if !ok {
+			t.Fatalf("externalNonLocalhostHost: ok=false, want true")
+		}
+		if host != "192.0.2.10" {
+			t.Errorf("host = %q, want 192.0.2.10", host)
+		}
+	})
+
+	t.Run("env host localhost returns (\"\", false)", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_HOST", "localhost")
+		config.ResetForTesting()
+		dir := t.TempDir()
+
+		host, ok := externalNonLocalhostHost(dir)
+		if ok {
+			t.Errorf("externalNonLocalhostHost: ok=true, want false (host=%q)", host)
+		}
+	})
+
+	t.Run("env host 127.0.0.1 returns (\"\", false)", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_HOST", "127.0.0.1")
+		config.ResetForTesting()
+		dir := t.TempDir()
+
+		_, ok := externalNonLocalhostHost(dir)
+		if ok {
+			t.Error("externalNonLocalhostHost: ok=true, want false for 127.0.0.1")
+		}
+	})
+
+	t.Run("metadata.json DoltServerHost non-localhost + dolt_mode server returns (host, true)", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+		config.ResetForTesting()
+		dir := t.TempDir()
+		metaCfg := &configfile.Config{
+			Backend:        configfile.BackendDolt,
+			DoltMode:       configfile.DoltModeServer,
+			DoltServerHost: "10.0.0.5",
+		}
+		if err := metaCfg.Save(dir); err != nil {
+			t.Fatal(err)
+		}
+
+		host, ok := externalNonLocalhostHost(dir)
+		if !ok {
+			t.Fatalf("externalNonLocalhostHost: ok=false, want true")
+		}
+		if host != "10.0.0.5" {
+			t.Errorf("host = %q, want 10.0.0.5", host)
+		}
+	})
+
+	t.Run("no config returns (\"\", false)", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+		config.ResetForTesting()
+		dir := t.TempDir()
+		// No metadata.json — configfile.Load returns nil cfg, no error.
+		// (Or an error; either way, helper returns false.)
+
+		_, ok := externalNonLocalhostHost(dir)
+		if ok {
+			t.Error("externalNonLocalhostHost: ok=true, want false for empty beadsDir")
+		}
+	})
+
+	t.Run("non-server mode does NOT yield external", func(t *testing.T) {
+		// Force backend off-dolt to exercise the !IsDoltServerMode
+		// gate. On this codebase GetBackend() recognizes "sqlite" as
+		// a distinct registered backend (BackendSQLite), unlike the
+		// GH#3563 reference PR where GetBackend() normalized any
+		// input back to BackendDolt — so here the backend gate at
+		// the top of IsDoltServerMode fires and short-circuits
+		// *before* env-host inference is ever consulted, regardless
+		// of BEADS_DOLT_SERVER_HOST. Pin current behavior so future
+		// changes to the gate are intentional.
+		t.Setenv("BEADS_DOLT_SERVER_HOST", "192.0.2.10")
+		t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+		config.ResetForTesting()
+		dir := t.TempDir()
+		metaCfg := &configfile.Config{
+			Backend:  "sqlite",
+			DoltMode: "embedded",
+		}
+		if err := metaCfg.Save(dir); err != nil {
+			t.Fatal(err)
+		}
+		host, ok := externalNonLocalhostHost(dir)
+		if ok {
+			t.Errorf("with backend=sqlite, externalNonLocalhostHost should be false (backend gate precedes host inference); got ok=true host=%q", host)
+		}
+	})
+}
+
+func TestDoltStatusQuery(t *testing.T) {
+	tests := []struct {
+		name   string
+		dbName string
+		want   string
+	}{
+		{"plain", "beads_x", "SELECT COUNT(*) > 0 FROM `beads_x`.dolt_status"},
+		{"backtick", "evil`; DROP TABLE x", "SELECT COUNT(*) > 0 FROM `evil``; DROP TABLE x`.dolt_status"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := doltStatusQuery(tt.dbName); got != tt.want {
+				t.Errorf("doltStatusQuery(%q) = %q, want %q", tt.dbName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUseDatabaseStatement(t *testing.T) {
+	tests := []struct {
+		name   string
+		dbName string
+		want   string
+	}{
+		{"plain", "beads_x", "USE `beads_x`"},
+		{"backtick", "evil`; DROP TABLE x", "USE `evil``; DROP TABLE x`"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := useDatabaseStatement(tt.dbName); got != tt.want {
+				t.Errorf("useDatabaseStatement(%q) = %q, want %q", tt.dbName, got, tt.want)
+			}
+		})
 	}
 }

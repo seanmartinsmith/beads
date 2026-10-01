@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -45,9 +46,8 @@ func bdProxiedEnv(dir string) []string {
 		"HOME="+dir,
 		"BEADS_DOLT_PROXIED_SERVER=1",
 		"BEADS_NO_DAEMON=1",
-		// Bypass the bd init --proxied-server dark-launch gate (bd-6dnrw.44)
-		// for the bd subprocesses these suites spawn.
-		"BEADS_TEST_PROXIED_SERVER_INIT=1",
+		"BD_DISABLE_METRICS=1",
+		"BD_DISABLE_EVENT_FLUSH=1",
 	)
 }
 
@@ -145,14 +145,150 @@ func bdProxiedListFail(t *testing.T, bd string, p proxiedProject, args ...string
 
 func bdProxiedRunBuffers(t *testing.T, bd, dir string, args ...string) (string, string, error) {
 	t.Helper()
+	return bdProxiedRunBuffersWithEnv(t, bd, dir, nil, args...)
+}
+
+// bdProxiedRunBuffersWithEnv is bdProxiedRunBuffers with extra environment
+// variables appended after the standard proxied env (so they can override
+// it, e.g. BEADS_MAX_ROWS for the proxied-server MaxRows-rejection tests).
+func bdProxiedRunBuffersWithEnv(t *testing.T, bd, dir string, envExtras []string, args ...string) (string, string, error) {
+	t.Helper()
 	cmd := exec.Command(bd, args...)
 	cmd.Dir = dir
-	cmd.Env = bdProxiedEnv(dir)
+	cmd.Env = append(bdProxiedEnv(dir), envExtras...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
+}
+
+// bdProxiedRunDeadline is bdProxiedRunBuffers for a command that may never exit
+// on its own — `bd list --watch` polls until it is interrupted. It reports
+// whether the deadline was what stopped it, so a case can tell "kept running"
+// from "exited" instead of hanging the suite to find out.
+func bdProxiedRunDeadline(t *testing.T, bd, dir string, timeout time.Duration, args ...string) (stdout, stderr string, err error, timedOut bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bd, args...)
+	cmd.Dir = dir
+	cmd.Env = bdProxiedEnv(dir)
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	err = cmd.Run()
+	return out.String(), errOut.String(), err, ctx.Err() != nil
+}
+
+// bdProxiedRunUntilStderr starts a bd command that is NOT expected to exit and
+// stops it the moment marker appears on stderr. reached is false when the
+// command exited, or the timeout elapsed, before it got there.
+//
+// The alternative is to run such a command under a fixed deadline and wait the
+// whole thing out, which costs the deadline on every green run and fails on a
+// machine slow enough to render late. This waits for the state instead, so the
+// timeout is only a bound on a hang.
+func bdProxiedRunUntilStderr(t *testing.T, bd, dir, marker string, timeout time.Duration, args ...string) (stdout, stderr string, reached bool) {
+	t.Helper()
+	w := &markerWriter{marker: marker, seen: make(chan struct{})}
+	var out bytes.Buffer
+	cmd := exec.Command(bd, args...)
+	cmd.Dir = dir
+	cmd.Env = bdProxiedEnv(dir)
+	cmd.Stdout = &out
+	cmd.Stderr = w
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start bd %s: %v", strings.Join(args, " "), err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	select {
+	case <-w.seen:
+		reached = true
+	case <-exited:
+	case <-time.After(timeout):
+	}
+	_ = cmd.Process.Kill()
+	<-exited
+	return out.String(), w.String(), reached
+}
+
+// markerWriter buffers everything written to it and closes seen the first time
+// marker shows up.
+type markerWriter struct {
+	marker string
+	seen   chan struct{}
+
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	once sync.Once
+}
+
+func (w *markerWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.marker) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return n, err
+}
+
+func (w *markerWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+func bdProxiedUpdate(t *testing.T, bd, dir string, args ...string) []*types.Issue {
+	t.Helper()
+	fullArgs := append([]string{"update", "--json"}, args...)
+	out, err := bdProxiedRun(t, bd, dir, fullArgs...)
+	if err != nil {
+		t.Fatalf("bd update %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	s := string(out)
+	start := strings.Index(s, "[")
+	if start < 0 {
+		t.Fatalf("no JSON array found in update output:\n%s", s)
+	}
+	var issues []*types.Issue
+	if err := json.Unmarshal([]byte(s[start:]), &issues); err != nil {
+		t.Fatalf("failed to parse update JSON: %v\nraw: %s", err, s[start:])
+	}
+	if len(issues) == 0 {
+		t.Fatalf("update returned empty JSON array:\n%s", s)
+	}
+	return issues
+}
+
+func bdProxiedUpdateOne(t *testing.T, bd, dir string, args ...string) *types.Issue {
+	t.Helper()
+	issues := bdProxiedUpdate(t, bd, dir, args...)
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue in update output, got %d", len(issues))
+	}
+	return issues[0]
+}
+
+func bdProxiedUpdateRaw(t *testing.T, bd, dir string, args ...string) (string, string, error) {
+	t.Helper()
+	fullArgs := append([]string{"update"}, args...)
+	return bdProxiedRunBuffers(t, bd, dir, fullArgs...)
+}
+
+func bdProxiedUpdateFail(t *testing.T, bd, dir string, args ...string) string {
+	t.Helper()
+	stdout, stderr, err := bdProxiedUpdateRaw(t, bd, dir, args...)
+	if err == nil {
+		t.Fatalf("bd update %s should have failed; got:\nstdout:\n%s\nstderr:\n%s",
+			strings.Join(args, " "), stdout, stderr)
+	}
+	return stdout + stderr
 }
 
 func bdProxiedShow(t *testing.T, bd, dir, id string) *types.Issue {
@@ -164,6 +300,63 @@ func bdProxiedShow(t *testing.T, bd, dir, id string) *types.Issue {
 	return parseIssueJSON(t, out)
 }
 
+func bdProxiedShowRaw(t *testing.T, bd, dir string, args ...string) string {
+	t.Helper()
+	fullArgs := append([]string{"show"}, args...)
+	out, err := bdProxiedRun(t, bd, dir, fullArgs...)
+	if err != nil {
+		t.Fatalf("bd show %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+func bdProxiedShowFail(t *testing.T, bd, dir string, args ...string) (string, string) {
+	t.Helper()
+	fullArgs := append([]string{"show"}, args...)
+	stdout, stderr, err := bdProxiedRunBuffers(t, bd, dir, fullArgs...)
+	if err == nil {
+		t.Fatalf("bd show %s should have failed; got stdout:\n%s\nstderr:\n%s",
+			strings.Join(args, " "), stdout, stderr)
+	}
+	return stdout, stderr
+}
+
+func bdProxiedShowDetailsAll(t *testing.T, bd, dir string, args ...string) []map[string]interface{} {
+	t.Helper()
+	fullArgs := append([]string{"show", "--json"}, args...)
+	out, err := bdProxiedRun(t, bd, dir, fullArgs...)
+	if err != nil {
+		t.Fatalf("bd show --json %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	s := strings.TrimSpace(string(out))
+	start := strings.IndexAny(s, "[{")
+	if start < 0 {
+		t.Fatalf("no JSON in show output: %s", s)
+	}
+	s = s[start:]
+	if strings.HasPrefix(s, "[") {
+		var arr []map[string]interface{}
+		if err := json.Unmarshal([]byte(s), &arr); err != nil {
+			t.Fatalf("parse show JSON array: %v\n%s", err, s)
+		}
+		return arr
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		t.Fatalf("parse show JSON: %v\n%s", err, s)
+	}
+	return []map[string]interface{}{m}
+}
+
+func bdProxiedShowDetailsFirst(t *testing.T, bd, dir string, args ...string) map[string]interface{} {
+	t.Helper()
+	arr := bdProxiedShowDetailsAll(t, bd, dir, args...)
+	if len(arr) == 0 {
+		t.Fatalf("bd show --json %s returned empty array", strings.Join(args, " "))
+	}
+	return arr[0]
+}
+
 type proxiedProject struct {
 	dir       string
 	beadsDir  string
@@ -172,13 +365,34 @@ type proxiedProject struct {
 	prefix    string
 }
 
+func bdProxiedInitWithHooks(t *testing.T, bd, prefix string, hooks map[string]string, extraInitArgs ...string) proxiedProject {
+	t.Helper()
+	p := bdProxiedInitInternal(t, bd, prefix, false, extraInitArgs...)
+	hooksDir := filepath.Join(p.beadsDir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks dir: %v", err)
+	}
+	for name, body := range hooks {
+		hookPath := filepath.Join(hooksDir, name)
+		if err := os.WriteFile(hookPath, []byte(body), 0o755); err != nil {
+			t.Fatalf("write hook %s: %v", name, err)
+		}
+	}
+	return p
+}
+
 func bdProxiedInit(t *testing.T, bd, prefix string, extraInitArgs ...string) proxiedProject {
+	t.Helper()
+	return bdProxiedInitInternal(t, bd, prefix, true, extraInitArgs...)
+}
+
+func bdProxiedInitInternal(t *testing.T, bd, prefix string, skipHooks bool, extraInitArgs ...string) proxiedProject {
 	t.Helper()
 
 	dir := t.TempDir()
 	initGitRepoAt(t, dir)
 	beadsDir := filepath.Join(dir, ".beads")
-	proxyRoot := filepath.Join(beadsDir, "proxieddb")
+	proxyRoot := filepath.Join(beadsDir, "dolt")
 	t.Cleanup(func() {
 		if err := proxy.Shutdown(proxyRoot); err != nil {
 			t.Logf("proxy.Shutdown(%s): %v", proxyRoot, err)
@@ -186,15 +400,18 @@ func bdProxiedInit(t *testing.T, bd, prefix string, extraInitArgs ...string) pro
 	})
 	shutdownProxyOnInterrupt(t, proxyRoot)
 
-	args := append([]string{
+	baseArgs := []string{
 		"init",
 		"--proxied-server",
 		"--quiet",
 		"--prefix", prefix,
 		"--non-interactive",
-		"--skip-hooks",
 		"--skip-agents",
-	}, extraInitArgs...)
+	}
+	if skipHooks {
+		baseArgs = append(baseArgs, "--skip-hooks")
+	}
+	args := append(baseArgs, extraInitArgs...)
 
 	cmd := exec.Command(bd, args...)
 	cmd.Dir = dir

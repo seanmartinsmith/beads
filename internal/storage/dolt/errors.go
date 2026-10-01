@@ -35,6 +35,18 @@ var (
 	// prevent propagating the corruption to the remote. Run bd dolt verify
 	// to diagnose and recover.
 	ErrDanglingReference = errors.New("dangling chunk reference")
+
+	// ErrFSCKTimeout indicates that the pre-push integrity check (dolt fsck) did
+	// not complete within the configured timeout. The push was aborted without
+	// verifying chunk integrity — the store is not necessarily corrupt. Large
+	// stores can be shrunk with `dolt gc` (or `CALL DOLT_GC()` on a running
+	// sql-server); the timeout can be raised via the BEADS_FSCK_TIMEOUT
+	// environment variable.
+	ErrFSCKTimeout = errors.New("pre-push integrity check timed out")
+
+	// ErrCommitIndeterminate is the storage-wide no-replay sentinel. Keep this
+	// alias for server-Dolt callers while embedded Dolt returns the same value.
+	ErrCommitIndeterminate = storage.ErrCommitIndeterminate
 )
 
 // isTableNotExistError returns true if the error indicates a MySQL/Dolt
@@ -64,6 +76,42 @@ func isSerializationError(err error) bool {
 		return false
 	}
 	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
+}
+
+// isDoltAutocommitRollbackError reports Dolt's explicit, rollback-guaranteed
+// commit conflict. A MySQL error is retried only when its decoded code and
+// server-provided semantic message identify this condition; newer Dolt builds
+// append recovery guidance after the same sentence.
+func isDoltAutocommitRollbackError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) &&
+		mysqlErr.Number == 1105 &&
+		(mysqlErr.Message == "Merge conflict detected, @autocommit transaction rolled back" ||
+			strings.HasPrefix(mysqlErr.Message, "Merge conflict detected, @autocommit transaction rolled back."))
+}
+
+// isIndeterminateCommitResponse reports whether a Commit error lacks a decoded
+// server response proving a definite rejection or rollback. Every untyped
+// protocol or transport error is conservatively indeterminate.
+func isIndeterminateCommitResponse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrCommitIndeterminate) {
+		return true
+	}
+	var mysqlErr *mysql.MySQLError
+	return !errors.As(err, &mysqlErr)
+}
+
+func wrapSQLCommitError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isIndeterminateCommitResponse(err) {
+		return fmt.Errorf("%s: %w: %w", op, err, ErrCommitIndeterminate)
+	}
+	return fmt.Errorf("%s: %w", op, err)
 }
 
 // wrapDBError wraps a database error with operation context.
@@ -141,9 +189,17 @@ func databaseNotFoundError(cfg *Config) error {
 	if cfg.SyncRemote != "" {
 		fmt.Fprintf(&b, "\n\nTip: sync.remote is configured (%s).\nRun bd bootstrap to recover from the remote or confirm what bootstrap will do with --dry-run.", cfg.SyncRemote)
 	} else {
-		b.WriteString("\n\nTip: If this is an existing project, fresh clone, or shared-server recovery, run bd bootstrap first.\n")
+		// be-5up5: no longer claims bootstrap is a safe first step "if this is an
+		// existing project" — bootstrap can silently create an empty database in
+		// server mode (2026-08-11 fleet-wide loss), so that framing pointed
+		// existing projects with a missing database at the same danger this guard
+		// exists to stop. Fresh-clone / shared-server-recovery guidance (the
+		// common, safe case) is unchanged.
+		b.WriteString("\n\nTip: If this is a fresh clone or shared-server recovery, run bd bootstrap first.\n")
 		b.WriteString("If bootstrap cannot find the expected remote automatically, set sync.remote\nin .beads/config.yaml and re-run bd bootstrap.\n")
 		b.WriteString("Use bd bootstrap --dry-run if you need to confirm the plan before it initializes anything.\n")
+		b.WriteString("If this is an existing project whose database went missing, run bd doctor before\n")
+		b.WriteString("bootstrap or init — neither is guaranteed to recover it safely.\n")
 		b.WriteString("Use bd init only when creating a brand-new project with no existing .beads data.")
 	}
 

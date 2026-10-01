@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/ceiling"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/utils"
@@ -63,7 +64,8 @@ func resolveBeadsDirForDBPath(dbPath string) string {
 	}
 
 	addAncestorCandidates := func(path string) {
-		for dir := path; dir != "" && dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		bound := ceiling.For(path)
+		for dir := path; dir != "" && dir != filepath.Dir(dir) && !bound.Excludes(dir); dir = filepath.Dir(dir) {
 			addCandidate(filepath.Join(dir, ".beads"))
 			if filepath.Base(dir) == ".beads" {
 				addCandidate(dir)
@@ -94,6 +96,14 @@ func resolveBeadsDirForDBPath(dbPath string) string {
 			continue
 		}
 		if utils.PathsEqual(beadsDir, dbPath) || utils.PathsEqual(beadsDir, actualDBPath) {
+			return beadsDir
+		}
+		// dbPath is the data directory living directly inside beadsDir
+		// (<beadsDir>/embeddeddolt for embedded, <beadsDir>/dolt for server).
+		// Match on that parent relationship so resolution works for embedded
+		// stores regardless of the beads dir name; Config.DatabasePath alone
+		// returns the "dolt" name and misses embeddeddolt/ (GH#4574).
+		if utils.PathsEqual(filepath.Dir(dbPath), beadsDir) || utils.PathsEqual(filepath.Dir(actualDBPath), beadsDir) {
 			return beadsDir
 		}
 		if utils.PathsEqual(cfg.DatabasePath(beadsDir), dbPath) || utils.PathsEqual(cfg.DatabasePath(beadsDir), actualDBPath) {

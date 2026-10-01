@@ -3,12 +3,41 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"sort"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// ErrAmbiguousID is the sentinel wrapped into the error ResolvePartialID
+// returns when a partial ID matches more than one issue. Callers use
+// errors.Is(err, ErrAmbiguousID) to distinguish "ambiguous" from
+// "not found" and surface the candidate list instead of a generic failure.
+var ErrAmbiguousID = errors.New("ambiguous issue ID")
+
+// ErrAbbreviatedIDNotAllowed is the sentinel wrapped into the error
+// ResolvePartialIDExact returns when the input does not exactly name an
+// issue but WOULD have resolved via leading-prefix abbreviation matching —
+// the behavior ResolvePartialID allows and exact-only callers refuse.
+//
+// Distinguishing this from "no such issue at all" matters because the two
+// are not the same failure: an abbreviation that matches a real issue is
+// proof the issue exists, so telling the caller "no issue found matching"
+// (the message a genuine not-found gets) is false. Exact-only callers use
+// errors.Is(err, ErrAbbreviatedIDNotAllowed) to give a truthful, actionable
+// message instead ("id abbreviations are not accepted here; use the full
+// id") — see bd comment's resolveAndGetIssueForMutationExact caller.
+var ErrAbbreviatedIDNotAllowed = errors.New("id is a valid abbreviation, but exact-match resolution is required here")
+
+type PartialIDResolverStore interface {
+	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
+	SearchIssueIDs(ctx context.Context, query string, filter types.IssueFilter) ([]string, error)
+	GetConfig(ctx context.Context, key string) (string, error)
+}
 
 // parseIssueID ensures an issue ID has the configured prefix.
 // If the input already has the prefix (e.g., "bd-a3f8e9"), returns it as-is.
@@ -34,9 +63,42 @@ func parseIssueID(input string, prefix string) string {
 // - Hierarchical: "a3f8e9.1" → "bd-a3f8e9.1"
 //
 // Returns an error if:
+// - The input is a bare tooling sentinel ("", "null", "undefined", "none", "nil")
 // - No issue found matching the ID
 // - Multiple issues match (ambiguous prefix)
-func ResolvePartialID(ctx context.Context, store storage.Storage, input string) (string, error) {
+func ResolvePartialID(ctx context.Context, store PartialIDResolverStore, input string) (string, error) {
+	return resolvePartialID(ctx, store, input, true)
+}
+
+// ResolvePartialIDExact resolves an issue ID like ResolvePartialID, but never
+// falls back to leading-prefix abbreviation matching (e.g. "a3f8" ->
+// "a3f8e9...", or a wisp's stripped hash "list" -> "list3t0") — only a full
+// exact ID or exact hash match (with or without a "wisp-" infix) succeeds.
+//
+// Intended for write paths where a mistyped or coincidentally-prefix-matching
+// argument must return "not found" instead of silently mutating an unrelated
+// issue (e.g. `bd comment list <id>`, a typo for `bd comments list`, was
+// silently fuzzy-resolving "list" to a wisp whose hash happened to start with
+// "list" and writing the rest of the command line to it as a comment).
+//
+// When the input matches nothing exactly but WOULD have resolved via
+// leading-prefix abbreviation, the returned error wraps
+// ErrAbbreviatedIDNotAllowed rather than being indistinguishable from a
+// genuine not-found — see that sentinel's doc comment.
+func ResolvePartialIDExact(ctx context.Context, store PartialIDResolverStore, input string) (string, error) {
+	return resolvePartialID(ctx, store, input, false)
+}
+
+func resolvePartialID(ctx context.Context, store PartialIDResolverStore, input string, allowAbbrev bool) (string, error) {
+	// Refuse before any lookup: these tokens are a valid partial-ID shape, so
+	// they otherwise reach the leading-prefix abbreviation branch below.
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "":
+		return "", fmt.Errorf("refusing an empty string as an issue ID")
+	case "null", "undefined", "none", "nil":
+		return "", fmt.Errorf("refusing %q as an issue ID: that is what tooling prints for a missing value (jq/JS null and undefined, Python None, Go/Ruby nil), so the caller's selector matched nothing", input)
+	}
+
 	if store == nil {
 		return "", fmt.Errorf("cannot resolve issue ID %q: storage is nil", input)
 	}
@@ -116,19 +178,27 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 		return "", fmt.Errorf("no issue found matching %q", input)
 	}
 
+	// Narrow projection: this loop only reads the .ID field, so use the
+	// SearchIssueIDs path instead of SearchIssues. Avoids hydrating all
+	// 45+ issue columns (including big TEXT fields like description, design,
+	// notes, metadata, payload) only to discard them.
 	filter := types.IssueFilter{}
-	issues, err := store.SearchIssues(ctx, searchPart, filter)
+	ids, err := store.SearchIssueIDs(ctx, searchPart, filter)
 	if err != nil {
 		return "", fmt.Errorf("failed to search issues: %w", err)
 	}
 
 	var matches []string
 	var exactMatch string
+	// abbrevOnly collects candidates that matched ONLY via leading-prefix
+	// abbreviation while allowAbbrev is false — never resolved to, only used
+	// to make the final "not found" error truthful (see ErrAbbreviatedIDNotAllowed).
+	var abbrevOnly []string
 
-	for _, issue := range issues {
+	for _, id := range ids {
 		// Check for exact full ID match first (case: user typed full ID with different prefix)
-		if issue.ID == input {
-			exactMatch = issue.ID
+		if id == input {
+			exactMatch = id
 			break
 		}
 
@@ -136,21 +206,28 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 		// This correctly handles multi-hyphen prefixes (e.g., "hacker-news-ko4"
 		// yields hash "ko4", not "news-ko4" from naive first-hyphen split).
 		var issueHash string
-		if p := ExtractIssuePrefixKnown(issue.ID, knownPrefixes); p != "" && strings.HasPrefix(issue.ID, p+"-") {
-			issueHash = issue.ID[len(p)+1:]
+		if p := ExtractIssuePrefixKnown(id, knownPrefixes); p != "" && strings.HasPrefix(id, p+"-") {
+			issueHash = id[len(p)+1:]
 		} else {
-			issueHash = issue.ID
+			issueHash = id
 		}
 
 		// Check for exact hash match (excluding hierarchical children)
 		if issueHash == hashPart {
-			exactMatch = issue.ID
+			exactMatch = id
 			// Don't break - keep searching in case there's a full ID match
-		}
-
-		// Check if the issue hash contains the input hash as substring
-		if strings.Contains(issueHash, hashPart) {
-			matches = append(matches, issue.ID)
+		} else if strings.HasPrefix(issueHash, hashPart) {
+			// Leading-prefix abbreviation (documented UX, e.g. "a3f8" -> "a3f8e9...").
+			// HasPrefix rather than Contains: reject interior-substring matches
+			// like "kt8" inside "j0kt8" (GH#4234).
+			if allowAbbrev {
+				matches = append(matches, id)
+			} else {
+				// Exact-only callers must never silently resolve to this
+				// candidate, but its existence is what makes "no issue found
+				// matching" false below — track it instead of discarding it.
+				abbrevOnly = append(abbrevOnly, id)
+			}
 		}
 	}
 
@@ -166,22 +243,30 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 	if len(matches) == 0 {
 		ephTrue := true
 		wispFilter := types.IssueFilter{Ephemeral: &ephTrue}
-		if wisps, wispErr := store.SearchIssues(ctx, searchPart, wispFilter); wispErr == nil {
-			for _, w := range wisps {
-				if w.ID == input {
-					return w.ID, nil
+		if wispIDs, wispErr := store.SearchIssueIDs(ctx, searchPart, wispFilter); wispErr == nil {
+			for _, wID := range wispIDs {
+				if wID == input {
+					return wID, nil
 				}
 				var wHash string
-				if p := ExtractIssuePrefixKnown(w.ID, knownPrefixes); p != "" && strings.HasPrefix(w.ID, p+"-") {
-					wHash = w.ID[len(p)+1:]
+				if p := ExtractIssuePrefixKnown(wID, knownPrefixes); p != "" && strings.HasPrefix(wID, p+"-") {
+					wHash = wID[len(p)+1:]
 				} else {
-					wHash = w.ID
+					wHash = wID
 				}
-				if wHash == hashPart {
-					exactMatch = w.ID
-				}
-				if strings.Contains(wHash, hashPart) {
-					matches = append(matches, w.ID)
+				// Wisp IDs are shaped "<prefix>-wisp-<hash>", so wHash here is
+				// the composite "wisp-<hash>". Strip the literal "wisp-" infix
+				// before comparing so bare-hash lookups (e.g. "t3st") resolve
+				// against the isolated hash, not the full "wisp-t3st" string.
+				wispHash := strings.TrimPrefix(wHash, "wisp-")
+				if wHash == hashPart || wispHash == hashPart {
+					exactMatch = wID
+				} else if strings.HasPrefix(wispHash, hashPart) {
+					if allowAbbrev {
+						matches = append(matches, wID)
+					} else {
+						abbrevOnly = append(abbrevOnly, wID)
+					}
 				}
 			}
 			if exactMatch != "" {
@@ -191,14 +276,72 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 	}
 
 	if len(matches) == 0 {
+		if !allowAbbrev && len(abbrevOnly) > 0 {
+			// The input matched nothing exactly, but it IS a valid leading-
+			// prefix abbreviation of at least one real issue — telling the
+			// caller "no issue found" here would be false. Report the
+			// truthful reason instead so an exact-only caller (comment.go's
+			// resolveAndGetIssueForMutationExact) can surface an accurate,
+			// actionable message rather than claiming the issue is missing.
+			sort.Strings(abbrevOnly)
+			return "", fmt.Errorf("%w: %q (matches %v)", ErrAbbreviatedIDNotAllowed, input, abbrevOnly)
+		}
 		return "", fmt.Errorf("no issue found matching %q", input)
 	}
 
+	// Sort so the ambiguity error lists IDs deterministically. SearchIssues return
+	// order is not a contract for ambiguous matches, so sorting by ID pins the same
+	// message for every storage implementation.
+	sort.Strings(matches)
+
 	if len(matches) > 1 {
-		return "", fmt.Errorf("ambiguous ID %q matches %d issues: %v\nUse more characters to disambiguate", input, len(matches), matches)
+		return "", fmt.Errorf("%w: %q matches %d issues: %v\nUse more characters to disambiguate", ErrAmbiguousID, input, len(matches), matches)
 	}
 
-	return matches[0], nil
+	// Sole leading-prefix match. Every other return from this function is an
+	// exact match (or a prefix-normalized exact match), so this is the one path
+	// that hands back an issue the caller did not name.
+	resolved := matches[0]
+	if shouldNotifyPartialResolution(input, resolved, debug.IsQuiet(), os.Getenv("BD_NO_PARTIAL_ID_NOTICE")) {
+		emitPartialResolutionNotice(input, resolved)
+	}
+	return resolved, nil
+}
+
+// shouldNotifyPartialResolution is the testable predicate behind the
+// partial-resolution notice. It takes the quiet flag and the suppression env
+// value as parameters so tests can cover every combination, the same shape as
+// shouldWarnImplicitBlocksDefault in cmd/bd/dep.go.
+//
+// Deliberately NOT gated on stderr being a terminal, which is where it departs
+// from that precedent. The implicit-blocks warning tells an interactive
+// operator about a default they chose; this one tells a caller that the issue
+// it is about to act on is not the issue it named, and the callers most exposed
+// to that — scripts, hooks and agents — are exactly the non-TTY ones. Gating on
+// a TTY would silence it precisely where it is most needed.
+func shouldNotifyPartialResolution(input, resolved string, quiet bool, noNotifyEnv string) bool {
+	if resolved == "" || resolved == input {
+		return false
+	}
+	// --quiet is documented as "Suppress non-essential output (errors only)",
+	// matching how the other non-error stderr notices behave.
+	if quiet {
+		return false
+	}
+	// Explicit opt-out, following the BD_NO_DEP_TYPE_WARNING precedent.
+	if noNotifyEnv != "" {
+		return false
+	}
+	return true
+}
+
+// emitPartialResolutionNotice writes the notice. Split from the gate so the
+// message text can be asserted under a captured stderr.
+//
+// stderr, never stdout: --json payloads and piped stdout stay byte-for-byte
+// unchanged, so this cannot break a parsing caller.
+func emitPartialResolutionNotice(input, resolved string) {
+	fmt.Fprintf(os.Stderr, "note: %q is not an exact issue ID; resolved to %s (silence with --quiet or BD_NO_PARTIAL_ID_NOTICE=1)\n", input, resolved) //nolint:gosec // G705: stderr, not a browser context
 }
 
 func partialIDSearchPart(hashPart string) (string, bool) {
@@ -229,7 +372,7 @@ func looksLikePartialIDHash(input string) bool {
 
 // ResolvePartialIDs resolves multiple potentially partial issue IDs.
 // Returns the resolved IDs and any errors encountered.
-func ResolvePartialIDs(ctx context.Context, store storage.Storage, inputs []string) ([]string, error) {
+func ResolvePartialIDs(ctx context.Context, store PartialIDResolverStore, inputs []string) ([]string, error) {
 	var resolved []string
 	for _, input := range inputs {
 		fullID, err := ResolvePartialID(ctx, store, input)

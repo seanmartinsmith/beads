@@ -7,14 +7,16 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/sqlclass"
 )
 
 var sqlCmd = &cobra.Command{
 	Use:     "sql <query>",
 	GroupID: "maint",
 	Short:   "Execute raw SQL against the beads database",
-	Long: `Execute a raw SQL query against the underlying database (SQLite or Dolt).
+	Long: `Execute a raw SQL query against the underlying database (Dolt).
 
 Useful for debugging, maintenance, and working around bugs in higher-level commands.
 
@@ -24,57 +26,75 @@ Examples:
   bd sql 'DELETE FROM dirty_issues WHERE issue_id = "bd-abc123"'
   bd sql --csv 'SELECT id, title, status FROM issues'
 
-The query is passed directly to the database. SELECT queries return results as a
-table (or JSON/CSV with --json/--csv). Non-SELECT queries (INSERT, UPDATE, DELETE)
-report the number of rows affected.
+The query is passed directly to the database. Reads (SELECT, WITH ... SELECT,
+SHOW, EXPLAIN) return results as a table (or JSON/CSV with --json/--csv). Writes
+(INSERT, UPDATE, DELETE, DDL) report the number of rows affected. Statements
+that may both write and return rows, such as CALL, are committed and print any
+rows they return (or "OK").
+
+In proxied-server mode, multiple statements separated by ';' run as a single
+committed batch and report "OK", and --database runs the query against a
+different server database (equivalent to a session USE) without changing the
+project's configured database.
 
 WARNING: Direct database access bypasses the storage layer. Use with caution.`,
-	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("sql")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		if !usesSQLServer() {
-			fmt.Fprintln(os.Stderr, "Error: 'bd sql' is not yet supported in embedded mode")
-			os.Exit(1)
+			return HandleError("'bd sql' is not yet supported in embedded mode")
 		}
 		query := args[0]
 		csvOutput, _ := cmd.Flags().GetBool("csv")
 
+		if usesProxiedServer() {
+			return runSQLProxiedServer(rootCtx, query, csvOutput)
+		}
+
 		if store == nil {
-			FatalErrorRespectJSON("no database connection available (%s)", diagHint())
+			return HandleErrorRespectJSON("no database connection available (%s)", diagHint())
 		}
 
 		accessor, ok := storage.UnwrapStore(store).(storage.RawDBAccessor)
 		if !ok {
-			FatalErrorRespectJSON("storage backend does not support raw DB access")
+			return HandleErrorRespectJSON("storage backend does not support raw DB access")
 		}
 		db := accessor.UnderlyingDB()
 		if db == nil {
-			FatalErrorRespectJSON("underlying database not available")
+			return HandleErrorRespectJSON("underlying database not available")
 		}
 
 		ctx := rootCtx
 
-		// Detect if it's a read query (SELECT, EXPLAIN, PRAGMA, SHOW, DESCRIBE, WITH)
-		trimmed := strings.TrimSpace(strings.ToUpper(query))
-		isRead := strings.HasPrefix(trimmed, "SELECT") ||
-			strings.HasPrefix(trimmed, "EXPLAIN") ||
-			strings.HasPrefix(trimmed, "PRAGMA") ||
-			strings.HasPrefix(trimmed, "SHOW") ||
-			strings.HasPrefix(trimmed, "DESCRIBE") ||
-			strings.HasPrefix(trimmed, "WITH")
-
-		if isRead {
+		// Reads and statements that may return rows go through Query so a
+		// result set is always rendered; only plain writes use Exec.
+		kind := sqlclass.Classify(query)
+		if kind != sqlclass.Write {
+			if kind == sqlclass.Mixed {
+				CheckReadonly("sql")
+			}
 			rows, err := db.QueryContext(ctx, query)
 			if err != nil {
-				FatalErrorRespectJSON("query error: %v", err)
+				return HandleErrorRespectJSON("query error: %v", err)
 			}
 			defer rows.Close()
 
 			columns, err := rows.Columns()
 			if err != nil {
-				FatalErrorRespectJSON("getting columns: %v", err)
+				return HandleErrorRespectJSON("getting columns: %v", err)
+			}
+			if kind == sqlclass.Mixed && len(columns) == 0 {
+				return printSQLStatusOK()
 			}
 
-			// Collect all rows
 			allRows := make([]map[string]interface{}, 0)
 			for rows.Next() {
 				values := make([]interface{}, len(columns))
@@ -84,7 +104,7 @@ WARNING: Direct database access bypasses the storage layer. Use with caution.`,
 				}
 
 				if err := rows.Scan(valuePtrs...); err != nil {
-					FatalErrorRespectJSON("scanning row: %v", err)
+					return HandleErrorRespectJSON("scanning row: %v", err)
 				}
 
 				row := make(map[string]interface{})
@@ -99,19 +119,17 @@ WARNING: Direct database access bypasses the storage layer. Use with caution.`,
 				allRows = append(allRows, row)
 			}
 			if err := rows.Err(); err != nil {
-				FatalErrorRespectJSON("reading rows: %v", err)
+				return HandleErrorRespectJSON("reading rows: %v", err)
 			}
 
 			if jsonOutput {
-				outputJSON(allRows)
-				return
+				return outputJSON(allRows)
 			}
 
 			if csvOutput {
 				w := csv.NewWriter(os.Stdout)
-				// Header
 				if err := w.Write(columns); err != nil {
-					FatalErrorRespectJSON("writing CSV header: %v", err)
+					return HandleErrorRespectJSON("writing CSV header: %v", err)
 				}
 				for _, row := range allRows {
 					record := make([]string, len(columns))
@@ -119,20 +137,19 @@ WARNING: Direct database access bypasses the storage layer. Use with caution.`,
 						record[i] = fmt.Sprintf("%v", row[col])
 					}
 					if err := w.Write(record); err != nil {
-						FatalErrorRespectJSON("writing CSV row: %v", err)
+						return HandleErrorRespectJSON("writing CSV row: %v", err)
 					}
 				}
 				w.Flush()
 				if err := w.Error(); err != nil {
-					FatalErrorRespectJSON("flushing CSV: %v", err)
+					return HandleErrorRespectJSON("flushing CSV: %v", err)
 				}
-				return
+				return nil
 			}
 
-			// Table output
 			if len(allRows) == 0 {
 				fmt.Println("(0 rows)")
-				return
+				return nil
 			}
 
 			// Calculate column widths
@@ -190,26 +207,26 @@ WARNING: Direct database access bypasses the storage layer. Use with caution.`,
 			}
 
 			fmt.Printf("(%d rows)\n", len(allRows))
-		} else {
-			// Write query
-			CheckReadonly("sql")
-
-			result, err := db.ExecContext(ctx, query)
-			if err != nil {
-				FatalErrorRespectJSON("exec error: %v", err)
-			}
-
-			affected, _ := result.RowsAffected()
-
-			if jsonOutput {
-				outputJSON(map[string]interface{}{
-					"rows_affected": affected,
-				})
-				return
-			}
-
-			fmt.Printf("OK, %d rows affected\n", affected)
+			return nil
 		}
+
+		CheckReadonly("sql")
+
+		result, err := db.ExecContext(ctx, query)
+		if err != nil {
+			return HandleErrorRespectJSON("exec error: %v", err)
+		}
+
+		affected, _ := result.RowsAffected()
+
+		if jsonOutput {
+			return outputJSON(map[string]interface{}{
+				"rows_affected": affected,
+			})
+		}
+
+		fmt.Printf("OK, %d rows affected\n", affected)
+		return nil
 	},
 }
 

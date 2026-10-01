@@ -6,7 +6,7 @@ import (
 	"sort"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -42,23 +42,47 @@ The patrol system uses this to find and dispatch gate-ready molecules.
 Examples:
   bd mol ready --gated           # Find all gate-ready molecules
   bd mol ready --gated --json    # JSON output for automation`,
-	Run: runMolReadyGated,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runMolReadyGated,
 }
 
-func runMolReadyGated(cmd *cobra.Command, args []string) {
+func runMolReadyGated(cmd *cobra.Command, args []string) error {
+	evt := metrics.NewCommandEvent("mol-ready-gated")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
+	return runMolReadyGatedCore(cmd, args)
+}
+
+// runMolReadyGatedCore runs the gate-ready molecule discovery and rendering
+// without emitting a metrics event, so the caller owns emission. `bd ready
+// --gated` delegates here after recording its own "ready" event, while the
+// standalone runMolReadyGated entrypoint records "mol-ready-gated"; this keeps a
+// single `bd ready --gated` invocation to exactly one cli_command event.
+func runMolReadyGatedCore(_ *cobra.Command, _ []string) error {
+	if usesProxiedServer() {
+		return runMolReadyGatedProxiedServer(rootCtx)
+	}
+
 	ctx := rootCtx
 
-	// --gated mode requires direct store access
 	if store == nil {
-		FatalError("no database connection")
+		return HandleErrorRespectJSON("no database connection")
 	}
 
-	// Find gate-ready molecules
 	molecules, err := findGateReadyMolecules(ctx, store)
 	if err != nil {
-		FatalError("%v", err)
+		return HandleErrorRespectJSON("%v", err)
 	}
 
+	return renderGatedReadyMolecules(molecules)
+}
+
+func renderGatedReadyMolecules(molecules []*GatedMolecule) error {
 	if jsonOutput {
 		output := GatedReadyOutput{
 			Molecules: molecules,
@@ -67,14 +91,12 @@ func runMolReadyGated(cmd *cobra.Command, args []string) {
 		if output.Molecules == nil {
 			output.Molecules = []*GatedMolecule{}
 		}
-		outputJSON(output)
-		return
+		return outputJSON(output)
 	}
 
-	// Human-readable output
 	if len(molecules) == 0 {
 		fmt.Printf("\n%s No molecules ready for gate-resume dispatch\n\n", ui.RenderWarn(""))
-		return
+		return nil
 	}
 
 	fmt.Printf("\n%s Molecules ready for gate-resume dispatch (%d):\n\n",
@@ -91,8 +113,34 @@ func runMolReadyGated(cmd *cobra.Command, args []string) {
 		fmt.Println()
 	}
 
-	fmt.Println("To dispatch a molecule:")
-	fmt.Println("  bd sling <agent> --mol <molecule-id>")
+	stepID, listPos := firstReadyStepID(molecules)
+	if len(molecules) > 1 && listPos > 0 {
+		// The example can only name one molecule's step, so point at the entry
+		// it came from rather than letting it read as the single thing to
+		// dispatch. Naming the position instead of "the first one" keeps the
+		// header and the printed ID from ever disagreeing: the first listed
+		// molecule is not necessarily the one the example belongs to.
+		fmt.Printf("To dispatch a molecule, assign its ready step to an agent - for #%d above:\n", listPos)
+	} else {
+		fmt.Println("To dispatch a molecule, assign its ready step to an agent:")
+	}
+	fmt.Printf("  bd assign %s <agent>\n", stepID)
+	return nil
+}
+
+// firstReadyStepID names the ready step of the first listed molecule that has
+// one, for use as the example in the dispatch hint, along with that molecule's
+// 1-based position in the listing above. The position is 0 when no listed
+// molecule has a ready step, in which case the returned ID is a placeholder and
+// there is no entry for the hint to point at. Every molecule's own ready step is
+// printed in the listing above the hint.
+func firstReadyStepID(molecules []*GatedMolecule) (string, int) {
+	for i, mol := range molecules {
+		if mol.ReadyStep != nil && mol.ReadyStep.ID != "" {
+			return mol.ReadyStep.ID, i + 1
+		}
+	}
+	return "<ready-step-id>", 0
 }
 
 // findGateReadyMolecules finds molecules where a gate has closed and work can resume.
@@ -103,7 +151,7 @@ func runMolReadyGated(cmd *cobra.Command, args []string) {
 // 3. Check if that step is now ready (unblocked)
 // 4. Find the parent molecule
 // 5. Filter out molecules that are already hooked by someone
-func findGateReadyMolecules(ctx context.Context, s storage.DoltStorage) ([]*GatedMolecule, error) {
+func findGateReadyMolecules(ctx context.Context, s molReader) ([]*GatedMolecule, error) {
 	// Step 1: Find all closed gate beads
 	gateType := types.IssueType("gate")
 	closedStatus := types.StatusClosed
@@ -216,7 +264,10 @@ func findGateReadyMolecules(ctx context.Context, s storage.DoltStorage) ([]*Gate
 }
 
 func init() {
-	// Note: --gated flag is registered in ready.go
-	// Also add as a subcommand under mol for discoverability
+	// `bd ready --gated` registers --gated on readyCmd in ready.go.
+	// `bd mol ready` is a separate subcommand under molCmd that always runs
+	// in gated mode, so accept --gated here too: both spellings work and the
+	// documented `bd mol ready --gated` form actually matches the help text.
+	molReadyGatedCmd.Flags().Bool("gated", false, "Find molecules ready for gate-resume dispatch (always on for this subcommand)")
 	molCmd.AddCommand(molReadyGatedCmd)
 }

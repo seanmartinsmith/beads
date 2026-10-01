@@ -3,13 +3,15 @@ package db
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -42,6 +44,18 @@ func (r *configSQLRepositoryImpl) SetMetadata(ctx context.Context, key, value st
 	return nil
 }
 
+func (r *configSQLRepositoryImpl) GetLocalMetadata(ctx context.Context, key string) (string, error) {
+	var value string
+	err := r.runner.QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE `key` = ?", key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("db: GetLocalMetadata %s: %w", key, err)
+	}
+	return value, nil
+}
+
 func (r *configSQLRepositoryImpl) SetLocalMetadata(ctx context.Context, key, value string) error {
 	if _, err := r.runner.ExecContext(ctx, "REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)", key, value); err != nil {
 		return fmt.Errorf("db: SetLocalMetadata %s: %w", key, err)
@@ -68,37 +82,94 @@ func (r *configSQLRepositoryImpl) SetConfig(ctx context.Context, key, value stri
 	if _, err := r.runner.ExecContext(ctx, "REPLACE INTO config (`key`, value) VALUES (?, ?)", key, value); err != nil {
 		return fmt.Errorf("db: SetConfig %s: %w", key, err)
 	}
+	// Re-sync the normalized lookup table a value backs, mirroring
+	// DoltStore.SetConfig. Reads are TABLE-FIRST — GetCustomTypes above
+	// consults custom_types and falls back to the string only when the table is
+	// empty, and GetCustomStatuses reads custom_statuses outright — so a write
+	// that updated only the string left the table holding the previous set,
+	// forever: `bd config set types.custom` on a proxied deployment reported
+	// success and `bd create -t <the new type>` kept answering "invalid issue
+	// type", with doctor re-verifying against the string and reporting all-OK.
+	//
+	// The caller supplies a transactional runner, so the row and its projection
+	// commit together or neither does.
+	if _, err := issueops.SyncConfigTables(ctx, r.runner, key, value); err != nil {
+		return fmt.Errorf("db: SetConfig %s: %w", key, err)
+	}
 	return nil
 }
 
-func (r *configSQLRepositoryImpl) GetCustomTypes(ctx context.Context) ([]string, error) {
-	value, err := r.GetConfig(ctx, "types.custom")
-	if err != nil {
-		return nil, fmt.Errorf("db: GetCustomTypes: %w", err)
+func (r *configSQLRepositoryImpl) DeleteConfig(ctx context.Context, key string) error {
+	if _, err := r.runner.ExecContext(ctx, "DELETE FROM config WHERE `key` = ?", key); err != nil {
+		return fmt.Errorf("db: DeleteConfig %s: %w", key, err)
 	}
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, nil
-	}
-	var jsonTypes []string
-	if err := json.Unmarshal([]byte(value), &jsonTypes); err == nil {
-		return parseCustomTypesList(jsonTypes), nil
-	}
-	return parseCustomTypesList(strings.Split(value, ",")), nil
+	return nil
 }
 
-func parseCustomTypesList(in []string) []string {
-	out := make([]string, 0, len(in))
-	for _, t := range in {
-		t = strings.TrimSpace(t)
-		if t != "" {
-			out = append(out, t)
+func (r *configSQLRepositoryImpl) GetAllConfig(ctx context.Context) (map[string]string, error) {
+	rows, err := r.runner.QueryContext(ctx, "SELECT `key`, value FROM config")
+	if err != nil {
+		return nil, fmt.Errorf("db: GetAllConfig: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, fmt.Errorf("db: GetAllConfig: scan: %w", err)
+		}
+		out[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: GetAllConfig: read: %w", err)
+	}
+	return out, nil
+}
+
+// GetCustomTypes resolves the workspace's custom issue types through
+// issueops.ComposeCustomTypes, the same rule the embedded and server-mode
+// stores use, so proxied `bd types` and proxied create/update validation
+// accept exactly the same set.
+func (r *configSQLRepositoryImpl) GetCustomTypes(ctx context.Context) ([]string, error) {
+	fromTable, err := r.readCustomTypesTable(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var configValue string
+	if len(fromTable) == 0 {
+		configValue, err = r.GetConfig(ctx, "types.custom")
+		if err != nil {
+			return nil, fmt.Errorf("db: GetCustomTypes: %w", err)
 		}
 	}
-	if len(out) == 0 {
-		return nil
+
+	return issueops.ComposeCustomTypes(fromTable, configValue, config.GetCustomTypesFromYAML()), nil
+}
+
+func (r *configSQLRepositoryImpl) readCustomTypesTable(ctx context.Context) ([]string, error) {
+	rows, err := r.runner.QueryContext(ctx, "SELECT name FROM custom_types ORDER BY name")
+	if err != nil {
+		if dberrors.IsTableNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("db: GetCustomTypes: query custom_types: %w", err)
 	}
-	return out
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("db: GetCustomTypes: scan custom_types: %w", err)
+		}
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: GetCustomTypes: read custom_types: %w", err)
+	}
+	return out, nil
 }
 
 func (r *configSQLRepositoryImpl) GetAllowedPrefixes(ctx context.Context) (string, error) {
@@ -140,26 +211,26 @@ func (r *configSQLRepositoryImpl) GetAdaptiveIDConfig(ctx context.Context) (doma
 }
 
 func (r *configSQLRepositoryImpl) GetCustomStatuses(ctx context.Context) ([]types.CustomStatus, error) {
-	rows, err := r.runner.QueryContext(ctx, "SELECT name, category FROM custom_statuses ORDER BY name")
+	return issueops.ResolveCustomStatusesDetailedInTx(ctx, r.runner)
+}
+
+func (r *configSQLRepositoryImpl) ListAllStatusNames(ctx context.Context) ([]string, error) {
+	builtins := []types.Status{
+		types.StatusOpen, types.StatusInProgress, types.StatusBlocked,
+		types.StatusDeferred, types.StatusClosed, types.StatusPinned, types.StatusHooked,
+	}
+	custom, err := r.GetCustomStatuses(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("db: GetCustomStatuses: query custom_statuses: %w", err)
+		return nil, err
 	}
-	defer rows.Close()
-	var result []types.CustomStatus
-	for rows.Next() {
-		var name, category string
-		if err := rows.Scan(&name, &category); err != nil {
-			return nil, fmt.Errorf("db: GetCustomStatuses: scan: %w", err)
-		}
-		result = append(result, types.CustomStatus{
-			Name:     name,
-			Category: types.StatusCategory(category),
-		})
+	out := make([]string, 0, len(builtins)+len(custom))
+	for _, s := range builtins {
+		out = append(out, string(s))
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("db: GetCustomStatuses: read custom_statuses: %w", err)
+	for _, c := range custom {
+		out = append(out, c.Name)
 	}
-	return result, nil
+	return out, nil
 }
 
 func (r *configSQLRepositoryImpl) GetInfraTypes(ctx context.Context) (map[string]bool, error) {

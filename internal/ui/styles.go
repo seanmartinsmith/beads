@@ -12,14 +12,36 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
+// isDarkBackground stores the detected terminal background, so other
+// packages (e.g. internal/uimd's glamour renderer) can match its color
+// choices to the same probe this package uses for its own adaptive colors,
+// instead of guessing independently. Zero value (false) when color is
+// disabled, since the probe is skipped in that case (see init below).
+var isDarkBackground bool
+
+// IsDarkBackground reports the detected terminal background. See
+// isDarkBackground for how and when it is set.
+func IsDarkBackground() bool {
+	return isDarkBackground
+}
+
+// SetDarkBackgroundForTest overrides the detected background for the
+// duration of a test and returns a function that restores the previous
+// value. Test-only.
+func SetDarkBackgroundForTest(dark bool) func() {
+	prev := isDarkBackground
+	isDarkBackground = dark
+	return func() { isDarkBackground = prev }
+}
+
 func init() {
 	if !ShouldUseColor() {
 		return // all colors remain NoColor, all styles remain empty
 	}
 	// Detect dark background for adaptive colors.
 	// Only probed when color is enabled (prevents OSC 11 leaks in hook contexts).
-	isDark := lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
-	initColors(isDark)
+	isDarkBackground = lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
+	initColors(isDarkBackground)
 	initStyles()
 }
 
@@ -283,10 +305,6 @@ const (
 	StatusIconCustom     = "◇" // custom/uncategorized status (diamond)
 )
 
-// Priority icon - small filled circle, colored by priority level
-// IMPORTANT: Use this small circle, NOT emoji blobs (🔴🟠🟡🔵⚪)
-const PriorityIcon = "●"
-
 // RenderStatusIcon returns the appropriate icon for a status with semantic coloring.
 // This is the canonical source for status icon rendering - use this everywhere.
 // For custom statuses, call RenderStatusIconWithCategory for category-aware rendering.
@@ -514,11 +532,12 @@ func RenderStatus(status string) string {
 	}
 }
 
-// RenderPriority renders a priority level with semantic styling
-// Format: ● P0 (icon + label)
-// P0/P1 get color; P2/P3/P4 use standard text
+// RenderPriority renders a priority level with semantic styling.
+// Format: P0 (label only). Status blocked uses ● (StatusIconBlocked); reusing
+// that glyph for priority made agents misread "● P3" as blocked (GH#4996).
+// P0/P1/P2 get color; P3/P4 use standard text.
 func RenderPriority(priority int) string {
-	label := fmt.Sprintf("%s P%d", PriorityIcon, priority)
+	label := fmt.Sprintf("P%d", priority)
 	switch priority {
 	case 0:
 		return PriorityP0Style.Render(label)
@@ -535,24 +554,10 @@ func RenderPriority(priority int) string {
 	}
 }
 
-// RenderPriorityCompact renders just the priority label without icon
-// Use when space is constrained or icon would be redundant
+// RenderPriorityCompact is an alias of RenderPriority (no glyph difference
+// remains after GH#4996).
 func RenderPriorityCompact(priority int) string {
-	label := fmt.Sprintf("P%d", priority)
-	switch priority {
-	case 0:
-		return PriorityP0Style.Render(label)
-	case 1:
-		return PriorityP1Style.Render(label)
-	case 2:
-		return PriorityP2Style.Render(label)
-	case 3:
-		return PriorityP3Style.Render(label)
-	case 4:
-		return PriorityP4Style.Render(label)
-	default:
-		return label
-	}
+	return RenderPriority(priority)
 }
 
 // RenderType renders an issue type with semantic styling

@@ -14,9 +14,10 @@ import (
 )
 
 func TestProxiedServerList(t *testing.T) {
-	requireProxiedServerEnv(t)
+	requireSharedProxiedServer(t)
+	t.Parallel()
 	bd := buildEmbeddedBD(t)
-	p := bdProxiedInit(t, bd, "lst")
+	p := newSharedProxiedProject(t, bd, "lst")
 	seed := seedProxiedListData(t, bd, p)
 
 	// --- A. Basic filtering ---
@@ -227,16 +228,43 @@ func TestProxiedServerList(t *testing.T) {
 	})
 
 	t.Run("ready_parent_tree_excludes_blocked_descendants", func(t *testing.T) {
-		// TODO: re-enable once `bd dep add` is ported to proxied mode.
-		// Currently bd dep add fails with "storage is nil" under proxied
-		// since the dep subcommand has no usesProxiedServer() dispatch.
-		t.Skip("requires bd dep add proxied support")
+		parent := bdProxiedCreate(t, bd, p.dir, "Ready parent tree", "--type", "epic")
+		readyChild := bdProxiedCreate(t, bd, p.dir, "Ready child in tree", "--type", "task", "--parent", parent.ID)
+		blockedChild := bdProxiedCreate(t, bd, p.dir, "Blocked child in tree", "--type", "task", "--parent", parent.ID)
+		blocker := bdProxiedCreate(t, bd, p.dir, "Tree child blocker", "--type", "task")
+		bdProxiedDep(t, bd, p.dir, "add", blockedChild.ID, blocker.ID)
+
+		out := bdProxiedList(t, bd, p, "--ready", "--parent", parent.ID, "--no-pager")
+		if !strings.Contains(out, readyChild.ID) {
+			t.Errorf("ready child %s should appear in ready parent tree:\n%s", readyChild.ID, out)
+		}
+		if strings.Contains(out, blockedChild.ID) {
+			t.Errorf("blocked child %s should not appear in ready parent tree:\n%s", blockedChild.ID, out)
+		}
 	})
 
 	// Regression for gastownhall/beads#3936: relates-to between two epics
-	// must not nest them, and bidirectional relates-to must not drop them.
+	// must not nest them in `bd list` tree mode, and a bidirectional
+	// relates-to must not silently drop both epics from the output.
 	t.Run("tree_relates_to_does_not_nest_or_drop_epics", func(t *testing.T) {
-		t.Skip("requires bd dep add proxied support")
+		epicA := bdProxiedCreate(t, bd, p.dir, "Relates Epic A", "--type", "epic", "--priority", "2")
+		epicB := bdProxiedCreate(t, bd, p.dir, "Relates Epic B", "--type", "epic", "--priority", "2")
+
+		bdProxiedDep(t, bd, p.dir, "add", epicA.ID, epicB.ID, "--type", "relates-to")
+		out := bdProxiedList(t, bd, p, "--no-pager", "--type", "epic")
+		if !strings.Contains(out, epicA.ID) || !strings.Contains(out, epicB.ID) {
+			t.Fatalf("one-direction relates-to should keep both epics visible:\n%s", out)
+		}
+		if strings.Contains(out, "└── "+epicA.ID) || strings.Contains(out, "└── "+epicB.ID) ||
+			strings.Contains(out, "├── "+epicA.ID) || strings.Contains(out, "├── "+epicB.ID) {
+			t.Fatalf("relates-to must not nest epics under each other:\n%s", out)
+		}
+
+		bdProxiedDep(t, bd, p.dir, "add", epicB.ID, epicA.ID, "--type", "relates-to")
+		out = bdProxiedList(t, bd, p, "--no-pager", "--type", "epic")
+		if !strings.Contains(out, epicA.ID) || !strings.Contains(out, epicB.ID) {
+			t.Fatalf("bidirectional relates-to must not drop epics from tree output:\n%s", out)
+		}
 	})
 
 	t.Run("ready_parent_filter_includes_grandchildren", func(t *testing.T) {
@@ -469,6 +497,16 @@ func TestProxiedServerList(t *testing.T) {
 		}
 	})
 
+	t.Run("format_digraph_output_error", func(t *testing.T) {
+		stderr, err := runWithReadOnlyStdout(t, bd, p.dir, bdProxiedEnv(p.dir), "list", "--format", "digraph", "--all", "--no-pager")
+		if err == nil {
+			t.Fatalf("proxied list --format digraph succeeded with read-only stdout; stderr:\n%s", stderr)
+		}
+		if !strings.Contains(stderr, "writing formatted list output") {
+			t.Fatalf("proxied list --format digraph stderr = %q, want writer diagnostic", stderr)
+		}
+	})
+
 	t.Run("compact_default", func(t *testing.T) {
 		out := bdProxiedList(t, bd, p, "--flat", "--no-pager")
 		if !strings.Contains(out, seed.openBug) {
@@ -499,7 +537,7 @@ func TestProxiedServerList(t *testing.T) {
 
 	t.Run("empty_database", func(t *testing.T) {
 		// Fresh proxied project with no seeded issues.
-		empty := bdProxiedInit(t, bd, "lst-empty")
+		empty := newSharedProxiedProject(t, bd, "lst-empty")
 		issues := bdProxiedListJSON(t, bd, empty)
 		if len(issues) != 0 {
 			t.Errorf("expected 0 issues in empty proxied database, got %d", len(issues))
@@ -596,13 +634,18 @@ func TestProxiedServerList(t *testing.T) {
 		}
 	})
 
-	t.Run("truncation_hint_on_stderr_when_more_results", func(t *testing.T) {
-		stdout, stderr := bdProxiedListCapture(t, bd, p, "--all", "--limit", "2")
-		if !strings.Contains(stderr, "more results matched") {
-			t.Errorf("expected truncation hint on stderr, got:\nstderr: %q\nstdout: %q", stderr, stdout)
+	t.Run("limit_truncates_and_hint_stays_off_stdout", func(t *testing.T) {
+		full := bdProxiedListJSON(t, bd, p, "--all", "--limit", "0")
+		if len(full) <= 2 {
+			t.Fatalf("fixture should have > 2 issues, got %d", len(full))
 		}
+		page := bdProxiedListJSON(t, bd, p, "--all", "--limit", "2")
+		if len(page) != 2 {
+			t.Errorf("--limit 2 should cap at 2 rows, got %d", len(page))
+		}
+		stdout, _ := bdProxiedListCapture(t, bd, p, "--all", "--limit", "2")
 		if strings.Contains(stdout, "more results matched") {
-			t.Errorf("truncation hint leaked into stdout:\n%s", stdout)
+			t.Errorf("truncation hint must not leak into stdout:\n%s", stdout)
 		}
 	})
 
@@ -618,29 +661,21 @@ func TestProxiedServerList(t *testing.T) {
 	// --- M. Pagination across the issues+wisps UNION ALL ---
 
 	t.Run("ready_returns_both_perm_and_wisp", func(t *testing.T) {
-		// The wisps table participates in --ready via the UNION path, but
-		// the ephemeral exclusion applies to it exactly like classic
-		// (bd-6dnrw.44 item 2): non-ephemeral NoHistory wisps surface by
-		// default, true ephemerals stay hidden.
-		noHistory := bdProxiedCreate(t, bd, p.dir, "NoHistory wisp ready", "--no-history")
-		var ephemeralIDs []string
+		var wispIDs []string
 		for i := 0; i < 3; i++ {
 			w := bdProxiedCreate(t, bd, p.dir, fmt.Sprintf("Wisp ready %d", i), "--ephemeral")
-			ephemeralIDs = append(ephemeralIDs, w.ID)
+			wispIDs = append(wispIDs, w.ID)
 		}
 
-		issues := bdProxiedListJSON(t, bd, p, "--ready", "--limit", "0")
+		issues := bdProxiedReadyJSON(t, bd, p, "--include-ephemeral", "--limit", "0")
 		ids := listIssueIDs(issues)
-		if !containsID(issues, noHistory.ID) {
-			t.Errorf("non-ephemeral wisp %s should appear in --ready (UNION path), got %v", noHistory.ID, ids)
-		}
-		for _, wid := range ephemeralIDs {
-			if containsID(issues, wid) {
-				t.Errorf("ephemeral wisp %s should be excluded from default --ready (classic parity), got %v", wid, ids)
+		for _, wid := range wispIDs {
+			if !containsID(issues, wid) {
+				t.Errorf("ephemeral wisp %s should appear in ready --include-ephemeral (UNION path), got %v", wid, ids)
 			}
 		}
 		if !containsID(issues, seed.readyTask) {
-			t.Errorf("permanent readyTask %s should still appear in --ready, got %v", seed.readyTask, ids)
+			t.Errorf("permanent readyTask %s should still appear in ready --include-ephemeral, got %v", seed.readyTask, ids)
 		}
 	})
 
@@ -711,7 +746,7 @@ func TestProxiedServerList(t *testing.T) {
 
 	t.Run("reject_format_with_watch", func(t *testing.T) {
 		out := bdProxiedListFail(t, bd, p, "--watch", "--format", "dot")
-		if !strings.Contains(out, "--format under --proxied-server --watch is not supported") {
+		if !strings.Contains(out, "--format cannot be combined with --watch") {
 			t.Errorf("expected --format+--watch rejection message, got: %s", out)
 		}
 	})
@@ -730,12 +765,52 @@ func TestProxiedServerList(t *testing.T) {
 		}
 	})
 
+	// The cap is HONORED on this route now. It used to be rejected outright,
+	// because the proxied repository path (internal/storage/domain/db) read no
+	// MaxRows at all and honoring it would have meant silence (be-x42v.4). The
+	// answer is the cap firing, with the same text and the same exit code the
+	// direct route prints.
+	t.Run("max_rows_flag_fires", func(t *testing.T) {
+		out := bdProxiedListFail(t, bd, p, "--max-rows", "1")
+		if strings.Contains(out, "not supported in proxied-server mode") {
+			t.Fatalf("--max-rows is refused under --proxied-server; the cap threads this route now: %s", out)
+		}
+		if !strings.Contains(out, "too many rows") || !strings.Contains(out, "--max-rows=1") {
+			t.Errorf("expected the cap to fire naming its source, got: %s", out)
+		}
+	})
+
+	t.Run("max_rows_env_fires", func(t *testing.T) {
+		fullArgs := []string{"list"}
+		stdout, stderr, err := bdProxiedRunBuffersWithEnv(t, bd, p.dir,
+			[]string{"BEADS_MAX_ROWS=1"}, fullArgs...)
+		if err == nil {
+			t.Fatalf("expected BEADS_MAX_ROWS under proxied-server to trip the cap, but it succeeded:\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+		}
+		out := stdout + stderr
+		if strings.Contains(out, "not supported in proxied-server mode") {
+			t.Fatalf("BEADS_MAX_ROWS is refused under --proxied-server; the cap threads this route now: %s", out)
+		}
+		if !strings.Contains(out, "too many rows") || !strings.Contains(out, "BEADS_MAX_ROWS=1") {
+			t.Errorf("expected the cap to fire naming its source, got: %s", out)
+		}
+	})
+
+	t.Run("allow_max_rows_zero", func(t *testing.T) {
+		// --max-rows 0 explicitly disables the cap, so it must not trip the
+		// proxied-server rejection.
+		issues := bdProxiedListJSON(t, bd, p, "--max-rows", "0", "--all")
+		if len(issues) == 0 {
+			t.Error("--max-rows 0 --all under proxied-server unexpectedly returned no issues")
+		}
+	})
+
 	// --- O. Lightweight race: 4 workers × 5 (create + list) iterations ---
 
 	t.Run("concurrent_create_and_list", func(t *testing.T) {
 		// Isolated project: race test creates 20 issues; keep them out of
 		// the shared fixture so subsequent runs aren't polluted.
-		race := bdProxiedInit(t, bd, "lst-race")
+		race := newSharedProxiedProject(t, bd, "lst-race")
 
 		const (
 			workers = 4

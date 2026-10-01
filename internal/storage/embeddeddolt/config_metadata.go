@@ -5,7 +5,6 @@ package embeddeddolt
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage/domain"
@@ -19,17 +18,8 @@ func (s *EmbeddedDoltStore) SetConfig(ctx context.Context, key, value string) er
 			return err
 		}
 		// Sync normalized tables when config keys change
-		switch key {
-		case "status.custom":
-			if err := issueops.SyncCustomStatusesTable(ctx, tx, value); err != nil {
-				return fmt.Errorf("syncing custom_statuses table: %w", err)
-			}
-		case "types.custom":
-			if err := issueops.SyncCustomTypesTable(ctx, tx, value); err != nil {
-				return fmt.Errorf("syncing custom_types table: %w", err)
-			}
-		}
-		return nil
+		_, err := issueops.SyncConfigTables(ctx, tx, key, value)
+		return err
 	})
 }
 
@@ -87,7 +77,7 @@ func (s *EmbeddedDoltStore) GetLocalMetadata(ctx context.Context, key string) (s
 
 // GetInfraTypes returns the set of infrastructure types that should be routed
 // to the wisps table. Reads from DB config "types.infra", falls back to YAML,
-// then to hardcoded defaults (agent, rig, role, message).
+// then to hardcoded defaults (agent, role, message).
 func (s *EmbeddedDoltStore) GetInfraTypes(ctx context.Context) map[string]bool {
 	var result map[string]bool
 	if err := s.withConn(ctx, false, func(tx *sql.Tx) error {

@@ -229,12 +229,19 @@ func (l *Lexer) readString(quote rune, startPos int) (Token, error) {
 }
 
 // readNumberOrDuration reads a number or duration (e.g., 7d, 24h).
+//
+// Unsigned digit-led tokens that continue into identifier characters
+// (e.g. "1-alpha", "42day-sla", "9.3.1") are re-lexed as identifiers so
+// they can stand in unquoted on the value side of comparisons like
+// "label=1-alpha". Signed forms ("-3-foo") still error — the user has
+// to quote them.
 func (l *Lexer) readNumberOrDuration(startPos int) (Token, error) {
 	var sb strings.Builder
 
 	// Handle optional sign
 	r := l.next()
-	if r == '-' || r == '+' {
+	hadSign := r == '-' || r == '+'
+	if hadSign {
 		sb.WriteRune(r)
 		r = l.next()
 	}
@@ -256,13 +263,39 @@ func (l *Lexer) readNumberOrDuration(startPos int) (Token, error) {
 		sb.WriteRune(r)
 	}
 
-	// Check for duration suffix
-	if r != 0 && isDurationSuffix(r) {
+	// Check for duration suffix. Only commit to a duration when the suffix
+	// stands alone — if more identifier characters follow (e.g. "7day"),
+	// fall through to the identifier-fallback below.
+	if r != 0 && isDurationSuffix(r) && !isIdentChar(l.peek()) {
 		sb.WriteRune(r)
 		return Token{Type: TokenDuration, Value: sb.String(), Pos: startPos}, nil
 	}
 
-	// Not a duration suffix, back up
+	// Multi-rune duration suffixes ("min") cannot be recognized above:
+	// isDurationSuffix classifies a single rune, and the stands-alone guard
+	// bails on the letters that follow it. Left as an identifier, "30min"
+	// would skip the evaluator's TokenDuration arm and resolve through
+	// timeparsing.ParseRelativeTime as a *future* offset — the opposite
+	// direction from the "N ago" contract 7d, 24h and 30m all honor.
+	if r != 0 {
+		if word, ok := l.acceptDurationWord(); ok {
+			sb.WriteString(word)
+			return Token{Type: TokenDuration, Value: sb.String(), Pos: startPos}, nil
+		}
+	}
+
+	// Identifier-continuation fallback: an unsigned digit-led run that
+	// butts against more identifier characters is an identifier, not a
+	// number. Restart the lex at the original position and read it as an
+	// identifier so "1-alpha", "2bravo", "42d-sla" all tokenize as one
+	// TokenIdent.
+	if !hadSign && r != 0 && isIdentChar(r) {
+		l.pos = startPos
+		return l.readIdent(startPos)
+	}
+
+	// Not a duration suffix and not an identifier — back up the lookahead
+	// rune.
 	if r != 0 {
 		l.backup()
 	}
@@ -323,8 +356,10 @@ func isIdentStart(r rune) bool {
 // isIdentChar returns true if r can be part of an identifier.
 // Colons are allowed so that namespaced labels (e.g., gt:merge-request) can
 // be used unquoted in query expressions like "label=gt:merge-request".
+// Slashes are allowed so that path-style metadata keys (e.g., jira/sprint)
+// can be used in query expressions like "metadata.jira/sprint=42".
 func isIdentChar(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.' || r == ':'
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.' || r == ':' || r == '/'
 }
 
 // isDurationSuffix returns true if r is a valid duration suffix.
@@ -335,4 +370,36 @@ func isDurationSuffix(r rune) bool {
 	default:
 		return false
 	}
+}
+
+// durationWords are the multi-rune duration suffixes of the shared
+// compact-duration grammar (internal/timeparsing). "min" is spelled out there
+// precisely because "m" means months, so the query plane has to match the whole
+// word to classify it as a duration. Lowercase only, matching that grammar.
+var durationWords = []string{"min"}
+
+// acceptDurationWord reports whether the input spells a multi-rune duration
+// suffix, starting at the rune the caller most recently read with next() and
+// standing alone. On a match it consumes the suffix and returns it; otherwise
+// the lexer position is left untouched.
+func (l *Lexer) acceptDurationWord() (string, bool) {
+	if l.width == 0 {
+		return "", false
+	}
+	start := l.pos - l.width
+	for _, word := range durationWords {
+		if !strings.HasPrefix(l.input[start:], word) {
+			continue
+		}
+		end := start + len(word)
+		// More identifier characters follow ("30mins", "30minutes",
+		// "30min-sla"), so this is an identifier, not a duration.
+		if end < len(l.input) && isIdentChar(rune(l.input[end])) {
+			continue
+		}
+		l.pos = end
+		l.width = 1
+		return word, true
+	}
+	return "", false
 }

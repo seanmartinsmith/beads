@@ -3,13 +3,13 @@ package github
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -31,14 +31,25 @@ var ghShorthandPattern = regexp.MustCompile(`^github:([1-9]\d*)$`)
 type Tracker struct {
 	client *Client
 	config *MappingConfig
-	store  storage.Storage
+	store  tracker.Store
+}
+
+// LinkResolver returns a relationship resolver bound to this tracker's
+// repository, or nil when the tracker has not been initialized. Callers get
+// the resolver (and, through it, the repository ref scope) rather than the raw
+// REST client, so relationship sync cannot reach past the endpoints it needs.
+func (t *Tracker) LinkResolver() *LinkResolver {
+	if t.client == nil {
+		return nil
+	}
+	return NewLinkResolver(t.client)
 }
 
 func (t *Tracker) Name() string         { return "github" }
 func (t *Tracker) DisplayName() string  { return "GitHub" }
 func (t *Tracker) ConfigPrefix() string { return "github" }
 
-func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
+func (t *Tracker) Init(ctx context.Context, store tracker.Store) error {
 	t.store = store
 
 	token := t.getConfig(ctx, "github.token", "GITHUB_TOKEN")
@@ -165,6 +176,46 @@ func (t *Tracker) FieldMapper() tracker.FieldMapper {
 	return &githubFieldMapper{config: t.config}
 }
 
+// MappingConfig exposes the tracker's field-mapping configuration so callers
+// (e.g. push-hook content comparison) can mirror push field semantics.
+func (t *Tracker) MappingConfig() *MappingConfig {
+	return t.config
+}
+
+// PushTargetScope returns the canonical repository endpoint under which issue
+// identifiers are resolved. It lets the sync engine distinguish repo-less refs
+// such as github:42 when the configured host, owner, or repository changes.
+func (t *Tracker) PushTargetScope() string {
+	if t.client == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/repos/%s/%s",
+		canonicalGitHubBaseURL(t.client.BaseURL),
+		strings.ToLower(strings.TrimSpace(t.client.Owner)),
+		strings.ToLower(strings.TrimSpace(t.client.Repo)),
+	)
+}
+
+// canonicalGitHubBaseURL normalizes the URL components that are
+// case-insensitive while preserving case-sensitive path semantics. Malformed
+// and relative custom values fall back to deterministic whitespace/slash
+// trimming instead of being rejected here (Tracker.Init/client validation owns
+// their usability).
+func canonicalGitHubBaseURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return trimmed
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.Path = strings.TrimRight(u.Path, "/")
+	if u.RawPath != "" {
+		u.RawPath = strings.TrimRight(u.RawPath, "/")
+	}
+	return u.String()
+}
+
 // IsExternalRef checks if a ref belongs to this GitHub tracker.
 // It recognizes both full GitHub URLs and the "github:{id}" shorthand format
 // produced by BuildExternalRef when a URL is unavailable.
@@ -185,6 +236,16 @@ func (t *Tracker) ExtractIdentifier(ref string) string {
 		return ""
 	}
 	return matches[1]
+}
+
+// RefScope returns the repository scope used to resolve external refs to issue
+// numbers for relationship sync. Refs are deliberately not resolved by issue
+// number alone: see RefScope.
+func (t *Tracker) RefScope() RefScope {
+	if t.client == nil {
+		return RefScope{}
+	}
+	return NewRefScope(t.client.BaseURL, t.client.Owner, t.client.Repo)
 }
 
 func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {

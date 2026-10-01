@@ -100,6 +100,8 @@ func TestSharedServerConcurrent(t *testing.T) {
 		"BEADS_DOLT_SERVER_PORT=" + strconv.Itoa(containerPort),
 		"BEADS_DOLT_AUTO_START=0",
 		"BEADS_TEST_MODE=1",
+		"BD_DISABLE_METRICS=1",
+		"BD_DISABLE_EVENT_FLUSH=1",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=",
 		"SSH_ASKPASS=",
@@ -600,11 +602,12 @@ var (
 func buildSharedServerTestBinary(t *testing.T) string {
 	t.Helper()
 	sharedServerBuildOnce.Do(func() {
-		if prebuilt := os.Getenv("BEADS_TEST_BD_BINARY"); prebuilt != "" {
-			if _, err := os.Stat(prebuilt); err != nil {
-				sharedServerBuildErr = fmt.Errorf("BEADS_TEST_BD_BINARY=%q not found: %w", prebuilt, err)
-				return
-			}
+		prebuilt, err := findPrebuiltBDBinary()
+		if err != nil {
+			sharedServerBuildErr = err
+			return
+		}
+		if prebuilt != "" {
 			sharedServerBdBinary = prebuilt
 			return
 		}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -98,15 +99,82 @@ func gitOriginGetURLForActiveRepo(ctx context.Context) (string, error) {
 // Uses a 10s timeout since this is a network call used for auto-detection,
 // and suppresses credential prompts to avoid blocking on SSH remotes.
 func gitOriginHasDoltDataRef() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return gitRemoteHasDoltDataRef("origin")
+}
+
+func gitRemoteHasDoltDataRef(remote string) bool {
+	hasData, err := gitRemoteHasDoltDataRefStatus(remote)
+	return err == nil && hasData
+}
+
+// gitOriginHasDoltDataRefStatus is the tri-state form: no data vs. unknown.
+func gitOriginHasDoltDataRefStatus() (bool, error) {
+	return gitRemoteHasDoltDataRefStatus("origin")
+}
+
+// A non-nil error means UNKNOWN, not "no data" — the bool is meaningless.
+//
+// The error names the failure, not the remote: every caller already names the
+// remote it probed, and wrapping here too produced messages that said the URL
+// and the ref twice ("...on sync.remote \"X\": probe refs/dolt/data on X: exit
+// status 128").
+func gitRemoteHasDoltDataRefStatus(remote string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitDoltDataProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "ls-remote", "origin", "refs/dolt/data")
+	// #nosec G702 -- no shell is involved: the binary is the literal "git" and
+	// the remote URL is its own argv element, so it cannot inject a command.
+	// The value is this repo's configured sync remote, local operator state
+	// rather than request data; gosec only reaches it because this PR routed
+	// config discovery through env-derived paths (see testSSHConnectivity in
+	// dolt.go for the same taint path).
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", gitRemoteURLForLsRemote(remote), "refs/dolt/data")
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	output, err := cmd.Output()
 	if err != nil {
-		return false
+		return false, gitLsRemoteProbeError(ctx, err)
 	}
-	return strings.TrimSpace(string(output)) != ""
+	return strings.TrimSpace(string(output)) != "", nil
+}
+
+const gitDoltDataProbeTimeout = 10 * time.Second
+
+// gitLsRemoteProbeError turns a failed `git ls-remote` into something a user
+// can act on. exec.ExitError.Error() is only "exit status 128" — git's actual
+// complaint (auth vs. DNS vs. deleted repo) sits unread in ExitError.Stderr
+// because cmd.Output() captures it there, and a context timeout surfaces as
+// the equally opaque "signal: killed".
+func gitLsRemoteProbeError(ctx context.Context, err error) error {
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("git ls-remote did not answer within %s (network, or an SSH key that wants a passphrase)", gitDoltDataProbeTimeout)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		// git can echo the remote it failed to reach — including a CI token in
+		// https://x-access-token:<token>@host form — so scrub credentials before
+		// this detail reaches plan.Reason, which flows to both stderr and
+		// `bd bootstrap --json`. exitErr itself is only "exit status 128".
+		if detail := scrubURLCredentials(firstNonEmptyLine(string(exitErr.Stderr))); detail != "" {
+			return fmt.Errorf("git ls-remote: %v: %s", exitErr, detail)
+		}
+	}
+	return fmt.Errorf("git ls-remote: %w", err)
+}
+
+// firstNonEmptyLine returns the first meaningful line of git's stderr. git
+// prefixes most failures with a "remote:"/"fatal:" line that already says
+// everything; the rest is usually a hint block we do not want inside a
+// single-line Reason.
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func gitRemoteURLForLsRemote(remote string) string {
+	return strings.TrimPrefix(remote, "git+")
 }
 
 // gitURLToDoltRemote converts a git remote URL to dolt's remote format.

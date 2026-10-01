@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/metrics"
 )
 
 var upgradeCmd = &cobra.Command{
@@ -34,8 +35,16 @@ at startup to detect if bd was upgraded.
 Examples:
   bd upgrade status
   bd upgrade status --json`,
-	Run: func(cmd *cobra.Command, args []string) {
-		// Use in-memory state from trackBdVersion() which runs in PersistentPreRun
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("upgrade-status")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		if jsonOutput {
 			result := map[string]interface{}{
 				"upgraded":        versionUpgradeDetected,
@@ -45,13 +54,11 @@ Examples:
 				result["previous_version"] = previousVersion
 				result["changes_available"] = len(getVersionsSince(previousVersion)) > 0
 			}
-			outputJSON(result)
-			return
+			return outputJSON(result)
 		}
 
-		// Human-readable output
 		if versionUpgradeDetected {
-			fmt.Printf("✨ bd upgraded from v%s to v%s\n", previousVersion, Version)
+			fmt.Printf("✨ bd upgraded from %s to %s\n", displayVersion(previousVersion), displayVersion(Version))
 			newVersions := getVersionsSince(previousVersion)
 			if len(newVersions) > 0 {
 				fmt.Printf("   %d version%s with changes available\n",
@@ -61,10 +68,11 @@ Examples:
 				fmt.Println("Run 'bd upgrade review' to see what changed")
 			}
 		} else if previousVersion == "" {
-			fmt.Printf("bd version: v%s (first run or version tracking just enabled)\n", Version)
+			fmt.Printf("bd version: %s (first run or version tracking just enabled)\n", displayVersion(Version))
 		} else {
-			fmt.Printf("bd version: v%s (no upgrade detected)\n", Version)
+			fmt.Printf("bd version: %s (no upgrade detected)\n", displayVersion(Version))
 		}
+		return nil
 	},
 }
 
@@ -82,42 +90,48 @@ changelog of everything that changed since then.
 Examples:
   bd upgrade review
   bd upgrade review --json`,
-	Run: func(cmd *cobra.Command, args []string) {
-		// Use in-memory state from trackBdVersion() which runs in PersistentPreRun
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("upgrade-review")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		lastVersion := previousVersion
 
 		if lastVersion == "" {
 			fmt.Println("No previous version recorded")
 			fmt.Println("Run 'bd info --whats-new' to see recent changes")
-			return
+			return nil
 		}
 
 		if !versionUpgradeDetected {
-			fmt.Printf("You're already on v%s (no upgrade detected)\n", Version)
+			fmt.Printf("You're already on %s (no upgrade detected)\n", displayVersion(Version))
 			fmt.Println("Run 'bd info --whats-new' to see recent changes")
-			return
+			return nil
 		}
 
 		newVersions := getVersionsSince(lastVersion)
 
 		if jsonOutput {
-			outputJSON(map[string]interface{}{
+			return outputJSON(map[string]interface{}{
 				"current_version":  Version,
 				"previous_version": lastVersion,
 				"new_versions":     newVersions,
 			})
-			return
 		}
 
-		// Human-readable output
-		fmt.Printf("\n🔄 Upgraded from v%s to v%s\n", lastVersion, Version)
+		fmt.Printf("\n🔄 Upgraded from %s to %s\n", displayVersion(lastVersion), displayVersion(Version))
 		fmt.Println(strings.Repeat("=", 60))
 		fmt.Println()
 
 		if len(newVersions) == 0 {
-			fmt.Printf("v%s is newer than v%s but not in changelog\n", Version, lastVersion)
+			fmt.Printf("%s is newer than %s but not in changelog\n", displayVersion(Version), displayVersion(lastVersion))
 			fmt.Println("Run 'bd info --whats-new' to see recent documented changes")
-			return
+			return nil
 		}
 
 		for _, vc := range newVersions {
@@ -136,6 +150,7 @@ Examples:
 
 		fmt.Println("💡 Run 'bd upgrade ack' to mark this version as seen")
 		fmt.Println()
+		return nil
 	},
 }
 
@@ -154,18 +169,24 @@ run this command unless you want to explicitly mark acknowledgement.
 Examples:
   bd upgrade ack
   bd upgrade ack --json`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("upgrade-ack")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {
-			fmt.Println("Error: " + activeWorkspaceNotFoundMessage())
-			fmt.Println("Hint: " + diagHint())
-			return
+			return HandleErrorWithHint(activeWorkspaceNotFoundMessage(), diagHint())
 		}
 
 		cfg, err := configfile.Load(beadsDir)
 		if err != nil {
-			fmt.Printf("Error loading metadata.json: %v\n", err)
-			return
+			return HandleError("loading metadata.json: %v", err)
 		}
 		if cfg == nil {
 			cfg = configfile.DefaultConfig()
@@ -175,30 +196,28 @@ Examples:
 		cfg.LastBdVersion = Version
 
 		if err := cfg.Save(beadsDir); err != nil {
-			fmt.Printf("Error saving metadata.json: %v\n", err)
-			return
+			return HandleError("saving metadata.json: %v", err)
 		}
 
-		// Mark as acknowledged in current session
 		upgradeAcknowledged = true
 		versionUpgradeDetected = false
 
 		if jsonOutput {
-			outputJSON(map[string]interface{}{
+			return outputJSON(map[string]interface{}{
 				"acknowledged":     true,
 				"current_version":  Version,
 				"previous_version": lastSeenVersion,
 			})
-			return
 		}
 
 		if lastSeenVersion == Version {
-			fmt.Printf("✓ Already on v%s\n", Version)
+			fmt.Printf("✓ Already on %s\n", displayVersion(Version))
 		} else if lastSeenVersion == "" {
-			fmt.Printf("✓ Acknowledged bd v%s\n", Version)
+			fmt.Printf("✓ Acknowledged bd %s\n", displayVersion(Version))
 		} else {
-			fmt.Printf("✓ Acknowledged upgrade from v%s to v%s\n", lastSeenVersion, Version)
+			fmt.Printf("✓ Acknowledged upgrade from %s to %s\n", displayVersion(lastSeenVersion), displayVersion(Version))
 		}
+		return nil
 	},
 }
 

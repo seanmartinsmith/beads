@@ -83,7 +83,7 @@ bd dep add implementation setup  # ✓ CORRECT
 When Claude's context gets compacted, conversation history is lost but bd state survives. Write notes as if explaining to a future Claude with zero context:
 
 ```bash
-bd update issue-123 --notes "COMPLETED: JWT auth with RS256
+bd update issue-123 --append-notes "COMPLETED: JWT auth with RS256
 KEY DECISION: RS256 over HS256 for key rotation
 IN PROGRESS: Password reset flow
 NEXT: Implement rate limiting"
@@ -102,7 +102,7 @@ NEXT: Implement rate limiting"
 | v0.60.0+ | CLI credential pass-through for Dolt server push/pull |
 | v0.58.0+ | `bd prime --claim`, `bd show --long`, `--stdin` flag |
 | v0.54.0+ | `bd doctor` detects committed runtime/sensitive files, `BD_BACKUP_ENABLED=false` |
-| v0.52.0+ | `bd sync` deprecated (use `bd dolt push`), `--claim` for atomic start-work |
+| v0.52.0+ | the JSONL-era `bd sync` deprecated (superseded by `bd dolt push`; a new federation-loop `bd sync` was added later — see `commands/sync.md`), `--claim` for atomic start-work |
 | v0.47.0+ | Pull-first sync, resolve-conflicts, dry-run create, gate auto-discovery |
 | v0.43.0+ | Full support: agents, gates, worktrees, chemistry patterns |
 | v0.40.0+ | Agent beads, async gates, worktree management |

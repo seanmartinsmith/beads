@@ -43,9 +43,16 @@ var candidateBin string
 var testDoltServerPort int
 
 func TestMain(m *testing.M) {
+	os.Exit(testMainInner(m))
+}
+
+// testMainInner holds TestMain's body so its defer runs before the process
+// exits — os.Exit skips deferred calls, so TestMain itself must never defer
+// anything (be-5kkk6).
+func testMainInner(m *testing.M) int {
 	if runtime.GOOS == "windows" {
 		fmt.Fprintln(os.Stderr, "regression tests not yet supported on Windows (zip extraction needed)")
-		os.Exit(0)
+		return 0
 	}
 
 	// Start an isolated Dolt server so regression tests don't pollute
@@ -53,14 +60,18 @@ func TestMain(m *testing.M) {
 	if _, err := exec.LookPath("dolt"); err != nil {
 		if os.Getenv("GITHUB_ACTIONS") == "true" {
 			fmt.Fprintln(os.Stderr, "FAIL: dolt missing under GITHUB_ACTIONS — CI workflow must install dolt")
-			os.Exit(1)
+			return 1
 		}
 		fmt.Fprintln(os.Stderr, "SKIP: dolt not found in PATH; regression tests require dolt")
-		os.Exit(0)
+		return 0
 	}
 	os.Setenv("BEADS_TEST_MODE", "1")
+	// AD-01 (be-c5p): allow regression tests to connect to the test container.
+	os.Setenv("BEADS_TEST_SERVER", "1")
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+		if testutil.DoltUnavailableForTestMain(err) {
+			return 1
+		}
 	} else {
 		defer testutil.TerminateDoltContainer()
 		testDoltServerPort = testutil.DoltContainerPortInt()
@@ -70,7 +81,7 @@ func TestMain(m *testing.M) {
 	tmpDir, err := os.MkdirTemp("", "bd-regression-bin-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "creating temp dir: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Build candidate from current worktree
@@ -79,7 +90,7 @@ func TestMain(m *testing.M) {
 	if err := buildCandidate(candidateBin); err != nil {
 		fmt.Fprintf(os.Stderr, "building candidate: %v\n", err)
 		os.RemoveAll(tmpDir)
-		os.Exit(1)
+		return 1
 	}
 
 	// Get baseline (env override > cache > download)
@@ -88,13 +99,13 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "getting baseline: %v\n", err)
 		os.RemoveAll(tmpDir)
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Fprintf(os.Stderr, "Baseline:  %s\nCandidate: %s\n\n", baselineBin, candidateBin)
 	code := m.Run()
 	os.RemoveAll(tmpDir)
-	os.Exit(code)
+	return code
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +341,8 @@ func (w *workspace) runEnv() []string {
 		// up front so it cannot race t.TempDir cleanup by writing .beads files.
 		"BD_NO_DAEMON=1",
 		"BEADS_NO_DAEMON=1",
+		"BD_DISABLE_METRICS=1",
+		"BD_DISABLE_EVENT_FLUSH=1",
 		"GIT_CONFIG_NOSYSTEM=1",
 	}
 	if testDoltServerPort != 0 {
@@ -461,8 +474,23 @@ func (w *workspace) showJSONForSnapshot(id string) string {
 	return w.run(args...)
 }
 
-func (w *workspace) supportsStreamedShowPayloads() bool {
+// isCandidate reports whether this workspace runs the candidate binary rather
+// than the pinned baseline. Intent-named feature gates below delegate here so
+// candidate detection lives in one place.
+func (w *workspace) isCandidate() bool {
 	return candidateBin != "" && w.bdPath == candidateBin
+}
+
+func (w *workspace) supportsStreamedShowPayloads() bool {
+	return w.isCandidate()
+}
+
+// requiresNotesOverwriteForce reports whether this binary refuses `update
+// --notes` over existing notes without --force. The pinned baseline predates
+// both the refusal and the flag (its update has no --force at all), so shared
+// scenarios pass --force only to the candidate.
+func (w *workspace) requiresNotesOverwriteForce() bool {
+	return w.isCandidate()
 }
 
 // export returns a JSONL snapshot of the workspace. This replaces the removed
@@ -509,6 +537,11 @@ var volatileFields = []string{
 	"last_activity", "closed_by_session",
 	"compaction_level", "original_size",
 	"content_hash",
+	// revision (row_lock) is the guarded-write optimistic-concurrency token that
+	// bd show --json began exposing (bd-bwa7n): a random value the engine
+	// rewrites on every write, and absent from the v0.49.6 baseline's show
+	// output entirely, so it is pure cross-version noise for this oracle.
+	"revision",
 }
 
 // showOnlyFields are present in bd show --json but were not in bd export.

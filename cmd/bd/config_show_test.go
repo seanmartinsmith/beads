@@ -1,11 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/gitenv"
 )
 
 // TestViperSourceLabel verifies source label formatting for different config sources.
@@ -282,6 +287,9 @@ func TestCollectViperEntriesWithEnvOverride(t *testing.T) {
 	defer os.Chdir(origDir) //nolint:errcheck
 
 	t.Setenv("BD_ACTOR", "env-bot")
+	// BEADS_ACTOR outranks BD_ACTOR on purpose (GH#4645), so one exported in
+	// the developer's shell would be reported as the source instead (GH#6560).
+	t.Setenv("BEADS_ACTOR", "")
 	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
 	config.ResetForTesting()
 	if err := config.Initialize(); err != nil {
@@ -304,4 +312,207 @@ func TestCollectViperEntriesWithEnvOverride(t *testing.T) {
 		}
 	}
 	t.Error("expected actor key in Viper entries")
+}
+
+// TestCollectViperEntriesActorPrecedenceOverBDActor is a regression test for
+// GH#4645: `bd config show` must report the same actor value AND provenance
+// that mutations actually use (resolveConfiguredActor in main.go), not the
+// deprecated BD_ACTOR that viper's AutomaticEnv binds ahead of any explicit
+// binding. With both env vars set, the entry must show BEADS_ACTOR's value
+// with "env: BEADS_ACTOR" provenance, never BD_ACTOR's.
+func TestCollectViperEntriesActorPrecedenceOverBDActor(t *testing.T) {
+	t.Setenv("BD_ACTOR", "from-bd-actor")
+	t.Setenv("BEADS_ACTOR", "from-beads-actor")
+	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	config.ResetForTesting()
+	if err := config.Initialize(); err != nil {
+		t.Fatalf("config.Initialize() failed: %v", err)
+	}
+	defer func() {
+		config.ResetForTesting()
+		_ = config.Initialize()
+	}()
+
+	entries := collectViperEntries()
+
+	for _, e := range entries {
+		if e.Key == "actor" {
+			if e.Value != "from-beads-actor" {
+				t.Errorf("actor value = %q, want %q (BEADS_ACTOR must win)", e.Value, "from-beads-actor")
+			}
+			if e.Source != "env: BEADS_ACTOR" {
+				t.Errorf("actor source = %q, want %q", e.Source, "env: BEADS_ACTOR")
+			}
+			return
+		}
+	}
+	t.Error("expected actor key in Viper entries")
+}
+
+// TestCollectViperEntriesMetricsUserGlobalProvenance verifies that user-global
+// metrics.* keys report the user-global value AND the user-global config path as
+// their source, even when a project .beads/config.yaml sets a conflicting value
+// that the runtime ignores. This is the provenance contract `bd config show`
+// shares with `bd config get`: metrics consent/endpoint live in the user-global
+// config only, so the displayed value must never be attributed to a project file.
+func TestCollectViperEntriesMetricsUserGlobalProvenance(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	// User-global config opts out of metrics; this is the value the runtime honors.
+	userCfgDir := filepath.Join(home, ".config", "bd")
+	if err := os.MkdirAll(userCfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir user config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userCfgDir, "config.yaml"), []byte("metrics:\n  disabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write user config: %v", err)
+	}
+
+	// A project config tries to flip metrics back on through the highest-precedence
+	// BEADS_DIR config. The runtime ignores it, but it makes GetValueSource report
+	// SourceConfigFile so the regression covers the misattribution case.
+	projectBeadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(projectBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir project .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectBeadsDir, "config.yaml"), []byte("metrics.disabled: false\n"), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	t.Setenv("BEADS_DIR", projectBeadsDir)
+
+	config.ResetForTesting()
+	if err := config.Initialize(); err != nil {
+		t.Fatalf("config.Initialize() failed: %v", err)
+	}
+	defer func() {
+		config.ResetForTesting()
+		_ = config.Initialize()
+	}()
+
+	// Precondition: the project override is live in the merged config, so the
+	// generic "config.yaml" source label would otherwise misattribute the value.
+	if config.GetBool("metrics.disabled") {
+		t.Fatalf("precondition: merged metrics.disabled should be false (project override), got true")
+	}
+
+	var entry *configEntry
+	entries := collectViperEntries()
+	for i := range entries {
+		if entries[i].Key == "metrics.disabled" {
+			entry = &entries[i]
+			break
+		}
+	}
+	if entry == nil {
+		t.Fatal("expected metrics.disabled in Viper entries")
+	}
+
+	// Value comes from the user-global file, not the project override.
+	if entry.Value != "true" {
+		t.Errorf("metrics.disabled value = %q, want %q (user-global, not project override)", entry.Value, "true")
+	}
+	// Source is the explicit user-global path, matching `bd config get`, not the
+	// generic project "config.yaml" label.
+	wantSource, err := config.UserConfigYamlPath()
+	if err != nil {
+		t.Fatalf("resolve user config path: %v", err)
+	}
+	if entry.Source != wantSource {
+		t.Errorf("metrics.disabled source = %q, want %q (user-global path)", entry.Source, wantSource)
+	}
+	if entry.Source == "config.yaml" {
+		t.Error("metrics.disabled source must not be the generic project config.yaml label")
+	}
+
+	// The `config show --json` output serializes exactly these fields, so assert
+	// the marshaled entry reports the user-global value and never the project
+	// "config.yaml" provenance the runtime ignores.
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("json.Marshal(entry): %v", err)
+	}
+	if !strings.Contains(string(encoded), `"value":"true"`) {
+		t.Errorf("config show --json entry %s missing user-global value", encoded)
+	}
+	if strings.Contains(string(encoded), `"source":"config.yaml"`) {
+		t.Errorf("config show --json entry %s misattributes user-global value to project config.yaml", encoded)
+	}
+}
+
+func TestCollectGitConfigEntriesIgnoresInheritedRouting(t *testing.T) {
+	for _, entry := range os.Environ() {
+		key := gitenv.EntryKey(entry)
+		if gitenv.IsRoutingKeyForOS(key, runtime.GOOS) {
+			t.Setenv(key, "")
+			if err := os.Unsetenv(key); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	pinJSONOutput(t, false)
+	runGit := func(t *testing.T, repo string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = gitenv.ScrubRouting(os.Environ())
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture git %v: %v: %s", args, err, out)
+		}
+	}
+	for _, tc := range []struct {
+		name, local, global, want string
+	}{
+		{"repository", "maintainer", "", "maintainer"},
+		{"inline", "maintainer", "", "maintainer"},
+		{"default_global", "", "contributor", "contributor"},
+		{"absent", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, target, decoy := t.TempDir(), t.TempDir(), t.TempDir()
+			for _, key := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME"} {
+				t.Setenv(key, home)
+			}
+			if tc.global != "" {
+				if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[beads]\nrole = "+tc.global+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, repo := range []string{target, decoy} {
+				runGit(t, repo, "init", "--quiet")
+			}
+			runGit(t, decoy, "config", "beads.role", "decoy-role")
+			if tc.local != "" {
+				runGit(t, target, "config", "beads.role", tc.local)
+			}
+			t.Chdir(target)
+			poison := map[string]string{"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "beads.role", "GIT_CONFIG_VALUE_0": "injected-role"}
+			if tc.name == "repository" {
+				poison = map[string]string{"GIT_DIR": filepath.Join(decoy, ".git"), "GIT_WORK_TREE": decoy}
+			}
+			for key, value := range poison {
+				t.Setenv(key, value)
+			}
+			entries := collectGitConfigEntries()
+			wantGet := tc.want
+			if tc.want == "" {
+				wantGet = "beads.role (not set in git config)"
+				if len(entries) != 0 {
+					t.Errorf("absent role produced entries: %+v", entries)
+				}
+			} else if len(entries) != 1 || entries[0] != (configEntry{Key: "beads.role", Value: tc.want, Source: "git"}) {
+				t.Errorf("Git entries = %+v; want role=%q with source=git", entries, tc.want)
+			}
+			out := captureStdout(t, func() error { return configGetCmd.RunE(configGetCmd, []string{"beads.role"}) })
+			if strings.TrimSpace(out) != wantGet {
+				t.Errorf("config get = %q; want %q", out, wantGet)
+			}
+			for key, value := range poison {
+				if os.Getenv(key) != value {
+					t.Errorf("reader changed parent environment %s", key)
+				}
+			}
+		})
+	}
 }

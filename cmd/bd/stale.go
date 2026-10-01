@@ -5,8 +5,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 var staleCmd = &cobra.Command{
@@ -18,39 +20,64 @@ This helps identify:
 - In-progress issues with no recent activity (may be abandoned)
 - Open issues that have been forgotten
 - Issues that might be outdated or no longer relevant`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("stale")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		days, _ := cmd.Flags().GetInt("days")
 		status, _ := cmd.Flags().GetString("status")
 		limit, _ := cmd.Flags().GetInt("limit")
-		// Use global jsonOutput set by PersistentPreRun
+		// Normalized for the reason blockedFilterFromFlags gives: these are
+		// exact-match clauses, and every sibling label filter trims its input
+		// before building them.
+		rawLabels, _ := cmd.Flags().GetStringSlice("label")
+		rawLabelsAny, _ := cmd.Flags().GetStringSlice("label-any")
+		rawExcludeLabels, _ := cmd.Flags().GetStringSlice("exclude-label")
+		labels := utils.NormalizeLabels(rawLabels)
+		labelsAny := utils.NormalizeLabels(rawLabelsAny)
+		excludeLabels := utils.NormalizeLabels(rawExcludeLabels)
 		if days < 1 {
-			FatalError("--days must be at least 1")
+			return HandleErrorRespectJSON("--days must be at least 1")
 		}
-		// Validate status if provided
 		if status != "" && status != "open" && status != "in_progress" && status != "blocked" && status != "deferred" {
-			FatalError("invalid status '%s'. Valid values: open, in_progress, blocked, deferred", status)
+			return HandleErrorRespectJSON("invalid status '%s'. Valid values: open, in_progress, blocked, deferred", status)
 		}
 		filter := types.StaleFilter{
-			Days:   days,
-			Status: status,
-			Limit:  limit,
+			Days:          days,
+			Status:        status,
+			Limit:         limit,
+			Labels:        labels,
+			LabelsAny:     labelsAny,
+			ExcludeLabels: excludeLabels,
 		}
-		// Direct mode
-		ctx := rootCtx
 
-		issues, err := store.GetStaleIssues(ctx, filter)
+		if usesProxiedServer() {
+			return runStaleProxiedServer(rootCtx, filter)
+		}
+
+		issues, err := store.GetStaleIssues(rootCtx, filter)
 		if err != nil {
-			FatalError("%v", err)
+			return HandleErrorRespectJSON("%v", err)
 		}
-		if jsonOutput {
-			if issues == nil {
-				issues = []*types.Issue{}
-			}
-			outputJSON(issues)
-			return
-		}
-		displayStaleIssues(issues, days)
+		return renderStale(issues, filter.Days)
 	},
+}
+
+func renderStale(issues []*types.Issue, days int) error {
+	if jsonOutput {
+		if issues == nil {
+			issues = []*types.Issue{}
+		}
+		return outputJSON(issues)
+	}
+	displayStaleIssues(issues, days)
+	return nil
 }
 
 func displayStaleIssues(issues []*types.Issue, days int) {
@@ -74,6 +101,9 @@ func init() {
 	staleCmd.Flags().IntP("days", "d", 30, "Issues not updated in this many days")
 	staleCmd.Flags().StringP("status", "s", "", "Filter by status (open|in_progress|blocked|deferred)")
 	staleCmd.Flags().IntP("limit", "n", 50, "Maximum issues to show")
+	staleCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
+	staleCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
+	staleCmd.Flags().StringSlice("exclude-label", []string{}, "Exclude issues that have ANY of these labels")
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(staleCmd)
 }

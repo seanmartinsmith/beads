@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltserver"
 )
 
 // TestRunDoltHealthChecks_NonDoltBackend was removed: SQLite backend no longer
@@ -152,7 +155,7 @@ func TestServerMode_NoLockAcquired(t *testing.T) {
 
 }
 
-func TestIsWispTable(t *testing.T) {
+func TestIsIgnoredTable(t *testing.T) {
 	tests := []struct {
 		name     string
 		table    string
@@ -163,8 +166,11 @@ func TestIsWispTable(t *testing.T) {
 		{"wisp_labels", "wisp_labels", true},
 		{"wisp_dependencies", "wisp_dependencies", true},
 		{"wisp_comments", "wisp_comments", true},
+		{"leases", "leases", true},
+		{"local_metadata", "local_metadata", true},
+		{"repo_mtimes", "repo_mtimes", true},
+		{"events", "events", true},
 		{"issues table", "issues", false},
-		{"events table", "events", false},
 		{"labels table", "labels", false},
 		{"dependencies table", "dependencies", false},
 		{"config table", "config", false},
@@ -174,8 +180,134 @@ func TestIsWispTable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isWispTable(tt.table); got != tt.expected {
-				t.Errorf("isWispTable(%q) = %v, want %v", tt.table, got, tt.expected)
+			if got := isIgnoredTable(tt.table); got != tt.expected {
+				t.Errorf("isIgnoredTable(%q) = %v, want %v", tt.table, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestDescribeUncommittedTables_FiltersIgnored is the regression test for the
+// skip-list drift (#5260). Both uncommitted-changes checks — "Dolt Status" and
+// "Dolt Locks" — now share this one filter, so a table that is benign for one
+// cannot be a permanent warning on the other.
+func TestDescribeUncommittedTables_FiltersIgnored(t *testing.T) {
+	rows := []doltStatusRow{
+		{table: "wisps", status: "modified"},
+		{table: "wisp_events", status: "modified"},
+		{table: "leases", status: "modified"},
+		{table: "local_metadata", status: "modified"},
+		{table: "repo_mtimes", status: "modified"},
+		{table: "events", status: "modified"},
+		{table: "issues", status: "modified", staged: true},
+		{table: "labels", status: "modified"},
+	}
+
+	got := describeUncommittedTables(rows)
+
+	want := []string{"issues: modified (staged)", "labels: modified"}
+	if len(got) != len(want) {
+		t.Fatalf("describeUncommittedTables() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("describeUncommittedTables()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestDescribeUncommittedTables_AllIgnoredIsClean pins the property the bug
+// report turned on: a store whose only dirty tables are dolt_ignore'd must read
+// as clean, not as a warning that can never be cleared.
+func TestDescribeUncommittedTables_AllIgnoredIsClean(t *testing.T) {
+	rows := []doltStatusRow{
+		{table: "wisps", status: "modified"},
+		{table: "wisp_dependencies", status: "new table"},
+		{table: "leases", status: "modified"},
+		{table: "events", status: "modified"},
+	}
+
+	if got := describeUncommittedTables(rows); len(got) != 0 {
+		t.Errorf("describeUncommittedTables() = %v, want empty (all tables are dolt_ignore'd)", got)
+	}
+}
+
+// TestResolveGlobalDoltDatabase pins each arm of the GH#6599 resolver directly.
+// The end-to-end coverage in dolt_phantom_test.go is //go:build cgo and skips
+// whenever the shared Dolt test container is unreachable, so these are the arms
+// that run everywhere, including the CGO_ENABLED=0 lane: no server, no skip.
+func TestResolveGlobalDoltDatabase(t *testing.T) {
+	// Shared-server mode is ON here and the stamp is deliberately not
+	// doltserver.GlobalDatabaseName, so this is the one configuration that
+	// discriminates "the stamp is read first" from "the mode gate is read
+	// first" — reordering the two arms returns the constant and reddens this.
+	t.Run("stamp wins ahead of the mode gate", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+		cfg := &configfile.Config{GlobalDoltDatabase: "beads_global_renamed"}
+		if got := resolveGlobalDoltDatabase(cfg); got != "beads_global_renamed" {
+			t.Errorf("resolveGlobalDoltDatabase(stamped) = %q, want the stamp %q", got, "beads_global_renamed")
+		}
+	})
+
+	// BEADS_DOLT_SHARED_SERVER="1" forces IsSharedServerMode() true before it
+	// consults config.yaml, so this arm cannot be quieted by the host's config.
+	t.Run("unstamped config falls back to the routed constant", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+		if got := resolveGlobalDoltDatabase(&configfile.Config{}); got != doltserver.GlobalDatabaseName {
+			t.Errorf("resolveGlobalDoltDatabase(unstamped) = %q, want %q", got, doltserver.GlobalDatabaseName)
+		}
+	})
+
+	t.Run("nil config falls back to the routed constant", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+		if got := resolveGlobalDoltDatabase(nil); got != doltserver.GlobalDatabaseName {
+			t.Errorf("resolveGlobalDoltDatabase(nil) = %q, want %q", got, doltserver.GlobalDatabaseName)
+		}
+	})
+
+	t.Run("unstamped per-project workspace resolves to nothing", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "0")
+		if doltserver.IsSharedServerMode() {
+			t.Skip("shared-server mode enabled via config.yaml; cannot exercise the per-project arm")
+		}
+		if got := resolveGlobalDoltDatabase(&configfile.Config{}); got != "" {
+			t.Errorf("resolveGlobalDoltDatabase(unstamped, per-project) = %q, want \"\" so the skip arm never matches", got)
+		}
+	})
+}
+
+// TestDoltLocksAndDoltStatusShareOneFilter is the anti-drift guard. The two
+// checks previously kept independent skip-lists that diverged; if a future
+// change reintroduces a second private filter, the shared helper stops being
+// the only path and this test is the place that should start failing.
+func TestDoltLocksAndDoltStatusShareOneFilter(t *testing.T) {
+	// Tables that were reported dirty by "Dolt Locks" but not by "Dolt Status"
+	// before #5260, because checkDoltLocks skipped only wisp tables.
+	previouslyDivergent := []string{"leases", "local_metadata", "repo_mtimes", "events"}
+
+	for _, table := range previouslyDivergent {
+		if !isIgnoredTable(table) {
+			t.Errorf("isIgnoredTable(%q) = false; the shared filter must cover every table both checks ignore", table)
+		}
+		if got := describeUncommittedTables([]doltStatusRow{{table: table, status: "modified"}}); len(got) != 0 {
+			t.Errorf("describeUncommittedTables(%q) = %v, want empty", table, got)
+		}
+	}
+}
+
+func TestIssuesProbeQuery(t *testing.T) {
+	tests := []struct {
+		name   string
+		dbName string
+		want   string
+	}{
+		{"plain", "beads_x", "SELECT COUNT(*) FROM `beads_x`.issues LIMIT 1"},
+		{"backtick", "evil`; DROP TABLE x", "SELECT COUNT(*) FROM `evil``; DROP TABLE x`.issues LIMIT 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := issuesProbeQuery(tt.dbName); got != tt.want {
+				t.Errorf("issuesProbeQuery(%q) = %q, want %q", tt.dbName, got, tt.want)
 			}
 		})
 	}

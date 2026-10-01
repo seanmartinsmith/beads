@@ -22,6 +22,7 @@ func TestCheckSchemaSkew_FreshDB_NoError(t *testing.T) {
 	}
 	defer db.Close()
 
+	expectCursorProbe(mock, "schema_migrations", true)
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM schema_migrations`).
 		WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(0))
 
@@ -40,6 +41,7 @@ func TestCheckSchemaSkew_EqualVersion_NoError(t *testing.T) {
 	}
 	defer db.Close()
 
+	expectCursorProbe(mock, "schema_migrations", true)
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM schema_migrations`).
 		WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(LatestVersion()))
 
@@ -59,6 +61,7 @@ func TestCheckSchemaSkew_OneAhead_ReturnsSchemaSkewError(t *testing.T) {
 	defer db.Close()
 
 	dbVersion := LatestVersion() + 1
+	expectCursorProbe(mock, "schema_migrations", true)
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM schema_migrations`).
 		WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(dbVersion))
 
@@ -89,6 +92,7 @@ func TestCheckSchemaSkew_ThreeAhead_ReturnsSchemaSkewError(t *testing.T) {
 	defer db.Close()
 
 	dbVersion := LatestVersion() + 3
+	expectCursorProbe(mock, "schema_migrations", true)
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM schema_migrations`).
 		WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(dbVersion))
 
@@ -121,6 +125,7 @@ func TestCheckSchemaSkew_EscapeHatch_ReturnsNilAndWarns(t *testing.T) {
 	defer db.Close()
 
 	dbVersion := LatestVersion() + 3
+	expectCursorProbe(mock, "schema_migrations", true)
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM schema_migrations`).
 		WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(dbVersion))
 
@@ -153,6 +158,61 @@ func TestCheckSchemaSkew_EscapeHatch_ReturnsNilAndWarns(t *testing.T) {
 	)
 	if !strings.Contains(buf.String(), wantWarning) {
 		t.Errorf("stderr = %q\nwant to contain warning:\n  %q", buf.String(), wantWarning)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestCheckSchemaSkew_MissingTable_NoError covers the writable open path, where
+// CheckForwardDrift runs before initSchema creates schema_migrations on a fresh
+// database. A table-not-exist error must be treated as version 0 (no forward
+// drift), not surfaced as a skew-check failure.
+func TestCheckSchemaSkew_MissingTable_NoError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// With the be-bv7x probe in front, an absent cursor table is reported by
+	// the probe returning 0 rather than by the cursor read erroring out.
+	expectCursorProbe(mock, "schema_migrations", false)
+
+	if err := checkSchemaSkew(context.Background(), db); err != nil {
+		t.Fatalf("checkSchemaSkew = %v, want nil when schema_migrations is absent (fresh DB)", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestCheckForwardDrift_Conn_Ahead confirms the exported guard accepts a DBConn
+// (so the embedded writable path can pass a pinned *sql.Conn) and still reports
+// forward drift.
+func TestCheckForwardDrift_Conn_Ahead(t *testing.T) {
+	ctx := context.Background()
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	defer conn.Close()
+
+	dbVersion := LatestVersion() + 2
+	expectCursorProbe(mock, "schema_migrations", true)
+	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM schema_migrations`).
+		WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(dbVersion))
+
+	got := CheckForwardDrift(ctx, conn)
+	if !IsSchemaSkewError(got) {
+		t.Fatalf("CheckForwardDrift = %v (%T), want *SchemaSkewError", got, got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
@@ -228,5 +288,37 @@ func TestIsSchemaSkewError_OtherError(t *testing.T) {
 	err := errors.New("some unrelated error")
 	if IsSchemaSkewError(err) {
 		t.Error("IsSchemaSkewError(non-SchemaSkewError) = true, want false")
+	}
+}
+
+// -- CheckBehindDrift unit tests (mock DB) --
+
+func TestCheckBehindDrift_FreshDB_ReturnsSchemaBehindError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// On a fresh database where schema_migrations does not exist, the cursor probe
+	// returns 0 and no bare SELECT against schema_migrations is issued.
+	expectCursorProbe(mock, "schema_migrations", false)
+
+	got := CheckBehindDrift(context.Background(), db)
+	if got == nil {
+		t.Fatal("CheckBehindDrift = nil, want *SchemaBehindError for fresh DB (version=0)")
+	}
+	var behindErr *SchemaBehindError
+	if !errors.As(got, &behindErr) {
+		t.Fatalf("error type = %T (%v), want *SchemaBehindError", got, got)
+	}
+	if behindErr.DBVersion != 0 {
+		t.Errorf("DBVersion = %d, want 0", behindErr.DBVersion)
+	}
+	if behindErr.BinaryVersion != LatestVersion() {
+		t.Errorf("BinaryVersion = %d, want %d", behindErr.BinaryVersion, LatestVersion())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
 	}
 }

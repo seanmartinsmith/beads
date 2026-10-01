@@ -9,12 +9,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 type readyWorkPredicates struct {
-	whereSQL         string
+	whereSQL string
+	// whereArgs binds only the WHERE placeholders (no ORDER BY params); it is
+	// what a bare COUNT(*) over the ready predicate needs. args carries the
+	// WHERE params followed by the ORDER BY params for the full page query.
+	whereArgs        []interface{}
 	orderBySQL       string
 	limitSQL         string
 	args             []interface{}
@@ -39,7 +44,7 @@ func buildReadyWorkOrder(policy types.SortPolicy) sqlbuild.ReadyWorkOrder {
 // buildReadyWorkPredicates computes the ID sets the ready-work WHERE clause
 // needs (children of deferred parents, parent descendants), then delegates
 // the clause text to sqlbuild so both stacks share ready semantics.
-func buildReadyWorkPredicates(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, tables FilterTables) (*readyWorkPredicates, error) {
+func buildReadyWorkPredicates(ctx context.Context, tx DBTX, filter types.WorkFilter, tables FilterTables) (*readyWorkPredicates, error) {
 	var inputs sqlbuild.ReadyWorkWhereInputs
 	if !filter.IncludeDeferred {
 		deferredChildIDs, dcErr := getChildrenOfDeferredParentsInTx(ctx, tx)
@@ -59,22 +64,33 @@ func buildReadyWorkPredicates(ctx context.Context, tx *sql.Tx, filter types.Work
 		}
 		inputs.ParentDescendantIDs = descendantIDs
 	}
+	return buildReadyWorkPredicatesFrom(filter, tables, inputs)
+}
 
-	whereSQL, args, err := sqlbuild.BuildReadyWorkWhere(filter, tables, inputs)
+// buildReadyWorkPredicatesFrom renders the ready-work predicates for one table
+// family from ID sets the caller already resolved. It issues no SQL, which is
+// what lets a caller that renders BOTH families (and the total) resolve the
+// deferred-parent children and parent descendants once per transaction
+// instead of once per family.
+func buildReadyWorkPredicatesFrom(filter types.WorkFilter, tables FilterTables, inputs sqlbuild.ReadyWorkWhereInputs) (*readyWorkPredicates, error) {
+	whereSQL, whereArgs, err := sqlbuild.BuildReadyWorkWhere(filter, tables, inputs)
 	if err != nil {
 		return nil, err
 	}
 
 	orderBy := buildReadyWorkOrder(filter.SortPolicy)
+	args := make([]interface{}, 0, len(whereArgs)+len(orderBy.Args))
+	args = append(args, whereArgs...)
 	args = append(args, orderBy.Args...)
 
 	var limitSQL string
-	if filter.Limit > 0 {
-		limitSQL = fmt.Sprintf("LIMIT %d", filter.Limit)
+	if eff := EffectiveSearchLimit(filter.Limit, filter.MaxRows); eff > 0 {
+		limitSQL = fmt.Sprintf("LIMIT %d", eff)
 	}
 
 	return &readyWorkPredicates{
 		whereSQL:         whereSQL,
+		whereArgs:        whereArgs,
 		orderBySQL:       orderBy.SQL,
 		limitSQL:         limitSQL,
 		args:             args,
@@ -85,7 +101,7 @@ func buildReadyWorkPredicates(ctx context.Context, tx *sql.Tx, filter types.Work
 //nolint:gosec // G201: whereSQL/orderBySQL built from hardcoded strings and ? placeholders
 func GetReadyWorkInTx(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx DBTX,
 	filter types.WorkFilter,
 ) ([]*types.Issue, error) {
 	preds, err := buildReadyWorkPredicates(ctx, tx, filter, IssuesFilterTables)
@@ -126,34 +142,39 @@ func GetReadyWorkInTx(
 		return nil, wErr
 	}
 	if len(wisps) > 0 {
-		ordered, err = mergeReadyWisps(ordered, wisps, filter)
-		if err != nil {
-			return nil, err
-		}
+		ordered = mergeReadyWisps(ordered, wisps, filter)
+	}
+
+	// Apply the defensive cap on the row count returned to the caller.
+	// LIMIT cap+1 was issued above so a count of cap+1 indicates overage.
+	if err := EnforceMaxRowsCap(len(ordered), filter.MaxRows, filter.MaxRowsSource); err != nil {
+		return nil, err
 	}
 
 	return ordered, nil
 }
 
-func mergeReadyWisps(ordered []*types.Issue, wisps []*types.Issue, filter types.WorkFilter) ([]*types.Issue, error) {
-	seen := make(map[string]struct{}, len(ordered))
+func mergeReadyWisps(ordered []*types.Issue, wisps []*types.Issue, filter types.WorkFilter) []*types.Issue {
+	// Prefer the canonical wisp record when an ID exists in both tables (be-iabdi).
+	wispByID := make(map[string]*types.Issue, len(wisps))
+	for _, w := range wisps {
+		wispByID[w.ID] = w
+	}
+	var kept []*types.Issue
 	for _, issue := range ordered {
-		seen[issue.ID] = struct{}{}
-	}
-	for _, wisp := range wisps {
-		if _, exists := seen[wisp.ID]; exists {
-			return nil, fmt.Errorf("ready work id %q exists in both issues and wisps", wisp.ID)
+		if wispByID[issue.ID] == nil {
+			kept = append(kept, issue)
 		}
-		ordered = append(ordered, wisp)
 	}
-	sortReadyIssues(ordered, filter.SortPolicy)
-	if filter.Limit > 0 && len(ordered) > filter.Limit {
-		ordered = ordered[:filter.Limit]
+	kept = append(kept, wisps...)
+	sortReadyIssues(kept, filter.SortPolicy)
+	if filter.Limit > 0 && len(kept) > filter.Limit {
+		kept = kept[:filter.Limit]
 	}
-	return ordered, nil
+	return kept
 }
 
-func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, deferredChildIDs []string) ([]*types.Issue, error) {
+func getReadyWispsInTx(ctx context.Context, tx DBTX, filter types.WorkFilter, deferredChildIDs []string) ([]*types.Issue, error) {
 	empty, err := wispsTableEmptyOrMissingInTx(ctx, tx)
 	if err != nil {
 		return nil, fmt.Errorf("search wisps (ready work): probe: %w", err)
@@ -165,9 +186,9 @@ func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter,
 	wispFilter := readyWorkWispIssueFilter(filter)
 	if filter.Limit <= 0 {
 		wispFilter.Limit = 0
-		wisps, err := searchTableInTx(ctx, tx, "", wispFilter, WispsFilterTables)
+		wisps, err := searchTableInTxT(ctx, tx, "", wispFilter, WispsFilterTables, issueProjection)
 		if err != nil {
-			if isTableNotExistError(err) {
+			if missingOptionalWispTable(err) {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("search wisps (ready work): %w", err)
@@ -181,7 +202,7 @@ func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter,
 	for offset := 0; len(ready) < filter.Limit; offset += pageSize {
 		pageIDs, err := queryReadyWispIssueIDPage(ctx, tx, wispFilter, !filter.IncludeDeferred, orderBy, pageSize, offset)
 		if err != nil {
-			if isTableNotExistError(err) {
+			if missingOptionalWispTable(err) {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("search wisps (ready work): %w", err)
@@ -211,7 +232,7 @@ func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter,
 	return ready, nil
 }
 
-func queryReadyWispIssueIDPage(ctx context.Context, tx *sql.Tx, filter types.IssueFilter, excludeDeferred bool, orderBy sqlbuild.ReadyWorkOrder, limit, offset int) ([]string, error) {
+func queryReadyWispIssueIDPage(ctx context.Context, tx DBTX, filter types.IssueFilter, excludeDeferred bool, orderBy sqlbuild.ReadyWorkOrder, limit, offset int) ([]string, error) {
 	plan := sqlbuild.BuildLabelDrivenSearch(filter, WispsFilterTables)
 	whereClauses, args, err := BuildIssueFilterClauses("", plan.Filter, WispsFilterTables)
 	if err != nil {
@@ -256,7 +277,7 @@ func queryReadyWispIssueIDPage(ctx context.Context, tx *sql.Tx, filter types.Iss
 	return ids, nil
 }
 
-func getWispIssuesByIDsInOrderInTx(ctx context.Context, tx *sql.Tx, ids []string) ([]*types.Issue, error) {
+func getWispIssuesByIDsInOrderInTx(ctx context.Context, tx DBTX, ids []string) ([]*types.Issue, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -298,11 +319,23 @@ func readyWorkWispIssueFilter(filter types.WorkFilter) types.IssueFilter {
 		Pinned:         &pinnedFalse,
 		MetadataFields: filter.MetadataFields,
 		HasMetadataKey: filter.HasMetadataKey,
+		// be-x42v.4 follow-up (review SHOULD-FIX 8): without this,
+		// getReadyWispsInTx's unbounded (Limit<=0) branch called
+		// searchTableInTxT with MaxRows=0, so EffectiveSearchLimit emitted
+		// no SQL LIMIT at all — the entire wisps table matching the
+		// predicate was scanned and hydrated before GetReadyWorkInTx's
+		// post-merge EnforceMaxRowsCap ever ran. Propagating the cap here
+		// lets EffectiveSearchLimit bound that query to cap+1 up front.
+		MaxRows:       filter.MaxRows,
+		MaxRowsSource: filter.MaxRowsSource,
 	}
-	if filter.Status != "" {
+	switch {
+	case filter.Status != "":
 		s := filter.Status
 		wispFilter.Status = &s
-	} else {
+	case len(filter.Statuses) > 0:
+		wispFilter.Statuses = append([]types.Status(nil), filter.Statuses...)
+	default:
 		wispFilter.Statuses = []types.Status{types.StatusOpen, types.StatusInProgress}
 	}
 	if filter.Type != "" {
@@ -327,7 +360,7 @@ func readyWorkWispIssueFilter(filter types.WorkFilter) types.IssueFilter {
 	return wispFilter
 }
 
-func filterReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, wisps []*types.Issue, deferredChildIDs []string) ([]*types.Issue, error) {
+func filterReadyWispsInTx(ctx context.Context, tx DBTX, filter types.WorkFilter, wisps []*types.Issue, deferredChildIDs []string) ([]*types.Issue, error) {
 	if len(wisps) == 0 {
 		return wisps, nil
 	}
@@ -447,7 +480,7 @@ func issuePriorityBefore(a, b *types.Issue) bool {
 		return a.Priority < b.Priority
 	}
 	if !a.CreatedAt.Equal(b.CreatedAt) {
-		return a.CreatedAt.After(b.CreatedAt)
+		return a.CreatedAt.Before(b.CreatedAt)
 	}
 	return a.ID < b.ID
 }
@@ -459,7 +492,7 @@ func issueCreatedBefore(a, b *types.Issue) bool {
 	return a.ID < b.ID
 }
 
-func queryReadyIssueIDPage(ctx context.Context, tx *sql.Tx, query string, args []interface{}) ([]string, error) {
+func queryReadyIssueIDPage(ctx context.Context, tx DBTX, query string, args []interface{}) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ready work: %w", err)
@@ -481,11 +514,65 @@ func queryReadyIssueIDPage(ctx context.Context, tx *sql.Tx, query string, args [
 	return issueIDs, nil
 }
 
+var (
+	deferredChildDepTables   = []string{"dependencies", "wisp_dependencies"}
+	deferredChildIssueTables = []string{"issues", "wisps"}
+)
+
+// deferredChildrenQuery selects the children, recorded in depTable, of parents
+// in issueTable whose defer_until is still in the future.
+func deferredChildrenQuery(depTable, issueTable string) string {
+	targetCol := "depends_on_issue_id"
+	if issueTable == "wisps" {
+		targetCol = "depends_on_wisp_id"
+	}
+	return fmt.Sprintf(`
+				SELECT dep.issue_id
+				FROM %s dep
+				JOIN %s parent ON parent.id = dep.%s
+				WHERE dep.type = 'parent-child'
+				  AND parent.defer_until IS NOT NULL
+				  AND parent.defer_until > UTC_TIMESTAMP()
+			`, depTable, issueTable, targetCol)
+}
+
+// getDeferredChildrenAllTablesInTx is getChildrenOfDeferredParentsInTx's
+// child scan for a database known to have the whole wisp plane: the four
+// dependency-table x parent-table legs go out as ONE statement (UNION ALL)
+// instead of four. Callers must already know every table exists — the
+// per-leg missing-table tolerance of the loop form cannot apply to a single
+// statement.
+func getDeferredChildrenAllTablesInTx(ctx context.Context, tx DBTX) ([]string, error) {
+	legs := make([]string, 0, len(deferredChildDepTables)*len(deferredChildIssueTables))
+	for _, depTable := range deferredChildDepTables {
+		for _, issueTable := range deferredChildIssueTables {
+			legs = append(legs, deferredChildrenQuery(depTable, issueTable))
+		}
+	}
+	rows, err := tx.QueryContext(ctx, strings.Join(legs, " UNION ALL "))
+	if err != nil {
+		return nil, fmt.Errorf("deferred parents: get deferred children: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var childIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("deferred parents: scan deferred child: %w", err)
+		}
+		childIDs = append(childIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("deferred parents: child rows: %w", err)
+	}
+	return childIDs, nil
+}
+
 // getChildrenOfDeferredParentsInTx returns IDs of issues whose parent has a
 // future defer_until. Works within an existing transaction.
 //
 //nolint:gosec // G201: depTable is selected from a hardcoded list below.
-func getChildrenOfDeferredParentsInTx(ctx context.Context, tx *sql.Tx) ([]string, error) {
+func getChildrenOfDeferredParentsInTx(ctx context.Context, tx DBTX) ([]string, error) {
 	hasDeferredParent := false
 	for _, issueTable := range []string{"issues", "wisps"} {
 		//nolint:gosec // G201: issueTable is hardcoded to "issues" or "wisps"
@@ -513,25 +600,19 @@ func getChildrenOfDeferredParentsInTx(ctx context.Context, tx *sql.Tx) ([]string
 	}
 
 	var childIDs []string
-	for _, depTable := range []string{"dependencies", "wisp_dependencies"} {
-		for _, issueTable := range []string{"issues", "wisps"} {
-			targetCol := "depends_on_issue_id"
-			if issueTable == "wisps" {
-				targetCol = "depends_on_wisp_id"
-			}
-			rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
-				SELECT dep.issue_id
-				FROM %s dep
-				JOIN %s parent ON parent.id = dep.%s
-				WHERE dep.type = 'parent-child'
-				  AND parent.defer_until IS NOT NULL
-				  AND parent.defer_until > UTC_TIMESTAMP()
-			`, depTable, issueTable, targetCol))
+	for _, depTable := range deferredChildDepTables {
+		for _, issueTable := range deferredChildIssueTables {
+			rows, err := tx.QueryContext(ctx, deferredChildrenQuery(depTable, issueTable))
 			if err != nil {
-				if depTable == "wisp_dependencies" && isTableNotExistError(err) {
+				// This FROM names two tables at once, so the gate has to key on
+				// which one the driver reports missing. The wisp plane is the
+				// only half a database may legitimately lack; keyed on the error
+				// class alone, the tolerance written for it also excused a
+				// missing dependencies or issues on the same leg.
+				if optionalBlockedTable(depTable) && dberrors.IsMissingTable(err, depTable) {
 					break
 				}
-				if issueTable == "wisps" && isTableNotExistError(err) {
+				if optionalBlockedTable(issueTable) && dberrors.IsMissingTable(err, issueTable) {
 					continue
 				}
 				return nil, fmt.Errorf("deferred parents: get deferred children from %s/%s: %w", depTable, issueTable, err)
@@ -554,7 +635,7 @@ func getChildrenOfDeferredParentsInTx(ctx context.Context, tx *sql.Tx) ([]string
 }
 
 //nolint:gosec // G201: depTable is hardcoded to "dependencies" or "wisp_dependencies"
-func getParentedIDSetInTx(ctx context.Context, tx *sql.Tx, issueIDs []string) (map[string]struct{}, error) {
+func getParentedIDSetInTx(ctx context.Context, tx DBTX, issueIDs []string) (map[string]struct{}, error) {
 	parented := make(map[string]struct{})
 	if len(issueIDs) == 0 {
 		return parented, nil

@@ -17,12 +17,23 @@ import (
 
 	mysqldrv "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/lockfile"
+	"github.com/steveyegge/beads/internal/procid"
+	"github.com/steveyegge/beads/internal/storage/dbproxy/pidfile"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const stopTimeout = 15 * time.Second
+
+const (
+	// backendExitTimeout is how long a fixture waits for the dolt sql-server
+	// to leave the process table after Stop returned. It is generous on
+	// purpose: this only decides between "took a while" and "still there",
+	// and only the second one is a defect.
+	backendExitTimeout = 30 * time.Second
+	backendExitPoll    = 50 * time.Millisecond
+)
 
 func requireDolt(t *testing.T) string {
 	t.Helper()
@@ -63,9 +74,147 @@ func newDoltServer(t *testing.T) (*server.DoltServer, string) {
 	port := freePort(t)
 	cfg := writeConfig(t, port)
 	log := filepath.Join(t.TempDir(), "server.log")
-	s, err := server.NewDoltServer(bin, rootDir, cfg, log, 0)
+	s, err := server.NewDoltServer(bin, rootDir, cfg, log, 0, "")
 	require.NoError(t, err)
+	// Close the log file handle before t.TempDir's RemoveAll runs.
+	// On Windows, an open handle prevents directory removal; Stop is
+	// idempotent so this is safe even when the test calls Stop itself.
+	verifiedStopCleanup(t, s, rootDir)
 	return s, rootDir
+}
+
+// verifiedStopCleanup is the stop the standard fixture registers. It
+// stops the server and then asserts the `dolt sql-server` it recorded is
+// actually gone.
+//
+// This cleanup used to be `_ = s.Stop(context.Background())`. Discarding the
+// error made a failed stop indistinguishable from a clean one, and the
+// t.TempDir() holding the server's working directory is removed AFTER this
+// cleanup runs (t.TempDir registers its own cleanup first, so it runs last).
+// A server that survives its Stop therefore ends the test as a live daemon
+// serving a deleted directory. The suite-scoped post-run sweep catches that
+// leak at package granularity; verifying here also names the responsible test
+// before its cleanup deletes the evidence (wy-j2zc8q).
+//
+// The check runs on the clean path too, not only when Stop reports an error:
+// "Stop returned nil" and "the server exited" are two different claims, and
+// this is the fixture whose job is to hold the second one. It costs one
+// identity probe against a record that a clean Stop has already removed.
+func verifiedStopCleanup(t *testing.T, s *server.DoltServer, rootDir string) {
+	t.Helper()
+	t.Cleanup(func() {
+		// Read the backend's record BEFORE stopping: a clean Stop removes
+		// the pid file, so afterwards there is nothing left to verify
+		// against.
+		record := backendServerRecord(t, rootDir)
+		ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
+		defer cancel()
+		if err := s.Stop(ctx); err != nil {
+			t.Logf("DoltServer.Stop(%s): %v", rootDir, err)
+		}
+		requireBackendExited(t, record)
+	})
+}
+
+// backendServerRecord returns the pid file this package's DoltServer wrote
+// for its `dolt sql-server` child. nil means there is nothing to verify: no
+// server was started, or it shut down cleanly and removed its record.
+//
+// The whole record is returned, not just the PID: Birth is the process-birth
+// token that makes the PID safe to act on at all.
+func backendServerRecord(t *testing.T, rootDir string) *pidfile.PidFile {
+	t.Helper()
+	pf, err := pidfile.Read(rootDir, server.PIDFileName)
+	if err != nil {
+		t.Logf("read %s in %s: %v", server.PIDFileName, rootDir, err)
+		return nil
+	}
+	if pf == nil || pf.Pid <= 0 {
+		return nil
+	}
+	return pf
+}
+
+// requireBackendExited fails the test if the recorded dolt sql-server is
+// still running after Stop returned, then force-kills it so the leak does not
+// outlive the run.
+//
+// Every step is gated on procid birth identity rather than the bare PID. Stop
+// reaps the child, so its PID is reusable the instant it exits; signalling an
+// unverified PID here could hit an unrelated process. A record with no birth
+// token, or one whose token no longer matches, is left alone: not the server
+// we recorded, nothing to report.
+func requireBackendExited(t *testing.T, pf *pidfile.PidFile) {
+	t.Helper()
+	if pf == nil || pf.Pid <= 0 {
+		return
+	}
+	if pf.Birth == "" {
+		// A record from before birth tokens were written. There is no safe
+		// way to ask about that PID, so the check is skipped — say so, rather
+		// than looking like a silent pass.
+		t.Logf("backend record for pid %d carries no birth token; skipping the survived-Stop check", pf.Pid)
+		return
+	}
+	token := procid.Token(pf.Birth)
+
+	deadline := time.Now().Add(backendExitTimeout)
+	for {
+		same, err := procid.Verify(pf.Pid, token)
+		if err != nil {
+			t.Logf("procid.Verify(%d): %v", pf.Pid, err)
+			return
+		}
+		if !same {
+			// Either the process is gone, or the PID now belongs to
+			// something else. Either way our server is not running.
+			return
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(backendExitPoll)
+	}
+
+	handle, err := procid.Open(pf.Pid, token)
+	if err != nil {
+		if backendStillRunning(t, pf.Pid, token) {
+			t.Errorf("dolt sql-server pid %d survived Stop by more than %s and could not be opened to kill: %v",
+				pf.Pid, backendExitTimeout, err)
+		}
+		return
+	}
+	killErr := handle.Kill()
+	_ = handle.Close()
+	if killErr != nil {
+		if backendStillRunning(t, pf.Pid, token) {
+			t.Errorf("dolt sql-server pid %d survived Stop by more than %s and could not be killed: %v",
+				pf.Pid, backendExitTimeout, killErr)
+		}
+		return
+	}
+	t.Errorf("dolt sql-server pid %d survived Stop by more than %s (force-killed)", pf.Pid, backendExitTimeout)
+}
+
+// backendStillRunning re-checks birth identity after procid.Open or
+// Handle.Kill failed, and reports whether the recorded server is verifiably
+// still there.
+//
+// Both calls verify the token themselves and return a plain "does not match
+// token" error when it no longer does — which is exactly what a process that
+// exited between the wait loop's last poll and the kill attempt produces.
+// Without this second look, a server that shut down a few milliseconds late
+// would be reported as one that survived Stop entirely. A verify that itself
+// errors reports "not running": the run is over, and an inconclusive probe is
+// not evidence of a leak.
+func backendStillRunning(t *testing.T, pid int, token procid.Token) bool {
+	t.Helper()
+	same, err := procid.Verify(pid, token)
+	if err != nil {
+		t.Logf("procid.Verify(%d) after a failed kill attempt: %v", pid, err)
+		return false
+	}
+	return same
 }
 
 func stopWithTimeout(t *testing.T, s *server.DoltServer) {
@@ -99,7 +248,7 @@ func TestNewDoltServer_Validation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := server.NewDoltServer(tc.bin, tc.root, tc.cfg, "", 0)
+			s, err := server.NewDoltServer(tc.bin, tc.root, tc.cfg, "", 0, "")
 			assert.Nil(t, s)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.want)
@@ -112,11 +261,11 @@ func TestDoltServer_ID_Stable(t *testing.T) {
 	rootA := t.TempDir()
 	rootB := t.TempDir()
 
-	a1, err := server.NewDoltServer("dolt", rootA, cfgPath, "", 0)
+	a1, err := server.NewDoltServer("dolt", rootA, cfgPath, "", 0, "")
 	require.NoError(t, err)
-	a2, err := server.NewDoltServer("dolt", rootA, cfgPath, "", 0)
+	a2, err := server.NewDoltServer("dolt", rootA, cfgPath, "", 0, "")
 	require.NoError(t, err)
-	b, err := server.NewDoltServer("dolt", rootB, cfgPath, "", 0)
+	b, err := server.NewDoltServer("dolt", rootB, cfgPath, "", 0, "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -126,7 +275,7 @@ func TestDoltServer_ID_Stable(t *testing.T) {
 
 func TestDoltServer_DSN(t *testing.T) {
 	cfgPath := writeConfig(t, 13306)
-	s, err := server.NewDoltServer("dolt", t.TempDir(), cfgPath, "", 0)
+	s, err := server.NewDoltServer("dolt", t.TempDir(), cfgPath, "", 0, "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -153,12 +302,19 @@ func TestDoltServer_DSN(t *testing.T) {
 }
 
 func TestDoltServer_StartStop_HappyPath(t *testing.T) {
-	s, _ := newDoltServer(t)
+	s, rootDir := newDoltServer(t)
 	ctx := context.Background()
 
 	require.NoError(t, s.Start(ctx))
 	t.Cleanup(func() { stopWithTimeout(t, s) })
 	assert.True(t, s.Running(ctx))
+	pf, err := pidfile.Read(rootDir, server.PIDFileName)
+	require.NoError(t, err)
+	require.NotNil(t, pf)
+	require.NoError(t, pf.ValidateV2(pidfile.KindDoltBackend))
+	match, err := procid.Verify(pf.Pid, procid.Token(pf.Birth))
+	require.NoError(t, err)
+	assert.True(t, match)
 
 	db, err := sql.Open("mysql", s.DSN(ctx, "", "root", ""))
 	require.NoError(t, err)
@@ -185,9 +341,18 @@ func TestDoltServer_StartStop_UnixSocket(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	rootDir := t.TempDir()
 
-	sock := filepath.Join(t.TempDir(), "s.sock")
+	// Not t.TempDir(): it nests the test's name, which alone takes the socket
+	// path past the limit below under any TMPDIR longer than /tmp's (the Bazel
+	// test wrapper's per-process one, macOS's /var/folders/...), and the test
+	// would silently skip there.
+	sockDir, err := os.MkdirTemp("", "sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "s.sock")
 	// Linux sun_path is 108 bytes including the NUL terminator; macOS is 104.
-	// Skip on systems where t.TempDir() pushes us past the limit rather than
+	// Skip on systems where TMPDIR pushes us past the limit rather than
 	// surface a confusing bind() error.
 	if len(sock) >= 104 {
 		t.Skipf("socket path too long (%d bytes): %s", len(sock), sock)
@@ -205,7 +370,7 @@ listener:
 	require.NoError(t, os.WriteFile(cfgPath, []byte(body), 0o600))
 
 	logPath := filepath.Join(t.TempDir(), "server.log")
-	s, err := server.NewDoltServer(bin, rootDir, cfgPath, logPath, 0)
+	s, err := server.NewDoltServer(bin, rootDir, cfgPath, logPath, 0, "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -233,6 +398,31 @@ listener:
 	require.NoError(t, err)
 	assert.Equal(t, "unix", conn.RemoteAddr().Network())
 	require.NoError(t, conn.Close())
+
+	require.NoError(t, s.Stop(ctx))
+	assert.False(t, s.Running(ctx))
+}
+
+func TestDoltServer_Stop_RunsGCWhenDatabaseSet(t *testing.T) {
+	bin := requireDolt(t)
+	t.Setenv("HOME", t.TempDir())
+	rootDir := t.TempDir()
+	port := freePort(t)
+	cfg := writeConfig(t, port)
+	log := filepath.Join(t.TempDir(), "server.log")
+
+	const dbName = "gc_test_db"
+	s, err := server.NewDoltServer(bin, rootDir, cfg, log, 0, dbName)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+
+	db, err := sql.Open("mysql", s.DSN(ctx, "", "root", ""))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+dbName)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
 
 	require.NoError(t, s.Stop(ctx))
 	assert.False(t, s.Running(ctx))
@@ -270,7 +460,7 @@ func TestDoltServer_StartStopStart_NewInstanceSameRootDirSucceeds(t *testing.T) 
 
 	port1 := freePort(t)
 	cfg1 := writeConfig(t, port1)
-	s1, err := server.NewDoltServer(bin, rootDir, cfg1, logPath, 0)
+	s1, err := server.NewDoltServer(bin, rootDir, cfg1, logPath, 0, "")
 	require.NoError(t, err)
 	require.NoError(t, s1.Start(ctx))
 	require.NoError(t, s1.Stop(ctx))
@@ -278,7 +468,7 @@ func TestDoltServer_StartStopStart_NewInstanceSameRootDirSucceeds(t *testing.T) 
 	// Fresh port to dodge any TIME_WAIT lingering on the old one.
 	port2 := freePort(t)
 	cfg2 := writeConfig(t, port2)
-	s2, err := server.NewDoltServer(bin, rootDir, cfg2, logPath, 0)
+	s2, err := server.NewDoltServer(bin, rootDir, cfg2, logPath, 0, "")
 	require.NoError(t, err)
 	require.NoError(t, s2.Start(ctx), "new instance at same rootDir must start")
 	t.Cleanup(func() { stopWithTimeout(t, s2) })
@@ -331,7 +521,7 @@ func TestDoltServer_LogFile_CapturesOutput(t *testing.T) {
 	cfgPath := writeConfig(t, port)
 	logPath := filepath.Join(t.TempDir(), "server.log")
 
-	s, err := server.NewDoltServer(bin, rootDir, cfgPath, logPath, 0)
+	s, err := server.NewDoltServer(bin, rootDir, cfgPath, logPath, 0, "")
 	require.NoError(t, err)
 	ctx := context.Background()
 	require.NoError(t, s.Start(ctx))
@@ -368,11 +558,12 @@ func TestDoltServer_ConcurrentStart_SameRootDir_OneWins(t *testing.T) {
 	bin := requireDolt(t)
 	t.Setenv("HOME", t.TempDir())
 
-	// No global dolt config on purpose: init identity comes from the
-	// --name/--email flags and repo-local config, both written under the
-	// rootDir lock, so concurrent Starts have no shared config file to race
-	// on (the old --global write needed pre-seeding here to avoid exactly
-	// that race).
+	// Pre-configure dolt's global user.name/email so doltConfigure is a
+	// no-op for every concurrent Start (no JSON-write race on
+	// ~/.dolt/config_global.json).
+	require.NoError(t, exec.Command(bin, "config", "--global", "--add", "user.name", "beads-test").Run())
+	require.NoError(t, exec.Command(bin, "config", "--global", "--add", "user.email", "beads@test").Run())
+
 	rootDir := t.TempDir()
 
 	const n = 10
@@ -382,7 +573,7 @@ func TestDoltServer_ConcurrentStart_SameRootDir_OneWins(t *testing.T) {
 		port := freePort(t)
 		cfg := writeConfig(t, port)
 		log := filepath.Join(logDir, fmt.Sprintf("server-%d.log", i))
-		s, err := server.NewDoltServer(bin, rootDir, cfg, log, 0)
+		s, err := server.NewDoltServer(bin, rootDir, cfg, log, 0, "")
 		require.NoError(t, err)
 		servers[i] = s
 	}
@@ -443,7 +634,7 @@ func TestDoltServer_DoltInit_Idempotent(t *testing.T) {
 
 	port := freePort(t)
 	cfgPath := writeConfig(t, port)
-	s, err := server.NewDoltServer(bin, rootDir, cfgPath, "", 0)
+	s, err := server.NewDoltServer(bin, rootDir, cfgPath, "", 0, "")
 	require.NoError(t, err)
 
 	ctx := context.Background()

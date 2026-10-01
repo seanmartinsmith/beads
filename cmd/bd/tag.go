@@ -4,7 +4,9 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 var tagCmd = &cobra.Command{
@@ -18,51 +20,65 @@ Shorthand for 'bd update <id> --add-label <label>'.
 Examples:
   bd tag bd-123 bug
   bd tag bd-123 needs-review`,
-	Args: cobra.ExactArgs(2),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.ExactArgs(2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		CheckReadonly("tag")
 
+		evt := metrics.NewCommandEvent("tag")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		label, err := normalizeLabelForTag(args[1])
+		if err != nil {
+			return HandleErrorRespectJSON("tag %s: %v", args[0], err)
+		}
+
+		if usesProxiedServer() {
+			return runTagProxiedServer(rootCtx, args[0], label)
+		}
+
 		id := args[0]
-		label := args[1]
 
 		ctx := rootCtx
 
-		// Write-intent routing: a prefix-routed target must open writable so the
-		// label add commits on the target head (#4141).
-		result, err := resolveAndGetIssueWithRoutingForWrite(ctx, store, id)
+		result, err := resolveAndGetIssueForMutation(ctx, store, id)
 		if err != nil {
 			if result != nil {
 				result.Close()
 			}
-			FatalErrorRespectJSON("resolving %s: %v", id, err)
+			return HandleErrorRespectJSON("resolving %s: %v", id, err)
 		}
 		if result == nil || result.Issue == nil {
 			if result != nil {
 				result.Close()
 			}
-			FatalErrorRespectJSON("issue %s not found", id)
+			return HandleErrorRespectJSON("issue %s not found", id)
 		}
 		defer result.Close()
 
 		issueStore := result.Store
 
 		if err := validateIssueUpdatable(id, result.Issue); err != nil {
-			FatalErrorRespectJSON("%s", err)
+			return HandleErrorRespectJSON("%s", err)
 		}
 
 		if err := issueStore.AddLabel(ctx, result.ResolvedID, label, actor); err != nil {
-			FatalErrorRespectJSON("adding label to %s: %v", id, err)
+			return HandleErrorRespectJSON("adding label to %s: %v", id, err)
 		}
 		if err := commitPendingIfEmbedded(ctx, issueStore, actor, doltAutoCommitParams{
 			Command:  "tag",
 			IssueIDs: []string{result.ResolvedID},
 		}); err != nil {
-			FatalErrorRespectJSON("failed to commit: %v", err)
+			return HandleErrorRespectJSON("failed to commit: %v", err)
 		}
 
 		SetLastTouchedID(result.ResolvedID)
 
-		// Re-fetch for display
 		updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
 		title := ""
 		if updatedIssue != nil {
@@ -70,12 +86,36 @@ Examples:
 		}
 		if jsonOutput {
 			if updatedIssue != nil {
-				outputJSON(updatedIssue)
+				return outputJSON(updatedIssue)
 			}
-		} else {
-			fmt.Printf("%s Added label %q to %s\n", ui.RenderPass("✓"), label, formatFeedbackID(result.ResolvedID, title))
+			return nil
 		}
+		fmt.Printf("%s Added label %q to %s\n", ui.RenderPass("✓"), label, formatFeedbackID(result.ResolvedID, title))
+		return nil
 	},
+}
+
+// normalizeLabelForTag applies to `bd tag` the normalization every other CLI
+// label write performs, and it is deliberately called BEFORE the route split so
+// the direct and proxied paths cannot diverge on it.
+//
+// `bd tag` describes itself as "Shorthand for 'bd update <id> --add-label
+// <label>'". Without this it was not: update trims and warns, tag stored the
+// positional verbatim, so `bd tag bd-1 ' theme:a'` wrote a label that no
+// `--label theme:a` filter can ever match — the exact unfilterable class #5812
+// is about, written by the command whose help text promises equivalence.
+//
+// A label that is only whitespace is rejected rather than silently dropped.
+// The plural flags can drop an empty element and still honor the rest of the
+// request; `bd tag` has exactly one label to add, so dropping it would leave a
+// command that reported success having done nothing.
+func normalizeLabelForTag(raw string) (string, error) {
+	labels := utils.NormalizeLabels([]string{raw})
+	if len(labels) == 0 {
+		return "", fmt.Errorf("label %q is empty after trimming whitespace", raw)
+	}
+	warnLabelsContainingWhitespace(labels)
+	return labels[0], nil
 }
 
 func init() {

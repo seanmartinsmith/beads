@@ -1,18 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/metrics"
 )
 
 // CheckResult represents the result of a single preflight check.
@@ -23,6 +27,13 @@ type CheckResult struct {
 	Warning bool   `json:"warning,omitempty"`
 	Output  string `json:"output,omitempty"`
 	Command string `json:"command"`
+	// Dir is the directory Command was resolved and run in. The --check probes
+	// do not all share one scope: lint and format run at the repository root
+	// while tests run in the caller's working directory, so a run started from
+	// a subdirectory mixes a repo-wide verdict with a subtree-only one.
+	// Reporting the directory keeps the two distinguishable and makes the
+	// reported command reproducible from somewhere other than the root.
+	Dir string `json:"dir,omitempty"`
 }
 
 // PreflightResult represents the overall preflight check results.
@@ -52,50 +63,144 @@ Examples:
   bd preflight --check --json  # JSON output for programmatic use
   bd preflight --check --skip-lint  # Explicitly skip lint check
 `,
-	Run: runPreflight,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runPreflight,
 }
+
+const beadsPRLintDriverCommand = "go run -mod=readonly -tags=gms_pure_go ./scripts/pr-lint"
+
+// lintCancellationGrace bounds how long Wait keeps reading the output pipe
+// after the lint deadline fires. Descendants of the driver can hold the write
+// end open indefinitely, so this is what turns the deadline into a real bound
+// on the call rather than only on the direct child.
+const lintCancellationGrace = 10 * time.Second
 
 func init() {
 	preflightCmd.Flags().Bool("check", false, "Run checks automatically")
-	preflightCmd.Flags().Bool("fix", false, "Auto-fix issues where possible (not yet implemented)")
-	preflightCmd.Flags().Bool("json", false, "Output results as JSON")
+	preflightCmd.Flags().Bool("fix", false, "Auto-fix issues where possible (vendorHash)")
 	preflightCmd.Flags().Bool("skip-lint", false, "Skip lint check explicitly")
 
 	rootCmd.AddCommand(preflightCmd)
 }
 
-func runPreflight(cmd *cobra.Command, args []string) {
+func runPreflight(cmd *cobra.Command, args []string) error {
+	evt := metrics.NewCommandEvent("preflight")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
 	check, _ := cmd.Flags().GetBool("check")
 	fix, _ := cmd.Flags().GetBool("fix")
-	jsonOutput, _ := cmd.Flags().GetBool("json")
 	skipLint, _ := cmd.Flags().GetBool("skip-lint")
 
 	if fix {
-		fmt.Println("Note: --fix is not yet implemented.")
-		fmt.Println("See bd-lfak.3 through bd-lfak.5 for implementation roadmap.")
-		fmt.Println()
+		return runFixes(jsonOutput)
 	}
 
 	if check {
-		runChecks(jsonOutput, skipLint)
-		return
+		return runChecks(jsonOutput, skipLint)
 	}
 
-	// Static checklist mode
+	// Static checklist mode — tailor the checklist to the detected project
+	// stack so non-Go projects don't get a misleading Go/Nix checklist (GH#4364).
+	root := preflightProjectRoot()
+
 	fmt.Println("PR Readiness Checklist:")
 	fmt.Println()
-	fmt.Println("[ ] Tests pass: go test -tags gms_pure_go -short ./...")
-	fmt.Println("[ ] Lint passes: golangci-lint run --build-tags=gms_pure_go ./...")
-	fmt.Println("[ ] Formatting: gofmt -l .")
-	fmt.Println("[ ] No beads pollution: check .beads/issues.jsonl diff")
-	fmt.Println("[ ] Nix hash current: go.sum unchanged or vendorHash updated")
-	fmt.Println("[ ] Version sync: version.go matches default.nix")
+	for _, item := range buildPreflightChecklist(root) {
+		fmt.Printf("[ ] %s\n", item)
+	}
 	fmt.Println()
 	fmt.Println("Run 'bd preflight --check' to validate automatically.")
+	return nil
+}
+
+// fileExists reports whether name exists directly under dir.
+func fileExists(dir, name string) bool {
+	if dir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, name))
+	return err == nil
+}
+
+// buildPreflightChecklist returns PR-readiness checklist items tailored to the
+// project's language stack, detected from standard marker files in dir. A
+// project with no recognized stack gets a generic reminder rather than a
+// misleading Go checklist, and the repo's own Go+Nix specific items
+// (gms_pure_go build tags, nix vendorHash, released metadata versions) only
+// appear where they apply (GH#4364).
+func buildPreflightChecklist(dir string) []string {
+	// Preserve the exact rich checklist when run inside the beads repo itself
+	// (its primary audience), so the gms_pure_go build tags and nix/version
+	// reminders beads contributors rely on are not lost.
+	if isBeadsRepo(dir) {
+		return []string{
+			"Tests pass: go test -tags gms_pure_go -short ./...",
+			"Lint passes: make ci-pr-lint",
+			"Formatting: gofmt -l .",
+			"No beads pollution: check .beads/issues.jsonl diff",
+			"Nix hash current: go.sum unchanged or vendorHash updated",
+			"Version sync: released metadata matches version.go",
+		}
+	}
+
+	var items []string
+	switch {
+	case fileExists(dir, "go.mod"):
+		items = append(items,
+			"Tests pass: go test ./...",
+			"Lint passes: golangci-lint run ./...",
+			"Formatting: gofmt -l .",
+		)
+	case fileExists(dir, "package.json"):
+		items = append(items,
+			"Tests pass: npm test",
+			"Types check: tsc --noEmit",
+		)
+	case fileExists(dir, "pyproject.toml"), fileExists(dir, "setup.py"):
+		items = append(items,
+			"Tests pass: pytest",
+			"Lint passes: ruff check",
+		)
+	case fileExists(dir, "Cargo.toml"):
+		items = append(items,
+			"Tests pass: cargo test",
+			"Lint passes: cargo clippy",
+		)
+	default:
+		items = append(items, "Tests pass: run your project's test suite, linter, and formatter")
+	}
+
+	// Relevant to any beads workspace, regardless of language.
+	if fileExists(dir, ".beads") {
+		items = append(items, "No beads pollution: check .beads/issues.jsonl diff")
+	}
+
+	return items
+}
+
+// isBeadsRepo reports whether dir is the beads source repo, detected by the
+// module path in go.mod. Used to keep preflight's repo-specific checklist.
+func isBeadsRepo(dir string) bool {
+	data, err := os.ReadFile(filepath.Join(dir, "go.mod")) //nolint:gosec // path is constructed internally (repo root + fixed filename)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "module ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "module ")) == "github.com/steveyegge/beads"
+		}
+	}
+	return false
 }
 
 // runChecks executes all preflight checks and reports results.
-func runChecks(jsonOutput, skipLint bool) {
+func runChecks(jsonOutput, skipLint bool) error {
 	var results []CheckResult
 
 	// Run test check
@@ -162,62 +267,87 @@ func runChecks(jsonOutput, skipLint bool) {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(result); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding preflight result: %v\n", err)
+			return HandleError("encoding preflight result: %v", err)
 		}
-	} else {
-		// Human-readable output
-		for _, r := range results {
-			if r.Skipped {
-				fmt.Printf("⚠ %s (skipped)\n", r.Name)
-			} else if r.Warning {
-				fmt.Printf("⚠ %s\n", r.Name)
-			} else if r.Passed {
-				fmt.Printf("✓ %s\n", r.Name)
-			} else {
-				fmt.Printf("✗ %s\n", r.Name)
-			}
-			fmt.Printf("  Command: %s\n", r.Command)
-			if r.Skipped && r.Output != "" {
-				// Show skip reason
-				fmt.Printf("  Reason: %s\n", r.Output)
-			} else if r.Warning && r.Output != "" {
-				// Show warning message
-				fmt.Printf("  Warning: %s\n", r.Output)
-			} else if !r.Passed && r.Output != "" {
-				// Truncate output for terminal display
-				output := truncateOutput(r.Output, 500)
-				fmt.Printf("  Output:\n")
-				for _, line := range strings.Split(output, "\n") {
-					fmt.Printf("    %s\n", line)
-				}
-			}
-			fmt.Println()
+		if !allPassed {
+			return SilentExit()
 		}
-		fmt.Println(summary)
+		return nil
 	}
+	for _, r := range results {
+		if r.Skipped {
+			fmt.Printf("⚠ %s (skipped)\n", r.Name)
+		} else if r.Warning {
+			fmt.Printf("⚠ %s\n", r.Name)
+		} else if r.Passed {
+			fmt.Printf("✓ %s\n", r.Name)
+		} else {
+			fmt.Printf("✗ %s\n", r.Name)
+		}
+		fmt.Printf("  Command: %s\n", r.Command)
+		if r.Dir != "" {
+			fmt.Printf("  Directory: %s\n", r.Dir)
+		}
+		if r.Skipped && r.Output != "" {
+			fmt.Printf("  Reason: %s\n", r.Output)
+		} else if r.Warning && r.Output != "" {
+			fmt.Printf("  Warning: %s\n", r.Output)
+		} else if !r.Passed && r.Output != "" {
+			output := truncateOutput(r.Output, 500)
+			fmt.Printf("  Output:\n")
+			for _, line := range strings.Split(output, "\n") {
+				fmt.Printf("    %s\n", line)
+			}
+		}
+		fmt.Println()
+	}
+	fmt.Println(summary)
 
 	if !allPassed {
-		os.Exit(1)
+		return SilentExit()
 	}
+	return nil
 }
 
-// runTestCheck runs go test -short ./... and returns the result.
+// runTestCheck runs go test -short ./... and returns the result. Unlike the
+// lint and format checks it is deliberately left in the caller's working
+// directory, so ./... stays the subtree the caller asked about; the reported
+// Dir is what keeps that narrower scope visible beside the rooted checks.
 func runTestCheck() CheckResult {
 	command := "go test -tags gms_pure_go -short ./..."
 	cmd := exec.Command("go", "test", "-tags", "gms_pure_go", "-short", "./...")
 	output, err := cmd.CombinedOutput()
+
+	dir, err2 := os.Getwd()
+	if err2 != nil {
+		dir = "."
+	}
 
 	return CheckResult{
 		Name:    "Tests pass",
 		Passed:  err == nil,
 		Output:  string(output),
 		Command: command,
+		Dir:     dir,
 	}
 }
 
-// runLintCheck runs golangci-lint and returns the result.
+type lintInvocation struct {
+	display    string
+	executable string
+	args       []string
+	dir        string
+	timeout    time.Duration
+}
+
+// runLintCheck runs the checkout-owned Beads lint driver in the Beads source
+// tree and retains a direct, generic golangci-lint check elsewhere.
 func runLintCheck(skipLint bool) CheckResult {
-	command := "golangci-lint run --build-tags=gms_pure_go ./..."
+	return runLintCheckAt(preflightProjectRoot(), skipLint)
+}
+
+func runLintCheckAt(root string, skipLint bool) CheckResult {
+	invocation := lintInvocationForRoot(root)
 	if skipLint {
 		return CheckResult{
 			Name:    "Lint passes",
@@ -225,33 +355,86 @@ func runLintCheck(skipLint bool) CheckResult {
 			Skipped: true,
 			Warning: true,
 			Output:  "lint check explicitly skipped by --skip-lint",
-			Command: command,
+			Command: invocation.display,
+			Dir:     invocation.dir,
 		}
 	}
 
-	// Check if golangci-lint is available
-	if _, err := exec.LookPath("golangci-lint"); err != nil {
+	if _, err := exec.LookPath(invocation.executable); err != nil {
 		return CheckResult{
 			Name:    "Lint passes",
 			Passed:  false,
-			Output:  "golangci-lint not found in PATH (install it or rerun with --skip-lint)",
-			Command: command,
+			Output:  fmt.Sprintf("%s not found in PATH (install it or rerun with --skip-lint)", invocation.executable),
+			Command: invocation.display,
+			Dir:     invocation.dir,
 		}
 	}
 
-	cmd := exec.Command("golangci-lint", "run", "--build-tags=gms_pure_go", "./...")
+	ctx, cancel := context.WithTimeout(context.Background(), invocation.timeout)
+	defer cancel()
+	// Cancellation targets the direct command. For the Beads go run invocation,
+	// it does not provide process-tree ownership: descendants may outlive it.
+	cmd := exec.CommandContext(ctx, invocation.executable, invocation.args...)
+	cmd.Dir = invocation.dir
+	// CombinedOutput collects through a pipe that every descendant inherits, so
+	// killing the direct child on deadline does not close the write end while a
+	// golangci-lint grandchild still holds it. Without a WaitDelay the deadline
+	// therefore cannot bound this call at all, and the message appended below
+	// never prints in the one case it exists to report.
+	cmd.WaitDelay = lintCancellationGrace
 	output, err := cmd.CombinedOutput()
+	// Report the deadline only when it actually decided the result: a child that
+	// wins the race exits cleanly just as the context expires, and that is a
+	// pass, not a timeout.
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		output = append(output, []byte(fmt.Sprintf("\nlint check exceeded %s", invocation.timeout))...)
+	}
 
 	return CheckResult{
 		Name:    "Lint passes",
 		Passed:  err == nil,
 		Output:  string(output),
-		Command: command,
+		Command: invocation.display,
+		Dir:     invocation.dir,
 	}
+}
+
+func lintInvocationForRoot(root string) lintInvocation {
+	if isBeadsRepo(root) {
+		return lintInvocation{
+			display:    beadsPRLintDriverCommand,
+			executable: "go",
+			args:       []string{"run", "-mod=readonly", "-tags=gms_pure_go", "./scripts/pr-lint"},
+			dir:        root,
+			timeout:    13 * time.Minute,
+		}
+	}
+	return lintInvocation{
+		display:    "golangci-lint run ./...",
+		executable: "golangci-lint",
+		args:       []string{"run", "./..."},
+		dir:        root,
+		timeout:    6 * time.Minute,
+	}
+}
+
+func preflightProjectRoot() string {
+	if root := git.GetRepoRoot(); root != "" {
+		return root
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return wd
 }
 
 // runFmtCheck runs gofmt -l and fails if any files need formatting.
 func runFmtCheck() CheckResult {
+	return runFmtCheckAt(preflightProjectRoot())
+}
+
+func runFmtCheckAt(root string) CheckResult {
 	command := "gofmt -l ."
 
 	// Check if gofmt is available
@@ -261,10 +444,12 @@ func runFmtCheck() CheckResult {
 			Passed:  false,
 			Output:  "gofmt not found in PATH (install Go toolchain)",
 			Command: command,
+			Dir:     root,
 		}
 	}
 
 	cmd := exec.Command("gofmt", "-l", ".")
+	cmd.Dir = root
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -273,6 +458,7 @@ func runFmtCheck() CheckResult {
 			Passed:  false,
 			Output:  string(output),
 			Command: command,
+			Dir:     root,
 		}
 	}
 
@@ -283,6 +469,7 @@ func runFmtCheck() CheckResult {
 			Passed:  false,
 			Output:  fmt.Sprintf("Unformatted files:\n%s\nRun: gofmt -w .", unformatted),
 			Command: command,
+			Dir:     root,
 		}
 	}
 
@@ -290,6 +477,7 @@ func runFmtCheck() CheckResult {
 		Name:    "Formatting",
 		Passed:  true,
 		Command: command,
+		Dir:     root,
 	}
 }
 
@@ -419,33 +607,19 @@ func runNixHashCheck() CheckResult {
 	}
 }
 
-// runVersionSyncCheck checks that all version files are in sync.
-// Prefers scripts/check-versions.sh (matches CI) with fallback to inline logic.
+// runVersionSyncCheck checks that all version files are in sync. Beads uses the
+// shared Go authority; unrelated repositories retain the generic Go/Nix check.
 func runVersionSyncCheck() CheckResult {
-	command := "scripts/check-versions.sh"
-
-	// Try using the script (matches CI's check-version-consistency job)
-	if _, err := os.Stat("scripts/check-versions.sh"); err == nil {
-		cmd := exec.Command("bash", "scripts/check-versions.sh")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return CheckResult{
-				Name:    "Version sync",
-				Passed:  false,
-				Output:  string(output),
-				Command: command,
-			}
-		}
-		return CheckResult{
-			Name:    "Version sync",
-			Passed:  true,
-			Output:  string(output),
-			Command: command,
-		}
+	root, found, rootFailure := resolveBeadsVersionRoot(".")
+	if rootFailure.Name != "" {
+		return rootFailure
+	}
+	if found {
+		return runBeadsVersionSyncCheck(root)
 	}
 
-	// Fallback: inline comparison of version.go and default.nix
-	command = "Compare cmd/bd/version.go and default.nix"
+	// Generic fallback: inline comparison of version.go and default.nix.
+	command := "Compare cmd/bd/version.go and default.nix"
 
 	// Read version.go
 	versionGoContent, err := os.ReadFile("cmd/bd/version.go")
@@ -556,4 +730,156 @@ func truncateOutput(s string, maxLen int) string {
 		return strings.TrimSpace(s)
 	}
 	return strings.TrimSpace(s[:maxLen]) + "\n... (truncated)"
+}
+
+// fixResult reports the outcome of one auto-fix operation.
+type fixResult struct {
+	Name    string `json:"name"`
+	Fixed   bool   `json:"fixed"`
+	Skipped bool   `json:"skipped,omitempty"`
+	Detail  string `json:"detail,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// runFixes executes auto-fix operations for fixable preflight checks.
+func runFixes(jsonOutput bool) error {
+	var results []fixResult
+	hasError := false
+
+	nixFixed, nixOld, nixNew, nixErr := fixNixHash()
+	nr := fixResult{Name: "Nix vendorHash"}
+	if nixErr != nil {
+		nr.Error = nixErr.Error()
+		hasError = true
+	} else if nixFixed {
+		nr.Fixed = true
+		nr.Detail = fmt.Sprintf("%s → %s", nixOld, nixNew)
+	} else {
+		nr.Skipped = true
+	}
+	results = append(results, nr)
+
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(results); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding fix results: %v\n", err)
+		}
+		if hasError {
+			return SilentExit()
+		}
+		return nil
+	}
+
+	for _, r := range results {
+		switch {
+		case r.Error != "":
+			fmt.Printf("✗ %s\n  %s\n\n", r.Name, r.Error)
+		case r.Fixed:
+			fmt.Printf("✓ %s\n", r.Name)
+			if r.Detail != "" {
+				fmt.Printf("  %s\n", r.Detail)
+			}
+			fmt.Println()
+		default:
+			fmt.Printf("- %s (nothing to fix)\n\n", r.Name)
+		}
+	}
+
+	if hasError {
+		return SilentExit()
+	}
+	return nil
+}
+
+// fixNixHash computes and updates the vendorHash in default.nix.
+// It uses a sentinel hash to trigger nix to report the correct hash.
+// Returns (fixed, oldHash, newHash, err).
+func fixNixHash() (bool, string, string, error) {
+	// Check if go.sum has uncommitted changes (same heuristic as runNixHashCheck)
+	cmd1 := exec.Command("git", "diff", "--name-only", "HEAD", "--", "go.sum")
+	out1, _ := cmd1.Output()
+	cmd2 := exec.Command("git", "diff", "--name-only", "--cached", "--", "go.sum")
+	out2, _ := cmd2.Output()
+	if len(strings.TrimSpace(string(out1))) == 0 && len(strings.TrimSpace(string(out2))) == 0 {
+		return false, "", "", nil
+	}
+
+	if _, err := exec.LookPath("nix"); err != nil {
+		return false, "", "", fmt.Errorf(
+			"nix not found in PATH\n  Manual fix:\n" +
+				"    1. Edit default.nix: set vendorHash = \"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n" +
+				"    2. Run: nix build .#default\n" +
+				"    3. Copy the 'got:' hash from the error into default.nix",
+		)
+	}
+
+	nixPath := "default.nix"
+	nixInfo, err := os.Stat(nixPath)
+	if err != nil {
+		return false, "", "", fmt.Errorf("cannot stat default.nix: %v", err)
+	}
+	nixPerm := nixInfo.Mode().Perm()
+
+	content, err := os.ReadFile(nixPath)
+	if err != nil {
+		return false, "", "", fmt.Errorf("cannot read default.nix: %v", err)
+	}
+
+	re := regexp.MustCompile(`(vendorHash\s*=\s*)"([^"]+)"`)
+	loc := re.FindSubmatchIndex(content)
+	if loc == nil {
+		return false, "", "", fmt.Errorf("vendorHash not found in default.nix")
+	}
+	oldHash := string(content[loc[4]:loc[5]])
+
+	const sentinel = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	probed := append(append([]byte{}, content[:loc[4]]...), append([]byte(sentinel), content[loc[5]:]...)...)
+	if err := os.WriteFile(nixPath, probed, nixPerm); err != nil {
+		return false, "", "", fmt.Errorf("cannot write default.nix: %v", err)
+	}
+
+	restored := false
+	defer func() {
+		if !restored {
+			_ = os.WriteFile(nixPath, content, nixPerm)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	nixCmd := exec.CommandContext(ctx, "nix", "build", ".#default", "--no-link")
+	nixOut, _ := nixCmd.CombinedOutput()
+
+	// Nix prints the correct hash in lines like "got:    sha256-..."
+	hashRe := regexp.MustCompile(`got:\s+(sha256-[A-Za-z0-9+/]+=)`)
+	m := hashRe.FindSubmatch(nixOut)
+	if m == nil {
+		// Fallback: pick any sha256-... that isn't our sentinel
+		altRe := regexp.MustCompile(`sha256-([A-Za-z0-9+/]+=)`)
+		for _, am := range altRe.FindAllSubmatch(nixOut, -1) {
+			h := "sha256-" + string(am[1])
+			if h != sentinel {
+				m = [][]byte{nil, []byte(h)}
+				break
+			}
+		}
+	}
+	if m == nil {
+		return false, oldHash, "", fmt.Errorf("could not parse correct hash from nix output:\n%s", string(nixOut))
+	}
+	newHash := string(m[1])
+
+	if newHash == oldHash {
+		_ = os.WriteFile(nixPath, content, nixPerm)
+		restored = true
+		return false, oldHash, newHash, nil
+	}
+
+	updated := append(append([]byte{}, content[:loc[4]]...), append([]byte(newHash), content[loc[5]:]...)...)
+	if err := os.WriteFile(nixPath, updated, nixPerm); err != nil {
+		return false, oldHash, newHash, fmt.Errorf("cannot update default.nix: %v", err)
+	}
+	restored = true
+	return true, oldHash, newHash, nil
 }

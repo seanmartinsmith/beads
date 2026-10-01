@@ -9,6 +9,11 @@ import (
 	"testing"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/migration"
+	"github.com/steveyegge/beads/internal/testutil"
+	"github.com/steveyegge/beads/internal/testutil/credentialcmd"
 )
 
 // beforeTestsHook is set by CGO-tagged test files to perform setup before tests run
@@ -35,11 +40,41 @@ func testTempDir(pattern string) (string, error) {
 	return os.MkdirTemp(testTempRoot, pattern)
 }
 
+// runTestsAndSweep runs the suite and then best-effort reaps any dolt
+// sql-server left running under testTempRoot (e.g. auto-started by a CLI
+// test's embedded `bd` invocation, if a SIGKILLed run left one behind).
+// This is the suite most likely to leak — most e2e tests here run a real
+// `bd` binary against a `.beads` dir under testTempRoot with auto-start
+// enabled. See gastownhall/beads mybd-q6cz.
+type testRunner interface {
+	Run() int
+}
+
+func runTestsAndSweep(m testRunner) int {
+	stdout, stderr := os.Stdout, os.Stderr
+	code := m.Run()
+	code = checkStdioAfterRun(code, stdout, stderr)
+	swept := doltserver.SweepSuiteTestServers(testTempRoot)
+	return doltserver.ApplyLeakPolicy("cmd/bd", code, swept)
+}
+
+// suiteRootPrefix is testMainInner's PinSuiteTempRoot pattern without its random
+// tail. It is what SweepDeadSuiteRoots globs for, so the two must not drift.
+const suiteRootPrefix = "beads-bd-tests-"
+
 // Guardrail: ensure the cmd/bd test suite does not touch the real repo .beads state.
 // Disable with BEADS_TEST_GUARD_DISABLE=1 (useful when running tests while actively using beads).
 func TestMain(m *testing.M) {
+	if code, ok := credentialcmd.Dispatch(); ok {
+		os.Exit(code)
+	}
 	// Delegate to testMainInner so defers run before os.Exit.
-	os.Exit(testMainInner(m))
+	code := testMainInner(m)
+	if err := credentialcmd.Cleanup(); err != nil {
+		fmt.Fprintf(os.Stderr, "credential command fixture cleanup: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
 }
 
 func testMainInner(m *testing.M) int {
@@ -49,12 +84,26 @@ func testMainInner(m *testing.M) int {
 	// Many tests expect default config values; running from within this repo would
 	// cause config.Initialize() to walk up from CWD and load `.beads/config.yaml`,
 	// which may set non-default config values and makes tests assert the wrong behavior.
-	tmp, err := os.MkdirTemp("", "beads-bd-tests-*")
+	// Before claiming a root of our own, clear out the roots of EARLIER runs
+	// of this suite whose process is gone — a `go test -timeout` panic skips
+	// both the defer below and the post-Run sweep, so the servers those runs
+	// started outlive every cleanup this process installs, and nothing else
+	// ever looks at a dead run's tree again (wy-j2zc8q). Roots with no owner
+	// marker, and roots whose owner is still running, are left untouched.
+	doltserver.SweepDeadSuiteRoots(os.TempDir(), suiteRootPrefix)
+
+	tmp, err := testutil.PinSuiteTempRoot(suiteRootPrefix + "*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
 		return 1
 	}
 	defer func() { _ = forceRemoveAll(tmp) }()
+
+	// Claim the root for this process so the NEXT run can tell our debris
+	// from a concurrent run's live tree.
+	if err := doltserver.WriteSuiteOwnerMarker(tmp); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not claim suite temp root %s: %v\n", tmp, err)
+	}
 
 	// Anchor package-level sync.Once builders (test binaries, isolated
 	// HOMEs) under this directory so the defer above sweeps them up too.
@@ -82,10 +131,60 @@ func testMainInner(m *testing.M) int {
 		}
 	}
 
-	_ = os.Setenv("HOME", tmp)
-	_ = os.Setenv("USERPROFILE", tmp) // Windows compatibility
-	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg-config"))
+	// The docker CLI's active context also lives under HOME
+	// (~/.docker/config.json); resolve it into DOCKER_HOST now or every
+	// container-gated test skips "Docker not available" on context-routed
+	// daemons like OrbStack (bd-84kos).
+	testutil.PinDockerHostFromContext()
+
+	// Keep HOME beside the fixture directories, not above them. Tests may
+	// create ~/.beads; putting it on their ancestry would make repository
+	// discovery pick up unrelated suite state before trying worktree fallback.
+	home := filepath.Join(tmp, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create test home: %v\n", err)
+		return 1
+	}
+	_ = os.Setenv("HOME", home)
+	_ = os.Setenv("USERPROFILE", home) // Windows compatibility
+	_ = os.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg-config"))
 	_ = os.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+
+	// Keep telemetry out of the test suite entirely (wy-12x1p).
+	//
+	// Every `bd` run with metrics enabled ends in metrics.CloseAndFlush, which
+	// (a) writes an eventkit queue under $HOME/.beads/eventsData and (b) spawns
+	// a DETACHED `bd send-metrics` child (cmd.Process.Release — no Wait) that
+	// outlives its parent. The e2e tests here run the bd binary with
+	// HOME=t.TempDir(), so those orphans keep creating/removing .evtq files and
+	// holding eventkit.lock under a temp dir the test is about to delete. Go's
+	// t.TempDir cleanup then fails with
+	//
+	//   TempDir RemoveAll cleanup: unlinkat .../NNN: directory not empty
+	//
+	// which reddens the whole cmd/bd package with no assertion failure in
+	// sight. It is load-dependent, so it flaked intermittently on a busy
+	// machine (TestPrime_HookJSON_{Local,Redirected}PrimeOverride were the
+	// observed victims, but every subprocess test here was exposed).
+	//
+	// Both vars are set: EnvDisableEventFlush alone would stop the detached
+	// child, and EnvDisableMetrics additionally keeps the queue files out of
+	// the isolated HOME — and a test suite should never upload telemetry.
+	// Subprocess envs in this package are built with append(os.Environ(), ...),
+	// so setting it here covers all of them. Tests that specifically exercise
+	// metrics resolution already unset these per-test and restore them.
+	_ = os.Setenv(metrics.EnvDisableMetrics, "1")
+	_ = os.Setenv(metrics.EnvDisableEventFlush, "1")
+
+	// Pin the migration-freeze override to a path that cannot exist (dc-6jaq).
+	// The freeze gate walks every ancestor of the workspace and of the cwd up
+	// to the filesystem root, so a stray MIGRATION-FREEZE above TMPDIR — or in
+	// a developer's home, or exported by their shell — would refuse every
+	// write in every subprocess suite in this package with exit 14. The
+	// override is authoritative, so pinning it here holds the walk off
+	// globally; the freeze tests that need the walk clear it per-run.
+	_ = os.Setenv(migration.EnvFreezeFile, filepath.Join(tmp, "no-such-freeze-marker"))
 
 	// Also reset viper state that was loaded by main.go's init().
 	config.ResetForTesting()
@@ -98,15 +197,43 @@ func testMainInner(m *testing.M) int {
 	// Previously each test set/unset this env var via ensureTestMode(),
 	// which raced under t.Parallel().
 	_ = os.Setenv("BEADS_TEST_MODE", "1")
+	// AD-01 (be-c5p): opt the cmd/bd test process into the dedicated
+	// test-server lane so dolt.New's database-name firewall allows
+	// testdb_*, benchdb_*, etc. on the spawned test container.
+	_ = os.Setenv("BEADS_TEST_SERVER", "1")
+	_ = os.Setenv("BEADS_TEST_CIRCUIT_DIR", filepath.Join(tmp, "circuit"))
+	defer os.Unsetenv("BEADS_TEST_CIRCUIT_DIR")
 
 	// Clear BEADS_DIR to prevent tests from accidentally picking up the project's
 	// .beads directory via git repo detection when there's a redirect file.
 	// Each test that needs a .beads directory should set BEADS_DIR explicitly.
+	// This is startup isolation only: fresh in-process command fixtures should
+	// use isolateBeadsDirForTest before setup to contain later dispatch mutations.
 	origBeadsDir := os.Getenv("BEADS_DIR")
 	os.Unsetenv("BEADS_DIR")
 	defer func() {
 		if origBeadsDir != "" {
 			os.Setenv("BEADS_DIR", origBeadsDir)
+		}
+	}()
+
+	// Clear BD_BACKUP_ENABLED / BEADS_BACKUP_ENABLED (legacy alias) so tests
+	// asserting on backup.enabled's auto-detected default aren't overridden by
+	// whatever the invoking shell happens to export for real bd usage
+	// (be-yjp4z). Tests that need a specific value set it explicitly via
+	// t.Setenv.
+	origBackupEnabled := os.Getenv("BD_BACKUP_ENABLED")
+	os.Unsetenv("BD_BACKUP_ENABLED")
+	defer func() {
+		if origBackupEnabled != "" {
+			os.Setenv("BD_BACKUP_ENABLED", origBackupEnabled)
+		}
+	}()
+	origBeadsBackupEnabled := os.Getenv("BEADS_BACKUP_ENABLED")
+	os.Unsetenv("BEADS_BACKUP_ENABLED")
+	defer func() {
+		if origBeadsBackupEnabled != "" {
+			os.Setenv("BEADS_BACKUP_ENABLED", origBeadsBackupEnabled)
 		}
 	}()
 
@@ -120,17 +247,17 @@ func testMainInner(m *testing.M) int {
 	}
 
 	if os.Getenv("BEADS_TEST_GUARD_DISABLE") != "" {
-		return m.Run()
+		return runTestsAndSweep(m)
 	}
 
 	repoRoot := findRepoRootFrom(origWD)
 	if repoRoot == "" {
-		return m.Run()
+		return runTestsAndSweep(m)
 	}
 
 	repoBeadsDir := filepath.Join(repoRoot, ".beads")
 	if _, err := os.Stat(repoBeadsDir); err != nil {
-		return m.Run()
+		return runTestsAndSweep(m)
 	}
 
 	watch := []string{
@@ -147,7 +274,7 @@ func testMainInner(m *testing.M) int {
 	}
 
 	before := snapshotFiles(repoBeadsDir, watch)
-	code := m.Run()
+	code := runTestsAndSweep(m)
 	after := snapshotFiles(repoBeadsDir, watch)
 
 	if diff := diffSnapshots(before, after); diff != "" {

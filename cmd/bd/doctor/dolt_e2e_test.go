@@ -14,8 +14,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/testutil"
+	"github.com/steveyegge/beads/internal/testutil/bazeltest"
 )
 
 // e2eDoctorResult mirrors the JSON output struct from cmd/bd/doctor.go.
@@ -56,8 +58,40 @@ func TestMain(m *testing.M) {
 
 func testMainInner(m *testing.M) int {
 	os.Setenv("BEADS_TEST_MODE", "1")
+	// AD-01 (be-c5p): doctor e2e tests connect to a per-package test server.
+	// The dolt.New database-name firewall requires this opt-in to allow
+	// doctor_pkg_shared and doctest_*-prefixed databases through.
+	os.Setenv("BEADS_TEST_SERVER", "1")
+
+	// Clear out the roots of earlier runs of this suite whose process is
+	// gone, before claiming one of our own. A `go test -timeout` panic skips
+	// every defer here AND the post-run sweep, so the servers such a run
+	// started outlive every cleanup this process installs and nothing ever
+	// looks at that run's tree again (wy-j2zc8q). Roots with no owner marker,
+	// and roots whose owner is still running, are left untouched.
+	doltserver.SweepDeadSuiteRoots(os.TempDir(), suiteRootPrefix)
+
+	// Pin t.TempDir() under a suite-owned root so SweepSuiteTestServers
+	// can reap AutoStart leftovers whose t.TempDir() cleanup failed because
+	// the live child still holds the tree (gastownhall/beads#5631).
+	root, pinErr := testutil.PinSuiteTempRoot(suiteRootPrefix + "*")
+	if pinErr != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: suite temp root: %v\n", pinErr)
+		return 1
+	}
+	suiteTempRoot = root
+	defer os.RemoveAll(root)
+
+	// Claim the root for this process so the NEXT run can tell our debris
+	// from a concurrent run's live tree.
+	if err := doltserver.WriteSuiteOwnerMarker(root); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not claim suite temp root %s: %v\n", root, err)
+	}
+
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+		if testutil.DoltUnavailableForTestMain(err) {
+			return 1
+		}
 	} else {
 		defer testutil.TerminateDoltContainer()
 		port := testutil.DoltContainerPortInt()
@@ -80,6 +114,12 @@ func testMainInner(m *testing.M) int {
 	}
 
 	code := m.Run()
+
+	// Best-effort reap of any dolt sql-server left running under a temp dir
+	// this suite created (e.g. a SIGKILLed run) — see
+	// gastownhall/beads mybd-q6cz / #5631.
+	swept := doltserver.SweepSuiteTestServers(root, testBDDir)
+	code = doltserver.ApplyLeakPolicy("cmd/bd/doctor", code, swept)
 
 	os.Unsetenv("BEADS_DOLT_PORT")
 	os.Unsetenv("BEADS_TEST_MODE")
@@ -132,6 +172,12 @@ func buildTestBD(t *testing.T) string {
 	t.Helper()
 
 	testBDOnce.Do(func() {
+		// Under Bazel the binary is injected (//cmd/bd:bd_for_tests); there is
+		// no toolchain or module tree to build from. Plain go test is unchanged.
+		if bazeltest.IsBazel() {
+			testBDPath, testBDErr = bazeltest.PrebuiltBD()
+			return
+		}
 		bdBinary := "bd-test"
 		if runtime.GOOS == "windows" {
 			bdBinary = "bd-test.exe"
@@ -173,6 +219,9 @@ func buildTestBD(t *testing.T) string {
 		}
 	})
 
+	if testBDErr != nil && bazeltest.IsBazel() {
+		t.Fatalf("bd binary for tests: %v", testBDErr) // a wiring bug, never a skip
+	}
 	if testBDErr != nil {
 		t.Skipf("skipping E2E test: failed to build bd binary: %v", testBDErr)
 	}
@@ -268,7 +317,7 @@ func runBDDoctor(t *testing.T, bdPath, path string) (e2eDoctorResult, string, er
 	return result, string(out), execErr
 }
 
-// TestE2E_DoctorSQLiteBackend was removed: SQLite backend no longer exists.
+// TestE2E_DoctorSQLiteBackend is covered by the backend-neutral doctor tests.
 // GetBackend() always returns "dolt" after the dolt-native cleanup (bd-yqpwy).
 
 // TestE2E_DoctorDoltBackendNoDB was removed: the embedded Dolt driver

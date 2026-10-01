@@ -4,10 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/spf13/viper"
+	"github.com/steveyegge/beads/internal/gitenv"
+	"gopkg.in/yaml.v3"
 )
 
 func TestIsYamlOnlyKey(t *testing.T) {
@@ -28,6 +31,7 @@ func TestIsYamlOnlyKey(t *testing.T) {
 		{"directory.labels", true},
 		{"repos.primary", true},
 		{"external_projects.beads", true},
+		{"list.limit", true},
 
 		// Hierarchy settings (GH#995)
 		{"hierarchy.max-depth", true},
@@ -40,13 +44,16 @@ func TestIsYamlOnlyKey(t *testing.T) {
 		{"backup.git-repo", true},
 		{"backup.future-key", true}, // prefix match
 
-		// Import settings
+		// Import settings. import.* is exact-match, not a prefix namespace:
+		// an unlisted import.* key must not be treated as yaml-only.
+		{"import.auto", true},
 		{"import.path", true},
-		{"import.orphan_handling", false},
+		{"import.unlisted-key", false},
 
 		// Secret keys (stored in yaml to avoid leaking via Dolt push)
 		{"github.token", true},
 		{"linear.api_key", true},
+		{"notion.token", true}, // GH#6676
 
 		// Non-yaml keys (should return false)
 		{"jira.url", false},
@@ -139,6 +146,106 @@ func TestUpdateYamlKey(t *testing.T) {
 	}
 }
 
+func TestUpdateYamlKeyNested(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		key      string
+		value    string
+		wantBool *bool
+		wantStr  string
+	}{
+		{
+			name:     "update existing nested leaf",
+			content:  "metrics:\n  disabled: false\n  endpoint: https://example.com\n",
+			key:      "metrics.disabled",
+			value:    "true",
+			wantBool: boolPtr(true),
+		},
+		{
+			name:    "update string leaf under existing block",
+			content: "metrics:\n  disabled: false\n  endpoint: https://example.com\n",
+			key:     "metrics.endpoint",
+			value:   "https://updated.example.com",
+			wantStr: "https://updated.example.com",
+		},
+		{
+			name:     "create missing leaf under existing block",
+			content:  "metrics:\n  endpoint: https://example.com\n",
+			key:      "metrics.disabled",
+			value:    "true",
+			wantBool: boolPtr(true),
+		},
+		{
+			name:     "create entire block when parent missing",
+			content:  "other: value\n",
+			key:      "metrics.disabled",
+			value:    "true",
+			wantBool: boolPtr(true),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := updateYamlKey(tt.content, tt.key, tt.value)
+			if err != nil {
+				t.Fatalf("updateYamlKey() error = %v", err)
+			}
+
+			var parsed map[string]interface{}
+			if err := yaml.Unmarshal([]byte(got), &parsed); err != nil {
+				t.Fatalf("result is not valid YAML: %v\n%s", err, got)
+			}
+
+			parts := strings.Split(tt.key, ".")
+			leaf := walkMap(parsed, parts)
+			if leaf == nil {
+				t.Fatalf("key %q not found after update\nresult:\n%s", tt.key, got)
+			}
+			if tt.wantBool != nil {
+				b, ok := leaf.(bool)
+				if !ok {
+					t.Fatalf("leaf is not bool: %T %v\nresult:\n%s", leaf, leaf, got)
+				}
+				if b != *tt.wantBool {
+					t.Errorf("leaf = %v, want %v\nresult:\n%s", b, *tt.wantBool, got)
+				}
+			}
+			if tt.wantStr != "" {
+				s, ok := leaf.(string)
+				if !ok {
+					t.Fatalf("leaf is not string: %T %v\nresult:\n%s", leaf, leaf, got)
+				}
+				if s != tt.wantStr {
+					t.Errorf("leaf = %q, want %q\nresult:\n%s", s, tt.wantStr, got)
+				}
+			}
+
+			if strings.Contains(got, tt.key+":") && !strings.Contains(tt.content, tt.key+":") {
+				t.Errorf("result contains flat dotted key %q (should have updated nested form instead)\n%s",
+					tt.key, got)
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func walkMap(m map[string]interface{}, parts []string) interface{} {
+	var cur interface{} = m
+	for _, p := range parts {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		cur, ok = mm[p]
+		if !ok {
+			return nil
+		}
+	}
+	return cur
+}
+
 func TestFormatYamlValue(t *testing.T) {
 	tests := []struct {
 		value    string
@@ -164,26 +271,6 @@ func TestFormatYamlValue(t *testing.T) {
 			got := formatYamlValue(tt.value)
 			if got != tt.expected {
 				t.Errorf("formatYamlValue(%q) = %q, want %q", tt.value, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestNormalizeYamlKey(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"no-db", "no-db"},               // no alias, unchanged
-		{"json", "json"},                 // no alias, unchanged
-		{"routing.mode", "routing.mode"}, // no alias for this one
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := normalizeYamlKey(tt.input)
-			if got != tt.expected {
-				t.Errorf("normalizeYamlKey(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
 	}
@@ -302,6 +389,157 @@ func TestSetYamlConfigInDir_WritesTargetConfigDespiteLocalStub(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(worktreeDir, ".beads", "config.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("expected worktree stub to remain untouched, got err=%v", err)
+	}
+}
+
+func TestWorkspaceYamlValueStrictDistinguishesMissingAndMalformed(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if value, present, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server"); err != nil || present || value != "" {
+		t.Fatalf("missing config = (%q, %v, %v), want empty/false/nil", value, present, err)
+	}
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("dolt: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server"); err == nil {
+		t.Fatal("malformed config should return an error")
+	}
+}
+
+func TestWorkspaceYamlValueStrictReadsNestedScalar(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("dolt:\n  shared-server: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value, present, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server")
+	if err != nil || !present || value != "false" {
+		t.Fatalf("nested scalar = (%q, %v, %v), want false/true/nil", value, present, err)
+	}
+}
+
+// TestWorkspaceYamlValueStrictWithLocalMirrorsInitializeMergeOrder pins the one
+// thing the layered reader exists for: it must answer the way the merged
+// singleton does, and Initialize merges config.local.yaml LAST, so the
+// local file wins. A workspace-scoped reader that saw only config.yaml would
+// diverge from every config.GetBool consumer for the ordinary shape of a tracked
+// config.yaml plus a machine-local override.
+func TestWorkspaceYamlValueStrictWithLocalMirrorsInitializeMergeOrder(t *testing.T) {
+	write := func(t *testing.T, beadsDir, name, body string) {
+		t.Helper()
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("local overrides tracked", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		write(t, beadsDir, ProjectConfigFileName, "dolt:\n  shared-server: true\n")
+		write(t, beadsDir, LocalConfigFileName, "dolt:\n  shared-server: false\n")
+		value, present, err := WorkspaceYamlValueStrictWithLocal(beadsDir, "dolt.shared-server")
+		if err != nil || !present || value != "false" {
+			t.Fatalf("= (%q, %v, %v), want the config.local.yaml answer \"false\"/true/nil", value, present, err)
+		}
+	})
+
+	t.Run("local overrides tracked in the enabling direction", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		write(t, beadsDir, ProjectConfigFileName, "dolt:\n  shared-server: false\n")
+		write(t, beadsDir, LocalConfigFileName, "dolt:\n  shared-server: true\n")
+		value, present, err := WorkspaceYamlValueStrictWithLocal(beadsDir, "dolt.shared-server")
+		if err != nil || !present || value != "true" {
+			t.Fatalf("= (%q, %v, %v), want the config.local.yaml answer \"true\"/true/nil", value, present, err)
+		}
+	})
+
+	// MergeInConfig only overrides the keys the local file actually states, so a
+	// local file that is silent about this key must fall through rather than
+	// mask the tracked answer.
+	t.Run("local silent on the key falls through", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		write(t, beadsDir, ProjectConfigFileName, "dolt:\n  shared-server: true\n")
+		write(t, beadsDir, LocalConfigFileName, "dolt:\n  auto-start: false\n")
+		value, present, err := WorkspaceYamlValueStrictWithLocal(beadsDir, "dolt.shared-server")
+		if err != nil || !present || value != "true" {
+			t.Fatalf("= (%q, %v, %v), want the config.yaml answer \"true\"/true/nil", value, present, err)
+		}
+	})
+
+	t.Run("no local file at all", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		write(t, beadsDir, ProjectConfigFileName, "dolt:\n  shared-server: true\n")
+		value, present, err := WorkspaceYamlValueStrictWithLocal(beadsDir, "dolt.shared-server")
+		if err != nil || !present || value != "true" {
+			t.Fatalf("= (%q, %v, %v), want the config.yaml answer \"true\"/true/nil", value, present, err)
+		}
+	})
+
+	// The mirror of the case above, and the corner where being MORE permissive
+	// than Initialize would reopen the divergence: Initialize hangs its local
+	// merge off a project config.yaml it found, so a .beads holding only
+	// config.local.yaml is never merged and config.GetBool answers from
+	// defaults. This reader has to say "absent" too, or it becomes the one
+	// resolver in the tree that honors that file.
+	t.Run("local only, no tracked config.yaml", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		write(t, beadsDir, LocalConfigFileName, "dolt:\n  shared-server: true\n")
+		value, present, err := WorkspaceYamlValueStrictWithLocal(beadsDir, "dolt.shared-server")
+		if err != nil || present || value != "" {
+			t.Fatalf("= (%q, %v, %v), want empty/false/nil: Initialize does not merge a config.local.yaml with no config.yaml beside it", value, present, err)
+		}
+	})
+
+	t.Run("neither file states the key", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		write(t, beadsDir, ProjectConfigFileName, "dolt:\n  auto-start: false\n")
+		value, present, err := WorkspaceYamlValueStrictWithLocal(beadsDir, "dolt.shared-server")
+		if err != nil || present || value != "" {
+			t.Fatalf("= (%q, %v, %v), want empty/false/nil", value, present, err)
+		}
+	})
+
+	// Initialize fails outright on a config.local.yaml it cannot merge, so the
+	// strict contract has to apply to the local layer too rather than skipping
+	// it and quietly answering from the tracked file.
+	t.Run("malformed local is an error, not a fallthrough", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		write(t, beadsDir, ProjectConfigFileName, "dolt:\n  shared-server: true\n")
+		write(t, beadsDir, LocalConfigFileName, "dolt: [")
+		if _, _, err := WorkspaceYamlValueStrictWithLocal(beadsDir, "dolt.shared-server"); err == nil {
+			t.Fatal("malformed config.local.yaml should return an error")
+		} else if !strings.Contains(err.Error(), LocalConfigFileName) {
+			t.Fatalf("error should name the file that failed, got: %v", err)
+		}
+	})
+
+	t.Run("empty beadsDir", func(t *testing.T) {
+		if value, present, err := WorkspaceYamlValueStrictWithLocal("", "dolt.shared-server"); err != nil || present || value != "" {
+			t.Fatalf("= (%q, %v, %v), want empty/false/nil", value, present, err)
+		}
+	})
+}
+
+func TestWorkspaceYamlValueStrictRejectsNullAndWrongParent(t *testing.T) {
+	for _, body := range []string{"dolt:\n  shared-server: null\n", "dolt: false\n", "dolt: []\n"} {
+		t.Run(strings.ReplaceAll(body, "\n", "_"), func(t *testing.T) {
+			beadsDir := filepath.Join(t.TempDir(), ".beads")
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := WorkspaceYamlValueStrict(beadsDir, "dolt.shared-server"); err == nil {
+				t.Fatalf("config %q should be rejected", body)
+			}
+		})
 	}
 }
 
@@ -548,6 +786,19 @@ func TestValidateYamlConfigValue_SharedServer(t *testing.T) {
 	}
 }
 
+func TestValidateYamlConfigValue_DoltRemotesAPIPort(t *testing.T) {
+	for _, value := range []string{"0", "1", "65535"} {
+		if err := validateYamlConfigValue("dolt.remotesapi-port", value); err != nil {
+			t.Errorf("expected %q to be valid: %v", value, err)
+		}
+	}
+	for _, value := range []string{"-1", "banana", "65536"} {
+		if err := validateYamlConfigValue("dolt.remotesapi-port", value); err == nil {
+			t.Errorf("expected %q to be invalid", value)
+		}
+	}
+}
+
 func TestValidateYamlConfigValue_DoltDebug(t *testing.T) {
 	if err := validateYamlConfigValue("dolt.debug", "true"); err != nil {
 		t.Errorf("expected 'true' to be valid: %v", err)
@@ -596,6 +847,76 @@ func TestValidateYamlConfigValue_DoltMode(t *testing.T) {
 	}
 }
 
+// TestValidateYamlConfigValue_PrimeMaxMemories tests validation of prime.max-memories
+func TestValidateYamlConfigValue_PrimeMaxMemories(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		expectErr bool
+		errMsg    string
+	}{
+		{"valid zero (unlimited)", "0", false, ""},
+		{"valid positive", "10", false, ""},
+		{"valid large value", "1000", false, ""},
+		{"invalid negative", "-1", true, "prime.max-memories must be a non-negative integer (0 = unlimited), got \"-1\""},
+		{"invalid non-integer", "abc", true, "prime.max-memories must be a non-negative integer (0 = unlimited), got \"abc\""},
+		{"invalid float", "3.5", true, "prime.max-memories must be a non-negative integer (0 = unlimited), got \"3.5\""},
+		{"invalid empty", "", true, "prime.max-memories must be a non-negative integer (0 = unlimited), got \"\""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateYamlConfigValue("prime.max-memories", tt.value)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("expected error for value %q, got nil", tt.value)
+				} else if err.Error() != tt.errMsg {
+					t.Errorf("expected error %q, got %q", tt.errMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for value %q: %v", tt.value, err)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateYamlConfigValue_PrimeMaxMemoryChars tests validation of prime.max-memory-chars
+func TestValidateYamlConfigValue_PrimeMaxMemoryChars(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		expectErr bool
+		errMsg    string
+	}{
+		{"valid zero (unlimited)", "0", false, ""},
+		{"valid positive", "25000", false, ""},
+		{"valid large value", "1000000", false, ""},
+		{"invalid negative", "-1", true, "prime.max-memory-chars must be a non-negative integer (0 = unlimited), got \"-1\""},
+		{"invalid non-integer", "abc", true, "prime.max-memory-chars must be a non-negative integer (0 = unlimited), got \"abc\""},
+		{"invalid float", "3.5", true, "prime.max-memory-chars must be a non-negative integer (0 = unlimited), got \"3.5\""},
+		{"invalid empty", "", true, "prime.max-memory-chars must be a non-negative integer (0 = unlimited), got \"\""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateYamlConfigValue("prime.max-memory-chars", tt.value)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("expected error for value %q, got nil", tt.value)
+				} else if err.Error() != tt.errMsg {
+					t.Errorf("expected error %q, got %q", tt.errMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for value %q: %v", tt.value, err)
+				}
+			}
+		})
+	}
+}
+
 func TestIsSecretKey(t *testing.T) {
 	tests := []struct {
 		key      string
@@ -607,11 +928,38 @@ func TestIsSecretKey(t *testing.T) {
 		{"some.secret", true},
 		{"some.api-key", true},
 
+		// Spellings the wire redaction has to cover. GET /v0/beads/config
+		// publishes a value for any key this returns false for, and bd serve's
+		// bearer — optional, and shared and surface-wide where it is
+		// configured — cannot withhold one value from one caller, so each of
+		// these is a credential in cleartext if it regresses. "apikey" in
+		// particular is the spelling the published schema promises is covered.
+		{"integrations.apikey", true},
+		{"github.pat", true},
+		{"github.auth", true},
+		{"db.pwd", true},
+		{"db.passwd", true},
+		{"ssh.key", true},
+		{"registry.bearer", true},
+		{"aws.credentials", true},
+		{"tls.cert", true},
+		{"signing.private_key", true},
+
 		{"no-db", false},
 		{"json", false},
 		{"routing.mode", false},
 		{"sync.remote", false},
 		{"linear.team_id", false},
+
+		// The near misses that make the short spellings SEGMENT matches rather
+		// than substring matches. Redacting these would be a bug in the other
+		// direction: every one is an ordinary key that merely starts with a
+		// sensitive word.
+		{"issue.path", false},
+		{"export.pattern", false},
+		{"commit.author", false},
+		{"sort.keyword", false},
+		{"build.compat", false},
 	}
 
 	for _, tt := range tests {
@@ -631,6 +979,7 @@ func TestSecretKeyEnvVarHint(t *testing.T) {
 	}{
 		{"linear.api_key", "LINEAR_API_KEY"},
 		{"github.token", "GITHUB_TOKEN"},
+		{"notion.token", "NOTION_TOKEN"},
 		{"ai.api_key", "ANTHROPIC_API_KEY"},
 		{"custom.secret-token", "BD_CUSTOM_SECRET_TOKEN"},
 	}
@@ -671,18 +1020,23 @@ func TestCheckSecretKeyGitSafety_RefusesGitTrackedSecret(t *testing.T) {
 	}
 
 	// checkSecretGitTracked should refuse a secret key
-	err := checkSecretGitTracked(configPath, "linear.api_key")
-	if err == nil {
-		t.Fatal("expected error for secret key on git-tracked config, got nil")
-	}
-	if !strings.Contains(err.Error(), "refusing to write secret key") {
-		t.Fatalf("expected 'refusing to write' error, got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "LINEAR_API_KEY") {
-		t.Fatalf("expected env var hint in error, got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "--force-git-tracked") {
-		t.Fatalf("expected --force-git-tracked hint in error, got: %v", err)
+	for key, envVar := range map[string]string{
+		"linear.api_key": "LINEAR_API_KEY",
+		"notion.token":   "NOTION_TOKEN", // GH#6676
+	} {
+		err := checkSecretGitTracked(configPath, key)
+		if err == nil {
+			t.Fatalf("expected error for secret key %q on git-tracked config, got nil", key)
+		}
+		if !strings.Contains(err.Error(), "refusing to write secret key") {
+			t.Fatalf("expected 'refusing to write' error for %q, got: %v", key, err)
+		}
+		if !strings.Contains(err.Error(), envVar) {
+			t.Fatalf("expected env var hint %s in error, got: %v", envVar, err)
+		}
+		if !strings.Contains(err.Error(), "--force-git-tracked") {
+			t.Fatalf("expected --force-git-tracked hint in error, got: %v", err)
+		}
 	}
 }
 
@@ -710,7 +1064,7 @@ func TestCheckSecretKeyGitSafety_AllowsDatabaseBackedSecretKey(t *testing.T) {
 	}
 
 	// Secret-looking keys that are not YAML-backed do not write to config.yaml.
-	err := checkSecretGitTracked(configPath, "notion.token")
+	err := checkSecretGitTracked(configPath, "custom.api_token")
 	if err != nil {
 		t.Fatalf("expected no error for database-backed secret key, got: %v", err)
 	}
@@ -803,11 +1157,85 @@ func TestCommentOutYamlKey(t *testing.T) {
 			key:      "backup.enabled",
 			expected: "  # backup.enabled: true\nother: value",
 		},
+		{
+			// A flat key is a top-level key. A single-segment key must not
+			// match the same name nested under some other section: that is a
+			// different key, and the database-backed unset path would
+			// otherwise comment out backup.enabled to unset `enabled`.
+			name:     "single-segment key does not match a nested line",
+			content:  "backup:\n  enabled: true\n",
+			key:      "enabled",
+			expected: "backup:\n  enabled: true\n",
+		},
+		{
+			// Nor refuse on one: the nested `mode:` block is not this key's.
+			// A dedent ends the value: `k:` has nothing beneath it, since the
+			// next content line belongs to the parent's level, so it is
+			// commented like any empty-valued key.
+			name:     "empty nested key followed by a dedent is still commented",
+			content:  "outer:\n  k:\nz: 1\n",
+			key:      "outer.k",
+			expected: "outer:\n  # k:\nz: 1\n",
+		},
+		{
+			name:     "single-segment key ignores a nested block of the same name",
+			content:  "dolt:\n  mode:\n    x: 1\n",
+			key:      "mode",
+			expected: "dolt:\n  mode:\n    x: 1\n",
+		},
+		{
+			name:     "nested key preserves siblings and comments",
+			content:  "# Backup settings\nbackup:\n  enabled: false\n  interval: 15m\n",
+			key:      "backup.enabled",
+			expected: "# Backup settings\nbackup:\n  # enabled: false\n  interval: 15m\n",
+		},
+		{
+			name:     "nested key three levels deep",
+			content:  "a:\n  b:\n    c: 1\n",
+			key:      "a.b.c",
+			expected: "a:\n  b:\n    # c: 1\n",
+		},
+		{
+			name:     "key with an empty value and no block is still commented",
+			content:  "actor:\nother: value",
+			key:      "actor",
+			expected: "# actor:\nother: value",
+		},
+		{
+			name:     "key with an empty value at end of file is still commented",
+			content:  "other: value\nactor:",
+			key:      "actor",
+			expected: "other: value\n# actor:",
+		},
+		{
+			// A match must keep the file's trailing newline, and so must a
+			// miss: UnsetYamlConfig reports a write by comparing content, so a
+			// no-op that dropped the final newline would read as a change.
+			name:     "flat key preserves the trailing newline",
+			content:  "a: 1\n",
+			key:      "a",
+			expected: "# a: 1\n",
+		},
+		{
+			name:     "no match preserves the trailing newline",
+			content:  "other: value\n",
+			key:      "backup.enabled",
+			expected: "other: value\n",
+		},
+		{
+			name:     "flat key without a trailing newline stays without one",
+			content:  "a: 1",
+			key:      "a",
+			expected: "# a: 1",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := commentOutYamlKey(tt.content, tt.key)
+			got, err := commentOutYamlKey(tt.content, tt.key)
+			if err != nil {
+				t.Fatalf("commentOutYamlKey() error = %v", err)
+			}
 			if got != tt.expected {
 				t.Errorf("commentOutYamlKey() =\n%q\nwant:\n%q", got, tt.expected)
 			}
@@ -857,8 +1285,12 @@ other-setting: value
 	defer os.Chdir(oldWd)
 
 	// Test UnsetYamlConfig
-	if err := UnsetYamlConfig("backup.enabled"); err != nil {
+	changed, err := UnsetYamlConfig("backup.enabled")
+	if err != nil {
 		t.Fatalf("UnsetYamlConfig() error = %v", err)
+	}
+	if !changed {
+		t.Error("UnsetYamlConfig() changed = false, want true for a key present in config.yaml")
 	}
 
 	// Read back and verify
@@ -983,8 +1415,12 @@ func TestSetAndUnsetYamlConfig_WithBEADS_DIR_FromOutsideRepo(t *testing.T) {
 		t.Fatalf("expected runtime config to contain no-git-ops: true, got:\n%s", contentStr)
 	}
 
-	if err := UnsetYamlConfig("no-git-ops"); err != nil {
+	changed, err := UnsetYamlConfig("no-git-ops")
+	if err != nil {
 		t.Fatalf("UnsetYamlConfig() error = %v", err)
+	}
+	if !changed {
+		t.Error("UnsetYamlConfig() changed = false, want true for a key present in config.yaml")
 	}
 	content, err = os.ReadFile(configPath)
 	if err != nil {
@@ -996,5 +1432,295 @@ func TestSetAndUnsetYamlConfig_WithBEADS_DIR_FromOutsideRepo(t *testing.T) {
 	}
 	if !strings.Contains(contentStr, "other-setting: value") {
 		t.Fatalf("expected runtime config to preserve other settings, got:\n%s", contentStr)
+	}
+}
+
+// TestMetricsConsentResolvesUserGlobalOnly is the regression guard for the
+// metrics opt-out authority blocker on PR #4419: a user who runs `bd metrics
+// off` (or pins their own endpoint) in the user-global config must not have
+// that choice re-enabled or redirected by a repository's project/BEADS_DIR
+// config, which has the highest viper precedence in the merged config.
+func TestMetricsConsentResolvesUserGlobalOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	const userEndpoint = "https://user-global.example/collect"
+	const projectEndpoint = "https://project-override.example/collect"
+
+	// User opted out globally and pinned their own endpoint.
+	userCfgDir := filepath.Join(home, ".config", "bd")
+	if err := os.MkdirAll(userCfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir user config dir: %v", err)
+	}
+	userCfg := "metrics:\n  disabled: true\n  endpoint: " + userEndpoint + "\n"
+	if err := os.WriteFile(filepath.Join(userCfgDir, "config.yaml"), []byte(userCfg), 0o600); err != nil {
+		t.Fatalf("write user config: %v", err)
+	}
+
+	// A repository tries to re-enable metrics and redirect the endpoint through
+	// the highest-precedence BEADS_DIR config.
+	projectBeadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(projectBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir project .beads: %v", err)
+	}
+	projectCfg := "metrics.disabled: false\nmetrics.endpoint: " + projectEndpoint + "\n"
+	if err := os.WriteFile(filepath.Join(projectBeadsDir, "config.yaml"), []byte(projectCfg), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	t.Setenv("BEADS_DIR", projectBeadsDir)
+
+	ResetForTesting()
+	t.Cleanup(ResetForTesting)
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	// Precondition: the project override really is live in the merged config, so
+	// the assertions below prove the consent readers bypass it rather than just
+	// agreeing with an absent override.
+	if GetBool("metrics.disabled") {
+		t.Fatalf("precondition: merged metrics.disabled should be false (project override), got true")
+	}
+	if got := GetString("metrics.endpoint"); got != projectEndpoint {
+		t.Fatalf("precondition: merged metrics.endpoint = %q, want project override %q", got, projectEndpoint)
+	}
+
+	// Contract: consent + endpoint honor the user-global config only.
+	if !MetricsDisabledByUserConfig() {
+		t.Errorf("MetricsDisabledByUserConfig() = false; project config must not re-enable a user who opted out")
+	}
+	if got := UserMetricsEndpoint(); got != userEndpoint {
+		t.Errorf("UserMetricsEndpoint() = %q, want %q; project config must not redirect the endpoint", got, userEndpoint)
+	}
+}
+
+// TestGetUserYamlConfigIgnoresProjectOverride is the regression guard for the
+// `bd config get metrics.*` / effective-config-display finding on PR #4419: a
+// read of a user-global key must report the user-global value that actually
+// governs runtime metrics behavior, not the merged value a repository's
+// project/BEADS_DIR config (highest viper precedence) can shadow.
+// GetUserYamlConfig backs the config get / config show user-global path.
+func TestGetUserYamlConfigIgnoresProjectOverride(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	const userEndpoint = "https://user-global.example/collect"
+	const projectEndpoint = "https://project-override.example/collect"
+
+	userCfgDir := filepath.Join(home, ".config", "bd")
+	if err := os.MkdirAll(userCfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir user config dir: %v", err)
+	}
+	userCfg := "metrics:\n  disabled: true\n  endpoint: " + userEndpoint + "\n"
+	if err := os.WriteFile(filepath.Join(userCfgDir, "config.yaml"), []byte(userCfg), 0o600); err != nil {
+		t.Fatalf("write user config: %v", err)
+	}
+
+	// A repository tries to flip metrics and redirect the endpoint through the
+	// highest-precedence BEADS_DIR config.
+	projectBeadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(projectBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir project .beads: %v", err)
+	}
+	projectCfg := "metrics.disabled: false\nmetrics.endpoint: " + projectEndpoint + "\n"
+	if err := os.WriteFile(filepath.Join(projectBeadsDir, "config.yaml"), []byte(projectCfg), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+	t.Setenv("BEADS_DIR", projectBeadsDir)
+
+	ResetForTesting()
+	t.Cleanup(ResetForTesting)
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	// Precondition: the project override is live in the merged config, so the
+	// assertions below prove GetUserYamlConfig bypasses it rather than just
+	// agreeing with an absent override.
+	if GetBool("metrics.disabled") {
+		t.Fatalf("precondition: merged metrics.disabled should be false (project override), got true")
+	}
+
+	// Contract: a user-global key read reports the user-global value, matching
+	// what `bd metrics` actually honors — not the project override.
+	if got := GetUserYamlConfig("metrics.disabled"); got != "true" {
+		t.Errorf("GetUserYamlConfig(metrics.disabled) = %q, want %q; project config must not shadow the user-global value", got, "true")
+	}
+	if got := GetUserYamlConfig("metrics.endpoint"); got != userEndpoint {
+		t.Errorf("GetUserYamlConfig(metrics.endpoint) = %q, want %q; project config must not shadow the user-global value", got, userEndpoint)
+	}
+	// An unset user-global key reads as empty, never the project value.
+	if got := GetUserYamlConfig("metrics.notice_shown"); got != "" {
+		t.Errorf("GetUserYamlConfig(metrics.notice_shown) = %q, want empty (unset in user-global)", got)
+	}
+}
+
+// TestMetricsNoticeShownResolvesUserGlobalOnly guards the first-run disclosure
+// finding on PR #4419: metrics.notice_shown must be resolved from the user-global
+// config only, so a repository cannot set it true to suppress the one-time
+// disclosure for a user who has never seen it, and a repository setting it false
+// cannot force the notice to re-appear once the user has dismissed it globally.
+func TestMetricsNoticeShownResolvesUserGlobalOnly(t *testing.T) {
+	writeUserNotice := func(t *testing.T, home string, body string) {
+		t.Helper()
+		userCfgDir := filepath.Join(home, ".config", "bd")
+		if err := os.MkdirAll(userCfgDir, 0o755); err != nil {
+			t.Fatalf("mkdir user config dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(userCfgDir, "config.yaml"), []byte(body), 0o600); err != nil {
+			t.Fatalf("write user config: %v", err)
+		}
+	}
+	writeProjectNotice := func(t *testing.T, value string) {
+		t.Helper()
+		projectBeadsDir := filepath.Join(t.TempDir(), ".beads")
+		if err := os.MkdirAll(projectBeadsDir, 0o755); err != nil {
+			t.Fatalf("mkdir project .beads: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(projectBeadsDir, "config.yaml"),
+			[]byte("metrics.notice_shown: "+value+"\n"), 0o644); err != nil {
+			t.Fatalf("write project config: %v", err)
+		}
+		t.Setenv("BEADS_DIR", projectBeadsDir)
+	}
+
+	t.Run("project true cannot suppress an unseen notice", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+		// User-global has no notice marker; the repository tries to claim it was
+		// already shown via the highest-precedence project config.
+		writeProjectNotice(t, "true")
+
+		ResetForTesting()
+		t.Cleanup(ResetForTesting)
+		if err := Initialize(); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		if !GetBool("metrics.notice_shown") {
+			t.Fatalf("precondition: merged metrics.notice_shown should be true (project override)")
+		}
+		if MetricsNoticeShownByUserConfig() {
+			t.Errorf("MetricsNoticeShownByUserConfig() = true; a project must not suppress an unseen disclosure")
+		}
+	})
+
+	t.Run("user-global true is authoritative over project false", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+		writeUserNotice(t, home, "metrics:\n  notice_shown: true\n")
+		writeProjectNotice(t, "false")
+
+		ResetForTesting()
+		t.Cleanup(ResetForTesting)
+		if err := Initialize(); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		if GetBool("metrics.notice_shown") {
+			t.Fatalf("precondition: merged metrics.notice_shown should be false (project override)")
+		}
+		if !MetricsNoticeShownByUserConfig() {
+			t.Errorf("MetricsNoticeShownByUserConfig() = false; user-global true must win over project false")
+		}
+	})
+}
+
+// TestCheckSecretKeyGitSafety_RoutedCheckout covers the call site's two
+// environment shapes. The guard is fail-open — a probe that cannot answer reads
+// as "not tracked" reads as "allow the secret write" — so each shape has to be
+// pinned separately: neither probe alone answers both, and the existing tests
+// above are all in-tree-repo, which is the one shape that never needed either.
+func TestCheckSecretKeyGitSafety_RoutedCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("routed checkout fixture requires Git")
+	}
+	for _, entry := range os.Environ() {
+		key := gitenv.EntryKey(entry)
+		if gitenv.IsRoutingKeyForOS(key, runtime.GOOS) {
+			t.Setenv(key, "")
+			if err := os.Unsetenv(key); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	runGit := func(t *testing.T, dir string, env []string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir, cmd.Env = dir, env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture git %v: %v: %s", args, err, out)
+		}
+	}
+	writeConfig := func(t *testing.T, workTree string) string {
+		t.Helper()
+		beadsDir := filepath.Join(workTree, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		configPath := filepath.Join(beadsDir, "config.yaml")
+		if err := os.WriteFile(configPath, []byte("json: false\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return configPath
+	}
+
+	// The routed layout the scrub-only probe cannot see: the repository lives
+	// outside the work tree and is reachable only through GIT_DIR/GIT_WORK_TREE,
+	// so there is no in-tree .git for a scrubbed probe to discover from.
+	t.Run("legitimate routing refuses a tracked config", func(t *testing.T) {
+		root := t.TempDir()
+		gitDir, workTree := filepath.Join(root, "repo.git"), filepath.Join(root, "work")
+		if err := os.MkdirAll(workTree, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		clean := gitenv.ScrubRoutingAndSuppression(os.Environ())
+		runGit(t, root, clean, "init", "--quiet", "--bare", gitDir)
+		configPath := writeConfig(t, workTree)
+		routed := append(clean, "GIT_DIR="+gitDir, "GIT_WORK_TREE="+workTree)
+		runGit(t, workTree, routed, "add", "--", ".beads/config.yaml")
+
+		t.Setenv("GIT_DIR", gitDir)
+		t.Setenv("GIT_WORK_TREE", workTree)
+		err := checkSecretGitTracked(configPath, "linear.api_key")
+		if err == nil {
+			t.Fatal("secret write allowed into a tracked config: the guard lost its only view of the repository")
+		}
+		if !strings.Contains(err.Error(), "refusing to write secret key") {
+			t.Fatalf("expected a refusal, got: %v", err)
+		}
+	})
+
+	// The poisoned layout the inherited probe cannot see. Pinned alongside so
+	// the fallback above cannot be widened into a way around the scrub.
+	t.Run("poisoned routing still refuses a tracked config", func(t *testing.T) {
+		root, decoy := t.TempDir(), t.TempDir()
+		clean := gitenv.ScrubRoutingAndSuppression(os.Environ())
+		runGit(t, root, clean, "init", "--quiet")
+		runGit(t, decoy, clean, "init", "--quiet")
+		configPath := writeConfig(t, root)
+		runGit(t, root, clean, "add", "--", ".beads/config.yaml")
+
+		t.Setenv("GIT_DIR", filepath.Join(decoy, ".git"))
+		t.Setenv("GIT_WORK_TREE", decoy)
+		err := checkSecretGitTracked(configPath, "linear.api_key")
+		if err == nil {
+			t.Fatal("secret write allowed into a tracked config: an inherited GIT_DIR hid the file behind a decoy repository")
+		}
+		if !strings.Contains(err.Error(), "refusing to write secret key") {
+			t.Fatalf("expected a refusal, got: %v", err)
+		}
+	})
+}
+
+func TestDoltRemotesAPIPortIsUserGlobal(t *testing.T) {
+	if !IsUserGlobalKey("dolt.remotesapi-port") {
+		t.Fatal("dolt.remotesapi-port must be machine-global; a project config cannot vary one shared server")
 	}
 }

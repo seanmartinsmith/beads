@@ -1,6 +1,9 @@
 package db
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage/domain"
@@ -16,13 +19,22 @@ func (s *testSuite) TestIssueGetReadyWork() {
 	s.Run("ExcludesDefaultTypes", s.readyExcludesDefaultTypes)
 	s.Run("FilterByPriority", s.readyFilterByPriority)
 	s.Run("FilterByAssignee", s.readyFilterByAssignee)
+	s.Run("FilterByType", s.readyFilterByType)
+	s.Run("FilterByParent", s.readyFilterByParent)
+	s.Run("FilterByMetadataEquality", s.readyFilterByMetadataEquality)
+	s.Run("FilterByMetadataKeyPresence", s.readyFilterByMetadataKeyPresence)
+	s.Run("ExcludesRequestedTypes", s.readyExcludesRequestedTypes)
 	s.Run("Unassigned", s.readyUnassigned)
 	s.Run("ExcludesDeferred", s.readyExcludesDeferred)
 	s.Run("IncludeDeferred", s.readyIncludeDeferred)
 	s.Run("LabelFilter", s.readyLabelFilter)
 	s.Run("LimitRespected", s.readyLimitRespected)
 	s.Run("SortByPriority", s.readySortByPriority)
-	s.Run("CrossTableCollisionError", s.readyCollisionError)
+	s.Run("CrossTableCollisionKeepsTheWispCopy", s.readyCollisionKeepsTheWispCopy)
+	s.Run("OffsetSkipsLeadingRows", s.readyOffsetSkipsLeadingRows)
+	s.Run("OffsetWithLooseLimitReturnsRemainder", s.readyOffsetWithoutLimit)
+	s.Run("OffsetHasMoreSignaling", s.readyOffsetHasMoreSignaling)
+	s.Run("OffsetWalksAllPages", s.readyOffsetWalksAllPages)
 }
 
 func (s *testSuite) readyOpenAndInProgress() {
@@ -99,6 +111,14 @@ func (s *testSuite) readyExcludesDefaultTypes() {
 	gate.IssueType = types.TypeGate
 	s.Require().NoError(r.Insert(s.Ctx(), gate, "tester", domain.InsertIssueOpts{}))
 
+	rig := newTestIssue("bd-rdy-dt-rig", "rig")
+	rig.IssueType = types.IssueType("rig")
+	s.Require().NoError(r.Insert(s.Ctx(), rig, "tester", domain.InsertIssueOpts{}))
+
+	message := newTestIssue("bd-rdy-dt-message", "message")
+	message.IssueType = types.TypeMessage
+	s.Require().NoError(r.Insert(s.Ctx(), message, "tester", domain.InsertIssueOpts{}))
+
 	task := newTestIssue("bd-rdy-dt-task", "task")
 	s.Require().NoError(r.Insert(s.Ctx(), task, "tester", domain.InsertIssueOpts{}))
 
@@ -108,6 +128,8 @@ func (s *testSuite) readyExcludesDefaultTypes() {
 	s.Contains(got, "bd-rdy-dt-task")
 	s.NotContains(got, "bd-rdy-dt-mol")
 	s.NotContains(got, "bd-rdy-dt-gate")
+	s.NotContains(got, "bd-rdy-dt-rig")
+	s.NotContains(got, "bd-rdy-dt-message")
 }
 
 func (s *testSuite) readyFilterByPriority() {
@@ -142,6 +164,92 @@ func (s *testSuite) readyFilterByAssignee() {
 	got := issueIDsFrom(out)
 	s.Contains(got, "bd-rdy-as-mine")
 	s.NotContains(got, "bd-rdy-as-theirs")
+}
+
+func (s *testSuite) readyFilterByType() {
+	r := s.issueRepo()
+	bug := newTestIssue("bd-rdy-typ-bug", "bug")
+	bug.IssueType = types.TypeBug
+	s.Require().NoError(r.Insert(s.Ctx(), bug, "tester", domain.InsertIssueOpts{}))
+	task := newTestIssue("bd-rdy-typ-task", "task")
+	s.Require().NoError(r.Insert(s.Ctx(), task, "tester", domain.InsertIssueOpts{}))
+
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{Type: string(types.TypeBug)})
+	s.Require().NoError(err)
+	got := issueIDsFrom(out)
+	s.Contains(got, bug.ID)
+	s.NotContains(got, task.ID)
+}
+
+func (s *testSuite) readyFilterByParent() {
+	r := s.issueRepo()
+	parent := newTestIssue("bd-rdy-par-root", "parent")
+	parent.IssueType = types.TypeEpic
+	s.Require().NoError(r.Insert(s.Ctx(), parent, "tester", domain.InsertIssueOpts{}))
+	child := newTestIssue("bd-rdy-par-child", "child")
+	s.Require().NoError(r.Insert(s.Ctx(), child, "tester", domain.InsertIssueOpts{}))
+	outside := newTestIssue("bd-rdy-par-outside", "outside")
+	s.Require().NoError(r.Insert(s.Ctx(), outside, "tester", domain.InsertIssueOpts{}))
+	s.Require().NoError(s.depRepo().Insert(s.Ctx(),
+		newDep(child.ID, parent.ID, types.DepParentChild), "tester", domain.DepInsertOpts{}))
+
+	parentID := parent.ID
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{ParentID: &parentID})
+	s.Require().NoError(err)
+	got := issueIDsFrom(out)
+	s.Contains(got, child.ID)
+	s.NotContains(got, outside.ID)
+}
+
+func (s *testSuite) readyFilterByMetadataEquality() {
+	r := s.issueRepo()
+	match := newTestIssue("bd-rdy-meta-match", "matches metadata")
+	match.Metadata = json.RawMessage(`{"team":"platform"}`)
+	s.Require().NoError(r.Insert(s.Ctx(), match, "tester", domain.InsertIssueOpts{}))
+	other := newTestIssue("bd-rdy-meta-other", "other metadata")
+	other.Metadata = json.RawMessage(`{"team":"frontend"}`)
+	s.Require().NoError(r.Insert(s.Ctx(), other, "tester", domain.InsertIssueOpts{}))
+
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{MetadataFields: map[string]string{"team": "platform"}})
+	s.Require().NoError(err)
+	got := issueIDsFrom(out)
+	s.Contains(got, match.ID)
+	s.NotContains(got, other.ID)
+}
+
+func (s *testSuite) readyFilterByMetadataKeyPresence() {
+	r := s.issueRepo()
+	withKey := newTestIssue("bd-rdy-metakey-yes", "has metadata key")
+	withKey.Metadata = json.RawMessage(`{"team":"platform"}`)
+	s.Require().NoError(r.Insert(s.Ctx(), withKey, "tester", domain.InsertIssueOpts{}))
+	withoutKey := newTestIssue("bd-rdy-metakey-no", "missing metadata key")
+	withoutKey.Metadata = json.RawMessage(`{"area":"cli"}`)
+	s.Require().NoError(r.Insert(s.Ctx(), withoutKey, "tester", domain.InsertIssueOpts{}))
+
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{HasMetadataKey: "team"})
+	s.Require().NoError(err)
+	got := issueIDsFrom(out)
+	s.Contains(got, withKey.ID)
+	s.NotContains(got, withoutKey.ID)
+}
+
+func (s *testSuite) readyExcludesRequestedTypes() {
+	r := s.issueRepo()
+	task := newTestIssue("bd-rdy-excl-task", "task")
+	s.Require().NoError(r.Insert(s.Ctx(), task, "tester", domain.InsertIssueOpts{}))
+	bug := newTestIssue("bd-rdy-excl-bug", "bug")
+	bug.IssueType = types.TypeBug
+	s.Require().NoError(r.Insert(s.Ctx(), bug, "tester", domain.InsertIssueOpts{}))
+	epic := newTestIssue("bd-rdy-excl-epic", "epic")
+	epic.IssueType = types.TypeEpic
+	s.Require().NoError(r.Insert(s.Ctx(), epic, "tester", domain.InsertIssueOpts{}))
+
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{ExcludeTypes: []types.IssueType{types.TypeBug, types.TypeEpic}})
+	s.Require().NoError(err)
+	got := issueIDsFrom(out)
+	s.Contains(got, task.ID)
+	s.NotContains(got, bug.ID)
+	s.NotContains(got, epic.ID)
 }
 
 func (s *testSuite) readyUnassigned() {
@@ -240,7 +348,17 @@ func (s *testSuite) readySortByPriority() {
 	s.Less(midIdx, loIdx, "priority=2 should sort before priority=3")
 }
 
-func (s *testSuite) readyCollisionError() {
+// readyCollisionKeepsTheWispCopy pins what a CROSS-PLANE DUPLICATE answers with. One id resident in both
+// tables is corruption — no local write path can produce it, only replication —
+// and this read used to fail the whole query over it, which left a store with
+// one bad id unable to answer any question about the others.
+//
+// The canonical copy is the WISPS one, and the read answers with it. That is
+// the verdict the per-table seam has always reached (issueops, be-iabdi) and
+// the one `bd doctor --check=validate --fix` acts on: it deletes the stale
+// ISSUES copy, the same row this drops. scanIDSrcPage carries the full
+// argument.
+func (s *testSuite) readyCollisionKeepsTheWispCopy() {
 	r := s.issueRepo()
 	const id = "bd-rdy-coll-1"
 	s.Require().NoError(r.Insert(s.Ctx(), newTestIssue(id, "perm"), "tester", domain.InsertIssueOpts{}))
@@ -248,9 +366,160 @@ func (s *testSuite) readyCollisionError() {
 	w.Ephemeral = false
 	s.Require().NoError(r.Insert(s.Ctx(), w, "tester", domain.InsertIssueOpts{UseWispsTable: true}))
 
-	_, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{})
-	s.Require().Error(err)
-	s.Contains(err.Error(), "exists in both issues and wisps")
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{})
+	s.Require().NoError(err)
+	seen := 0
+	for _, iss := range out.Items {
+		if iss != nil && iss.ID == id {
+			seen++
+			s.Equal("wisp", iss.Title, "the wisps copy is canonical; the issues copy is the stale one")
+		}
+	}
+	s.Equal(1, seen, "the id must come back once, not once per plane")
+}
+
+func (s *testSuite) readyOffsetSkipsLeadingRows() {
+	r := s.issueRepo()
+	labelRepo := NewLabelSQLRepository(s.Runner())
+	const isoLabel = "rdy-off-isolate"
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("bd-rdy-off-p%d", i)
+		iss := newTestIssue(id, fmt.Sprintf("p%d", i))
+		iss.Priority = i
+		s.Require().NoError(r.Insert(s.Ctx(), iss, "tester", domain.InsertIssueOpts{}))
+		s.Require().NoError(labelRepo.Insert(s.Ctx(), id, isoLabel, "tester", domain.LabelOpts{}))
+	}
+
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{
+		Offset:     2,
+		Limit:      2,
+		SortPolicy: types.SortPolicyPriority,
+		Labels:     []string{isoLabel},
+	})
+	s.Require().NoError(err)
+	got := issueIDsFrom(out)
+
+	s.Require().Len(got, 2, "expected exactly 2 paginated results, got %v", got)
+	s.Equal("bd-rdy-off-p3", got[0], "Offset=2 must skip p1+p2")
+	s.Equal("bd-rdy-off-p4", got[1], "Limit=2 must stop after p4")
+}
+
+func (s *testSuite) readyOffsetWithoutLimit() {
+	r := s.issueRepo()
+	labelRepo := NewLabelSQLRepository(s.Runner())
+	const n = 5
+	const isoLabel = "rdy-owl-isolate"
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("bd-rdy-owl-p%d", i)
+		iss := newTestIssue(id, fmt.Sprintf("p%d", i))
+		iss.Priority = i
+		s.Require().NoError(r.Insert(s.Ctx(), iss, "tester", domain.InsertIssueOpts{}))
+		s.Require().NoError(labelRepo.Insert(s.Ctx(), id, isoLabel, "tester", domain.LabelOpts{}))
+	}
+
+	out, err := r.GetReadyWork(s.Ctx(), types.WorkFilter{
+		Offset:     3,
+		Limit:      100,
+		SortPolicy: types.SortPolicyPriority,
+		Labels:     []string{isoLabel},
+	})
+	s.Require().NoError(err)
+
+	s.Require().Len(out.Items, n-3, "Offset=3 must skip 3 of 5, got %v", issueIDsFrom(out))
+	s.Equal("bd-rdy-owl-p4", out.Items[0].ID, "first remaining row must be p4")
+	s.Equal("bd-rdy-owl-p5", out.Items[1].ID, "second remaining row must be p5")
+}
+
+func (s *testSuite) readyOffsetHasMoreSignaling() {
+	r := s.issueRepo()
+	labelRepo := NewLabelSQLRepository(s.Runner())
+	const n = 6
+	const isoLabel = "rdy-hms-isolate"
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("bd-rdy-hms-p%d", i)
+		iss := newTestIssue(id, fmt.Sprintf("p%d", i))
+		iss.Priority = 1
+		s.Require().NoError(r.Insert(s.Ctx(), iss, "tester", domain.InsertIssueOpts{}))
+		s.Require().NoError(labelRepo.Insert(s.Ctx(), id, isoLabel, "tester", domain.LabelOpts{}))
+	}
+	filter := types.WorkFilter{
+		Labels:     []string{isoLabel},
+		SortPolicy: types.SortPolicyPriority,
+	}
+
+	first, err := r.GetReadyWork(s.Ctx(), withOffsetLimit(filter, 0, 3))
+	s.Require().NoError(err)
+	s.Require().Len(first.Items, 3, "page 1 should have exactly 3 items")
+	s.True(first.HasMore, "HasMore must be true when more rows exist beyond Limit")
+
+	boundary, err := r.GetReadyWork(s.Ctx(), withOffsetLimit(filter, 3, 3))
+	s.Require().NoError(err)
+	s.Require().Len(boundary.Items, 3, "boundary page should fill exactly")
+	s.False(boundary.HasMore, "HasMore must be false at exact boundary (N+1 overfetch returns no extra)")
+
+	partial, err := r.GetReadyWork(s.Ctx(), withOffsetLimit(filter, 4, 3))
+	s.Require().NoError(err)
+	s.Require().Len(partial.Items, 2, "tail page should return remaining 2 items")
+	s.False(partial.HasMore, "HasMore must be false on the partial tail page")
+}
+
+func withOffsetLimit(base types.WorkFilter, offset, limit int) types.WorkFilter {
+	base.Offset = offset
+	base.Limit = limit
+	return base
+}
+
+func (s *testSuite) readyOffsetWalksAllPages() {
+	r := s.issueRepo()
+	labelRepo := NewLabelSQLRepository(s.Runner())
+	const n = 6
+	const pageSize = 2
+	const isoLabel = "rdy-walk-isolate"
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("bd-rdy-walk-p%d", i)
+		iss := newTestIssue(id, fmt.Sprintf("p%d", i))
+		iss.Priority = 1
+		s.Require().NoError(r.Insert(s.Ctx(), iss, "tester", domain.InsertIssueOpts{}))
+		s.Require().NoError(labelRepo.Insert(s.Ctx(), id, isoLabel, "tester", domain.LabelOpts{}))
+	}
+	base := types.WorkFilter{Labels: []string{isoLabel}, SortPolicy: types.SortPolicyPriority}
+
+	unpaginated, err := r.GetReadyWork(s.Ctx(), withOffsetLimit(base, 0, 0))
+	s.Require().NoError(err)
+	s.Require().Len(unpaginated.Items, n, "baseline must return all %d items", n)
+	wantIDs := issueIDsFrom(unpaginated)
+
+	var walked []string
+	for page := 0; ; page++ {
+		offset := page * pageSize
+		got, err := r.GetReadyWork(s.Ctx(), withOffsetLimit(base, offset, pageSize))
+		s.Require().NoError(err)
+		for _, iss := range got.Items {
+			walked = append(walked, iss.ID)
+		}
+		if !got.HasMore {
+			if page == 0 || page == 1 {
+				s.Failf("HasMore false too early", "page %d HasMore=false (only walked %d/%d)", page, len(walked), n)
+			}
+			break
+		}
+		if page > n {
+			s.Failf("walk did not terminate", "more than %d pages", n)
+			break
+		}
+	}
+
+	s.Equal(wantIDs, walked, "concatenated pages must equal the full unpaginated result with no gaps or duplicates")
+}
+
+func filterPrefix(ids []string, prefix string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if strings.HasPrefix(id, prefix) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func issueIDsFrom(page domain.SearchPage) []string {

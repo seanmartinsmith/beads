@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -16,10 +17,10 @@ type blockingDepRecord struct {
 }
 
 func optionalBlockedTable(table string) bool {
-	return table == "wisps" || table == "wisp_dependencies"
+	return sqlbuild.OptionalWispTable(table)
 }
 
-func loadBlockingDepsForIssueIDsInTx(ctx context.Context, tx *sql.Tx, depTables []string, issueIDs []string) ([]blockingDepRecord, error) {
+func loadBlockingDepsForIssueIDsInTx(ctx context.Context, tx DBTX, depTables []string, issueIDs []string) ([]blockingDepRecord, error) {
 	var deps []blockingDepRecord
 	for _, depTable := range depTables {
 		//nolint:gosec // G201: depTable is a hardcoded constant.
@@ -53,7 +54,7 @@ func loadBlockingDepsForIssueIDsInTx(ctx context.Context, tx *sql.Tx, depTables 
 	return deps, nil
 }
 
-func loadParentIDsForChildrenInTx(ctx context.Context, tx *sql.Tx, depTables []string, childIDs []string) (map[string]string, error) {
+func loadParentIDsForChildrenInTx(ctx context.Context, tx DBTX, depTables []string, childIDs []string) (map[string]string, error) {
 	childParents := make(map[string]string)
 	for _, depTable := range depTables {
 		//nolint:gosec // G201: depTable is a hardcoded constant.
@@ -88,7 +89,7 @@ func loadParentIDsForChildrenInTx(ctx context.Context, tx *sql.Tx, depTables []s
 }
 
 //nolint:gosec // G201: tables are hardcoded
-func GetChildrenWithParentsInTx(ctx context.Context, tx *sql.Tx, parentIDs []string) (map[string]string, error) {
+func GetChildrenWithParentsInTx(ctx context.Context, tx DBTX, parentIDs []string) (map[string]string, error) {
 	if len(parentIDs) == 0 {
 		return nil, nil
 	}
@@ -124,7 +125,7 @@ func GetChildrenWithParentsInTx(ctx context.Context, tx *sql.Tx, parentIDs []str
 }
 
 //nolint:gosec // G201: tables are hardcoded
-func GetChildrenOfIssuesInTx(ctx context.Context, tx *sql.Tx, parentIDs []string) ([]string, error) {
+func GetChildrenOfIssuesInTx(ctx context.Context, tx DBTX, parentIDs []string) ([]string, error) {
 	if len(parentIDs) == 0 {
 		return nil, nil
 	}
@@ -159,43 +160,15 @@ func GetChildrenOfIssuesInTx(ctx context.Context, tx *sql.Tx, parentIDs []string
 	return children, nil
 }
 
-func GetDescendantIDsInTx(ctx context.Context, tx *sql.Tx, rootID string, maxDepth int) ([]string, error) {
+func GetDescendantIDsInTx(ctx context.Context, tx DBTX, rootID string, maxDepth int) ([]string, error) {
 	if rootID == "" {
 		return nil, nil
 	}
 
 	queryDescendants := func(includeWisps bool) ([]string, bool, error) {
-		edgeQuery := fmt.Sprintf(`
-			SELECT issue_id, %s FROM dependencies WHERE type = 'parent-child'
-		`, DepTargetExpr)
-		if includeWisps {
-			edgeQuery += fmt.Sprintf(`
-			UNION ALL
-			SELECT issue_id, %s FROM wisp_dependencies WHERE type = 'parent-child'
-		`, DepTargetExpr)
-		}
-
-		//nolint:gosec // G201: edgeQuery is built from hardcoded SQL plus DepTargetExpr (no user input)
-		query := fmt.Sprintf(`
-			WITH RECURSIVE
-			parent_edges(issue_id, depends_on_id) AS (
-				%s
-			),
-			descendants(id, depth, path) AS (
-				SELECT issue_id, 1, CONCAT(',', ?, ',', issue_id, ',')
-				FROM parent_edges
-				WHERE depends_on_id = ?
-				UNION ALL
-				SELECT e.issue_id, d.depth + 1, CONCAT(d.path, e.issue_id, ',')
-				FROM parent_edges e
-				JOIN descendants d ON e.depends_on_id = d.id
-				WHERE (? <= 0 OR d.depth < ?)
-				  AND LOCATE(CONCAT(',', e.issue_id, ','), d.path) = 0
-			)
-			SELECT id, depth FROM descendants WHERE id <> ?
-		`, edgeQuery)
-
-		rows, err := tx.QueryContext(ctx, query, rootID, rootID, maxDepth, maxDepth, rootID)
+		rows, err := tx.QueryContext(ctx,
+			sqlbuild.DescendantWalkQuery(includeWisps),
+			sqlbuild.DescendantWalkArgs(rootID, maxDepth, includeWisps)...)
 		if err != nil {
 			return nil, false, err
 		}
@@ -237,15 +210,25 @@ func GetDescendantIDsInTx(ctx context.Context, tx *sql.Tx, rootID string, maxDep
 }
 
 //nolint:gosec // G201: tables are hardcoded
-func GetBlockedIssuesInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter) ([]*types.BlockedIssue, error) {
+func GetBlockedIssuesInTx(ctx context.Context, tx DBTX, filter types.WorkFilter) ([]*types.BlockedIssue, error) {
 	var blockedIDList []string
 	blockedSet := make(map[string]bool)
-	for _, table := range []string{"issues", "wisps"} {
-		//nolint:gosec // G201: table is one of two hardcoded values.
+	// Label predicates are applied here, in the per-table scan, rather than to
+	// the assembled results: issues and wisps keep their labels in different
+	// tables, and filtering at the source also spares the blocker-dependency
+	// and hydration passes below any work on rows that cannot survive.
+	for _, tables := range []sqlbuild.FilterTables{IssuesFilterTables, WispsFilterTables} {
+		table := tables.Main
+		labelWhere, labelArgs := sqlbuild.LabelSetClauses("id", tables, filter.Labels, filter.LabelsAny, filter.ExcludeLabels)
+		labelClause := ""
+		if len(labelWhere) > 0 {
+			labelClause = " AND " + strings.Join(labelWhere, " AND ")
+		}
+		//nolint:gosec // G201: table is one of two hardcoded values; labelClause is literal SQL plus ? placeholders.
 		rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 			SELECT id FROM %s
-			WHERE is_blocked = 1 AND status <> 'closed' AND status <> 'pinned'
-		`, table))
+			WHERE is_blocked = 1 AND status <> 'closed' AND status <> 'pinned'%s
+		`, table, labelClause), labelArgs...)
 		if err != nil {
 			if optionalBlockedTable(table) && isTableNotExistError(err) {
 				continue

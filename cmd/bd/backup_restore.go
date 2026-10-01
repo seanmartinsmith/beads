@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -29,8 +30,17 @@ Use --force to overwrite an existing database with the backup contents.
 
 The database must already be initialized (run 'bd init' first if needed).
 To initialize and restore in one step, use: bd init && bd backup restore`,
-	Args: cobra.MaximumNArgs(1),
+	Args:          cobra.MaximumNArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("backup-restore")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		ctx := rootCtx
 
 		var dir string
@@ -50,14 +60,24 @@ To initialize and restore in one step, use: bd init && bd backup restore`,
 
 		force, _ := cmd.Flags().GetBool("force")
 
-		if err := runBackupRestore(ctx, store, dir, force); err != nil {
+		if usesProxiedServer() {
+			if err := runBackupRestoreProxied(ctx, dir, force); err != nil {
+				return err
+			}
+		} else if err := runBackupRestore(ctx, store, dir, force); err != nil {
 			return err
 		}
 
-		if !jsonOutput {
-			fmt.Printf("%s Restore complete\n", ui.RenderPass("✓"))
+		// One success report for both topologies. Under --json this used to
+		// print nothing at all, which left a caller unable to tell a completed
+		// restore from a silently skipped one.
+		if jsonOutput {
+			return outputJSON(map[string]interface{}{
+				"restored": true,
+				"source":   dir,
+			})
 		}
-
+		fmt.Printf("%s Restore complete\n", ui.RenderPass("✓"))
 		return nil
 	},
 }

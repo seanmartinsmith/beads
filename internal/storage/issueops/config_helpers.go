@@ -2,7 +2,6 @@ package issueops
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -47,7 +46,7 @@ func ParseCommaSeparatedList(value string) []string {
 	return result
 }
 
-func ResolveCustomConfigInTx(ctx context.Context, tx *sql.Tx) (statuses []types.CustomStatus, customTypes []string, err error) {
+func ResolveCustomConfigInTx(ctx context.Context, tx DBTX) (statuses []types.CustomStatus, customTypes []string, err error) {
 	statuses, statusesFromTable, err := resolveCustomStatusesFromTableInTx(ctx, tx)
 	if err != nil {
 		return nil, nil, err
@@ -57,7 +56,7 @@ func ResolveCustomConfigInTx(ctx context.Context, tx *sql.Tx) (statuses []types.
 		return nil, nil, err
 	}
 	if statusesFromTable && typesFromTable {
-		return statuses, customTypes, nil
+		return statuses, ComposeCustomTypes(customTypes, "", config.GetCustomTypesFromYAML()), nil
 	}
 
 	cfg, err := getConfigKeysInTx(ctx, tx, "status.custom", "types.custom")
@@ -67,12 +66,8 @@ func ResolveCustomConfigInTx(ctx context.Context, tx *sql.Tx) (statuses []types.
 				statuses = ParseStatusFallback(yamlStatuses)
 			}
 		}
-		if !typesFromTable {
-			if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
-				customTypes = yamlTypes
-			}
-		}
-		return statuses, customTypes, nil
+		// The types.custom row is unreadable; the remaining layers still compose.
+		return statuses, ComposeCustomTypes(customTypes, "", config.GetCustomTypesFromYAML()), nil
 	}
 
 	if !statusesFromTable {
@@ -84,22 +79,10 @@ func ResolveCustomConfigInTx(ctx context.Context, tx *sql.Tx) (statuses []types.
 			statuses = ParseStatusFallback(yamlStatuses)
 		}
 	}
-	if !typesFromTable {
-		if v := cfg["types.custom"]; v != "" {
-			var jsonTypes []string
-			if jsonErr := json.Unmarshal([]byte(v), &jsonTypes); jsonErr == nil {
-				customTypes = jsonTypes
-			} else {
-				customTypes = ParseCommaSeparatedList(v)
-			}
-		} else if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
-			customTypes = yamlTypes
-		}
-	}
-	return statuses, customTypes, nil
+	return statuses, ComposeCustomTypes(customTypes, cfg["types.custom"], config.GetCustomTypesFromYAML()), nil
 }
 
-func resolveCustomStatusesFromTableInTx(ctx context.Context, tx *sql.Tx) ([]types.CustomStatus, bool, error) {
+func resolveCustomStatusesFromTableInTx(ctx context.Context, tx DBTX) ([]types.CustomStatus, bool, error) {
 	rows, err := tx.QueryContext(ctx, "SELECT name, category FROM custom_statuses ORDER BY name")
 	if err != nil {
 		return nil, false, nil
@@ -122,7 +105,7 @@ func resolveCustomStatusesFromTableInTx(ctx context.Context, tx *sql.Tx) ([]type
 	return result, len(result) > 0, nil
 }
 
-func resolveCustomTypesFromTableInTx(ctx context.Context, tx *sql.Tx) ([]string, bool, error) {
+func resolveCustomTypesFromTableInTx(ctx context.Context, tx DBTX) ([]string, bool, error) {
 	rows, err := tx.QueryContext(ctx, "SELECT name FROM custom_types ORDER BY name")
 	if err != nil {
 		return nil, false, nil
@@ -142,7 +125,7 @@ func resolveCustomTypesFromTableInTx(ctx context.Context, tx *sql.Tx) ([]string,
 	return result, len(result) > 0, nil
 }
 
-func getConfigKeysInTx(ctx context.Context, tx *sql.Tx, keys ...string) (map[string]string, error) {
+func getConfigKeysInTx(ctx context.Context, tx DBTX, keys ...string) (map[string]string, error) {
 	if len(keys) == 0 {
 		return map[string]string{}, nil
 	}
@@ -175,16 +158,20 @@ func getConfigKeysInTx(ctx context.Context, tx *sql.Tx, keys ...string) (map[str
 // doesn't exist (pre-migration databases).
 // Returns nil on parse errors (degraded mode). Does not cache or log —
 // callers layer those concerns on top.
-func ResolveCustomStatusesDetailedInTx(ctx context.Context, tx *sql.Tx) ([]types.CustomStatus, error) {
+func ResolveCustomStatusesDetailedInTx(ctx context.Context, tx DBTX) ([]types.CustomStatus, error) {
 	// Try the normalized table first
 	rows, err := tx.QueryContext(ctx, "SELECT name, category FROM custom_statuses ORDER BY name")
-	if err == nil {
+	if err != nil {
+		if !isTableNotExistError(err) {
+			return nil, fmt.Errorf("query custom_statuses: %w", err)
+		}
+	} else {
 		defer rows.Close()
 		var result []types.CustomStatus
 		for rows.Next() {
 			var name, category string
 			if err := rows.Scan(&name, &category); err != nil {
-				continue
+				return nil, fmt.Errorf("scan custom_statuses: %w", err)
 			}
 			result = append(result, types.CustomStatus{
 				Name:     name,
@@ -226,6 +213,26 @@ func ResolveCustomStatusesDetailedInTx(ctx context.Context, tx *sql.Tx) ([]types
 	return nil, nil
 }
 
+// ReopenCategoryInTx resolves the reopen category for status from the same
+// transaction that will perform the state change. Unknown and malformed custom
+// statuses are treated as unspecified so callers leave them unchanged.
+func ReopenCategoryInTx(ctx context.Context, tx DBTX, status types.Status) (types.StatusCategory, error) {
+	if status.IsValid() {
+		return types.BuiltInStatusCategory(status), nil
+	}
+
+	statuses, err := ResolveCustomStatusesDetailedInTx(ctx, tx)
+	if err != nil {
+		return types.CategoryUnspecified, fmt.Errorf("resolve custom statuses: %w", err)
+	}
+	for _, custom := range statuses {
+		if custom.Name == string(status) {
+			return custom.Category, nil
+		}
+	}
+	return types.CategoryUnspecified, nil
+}
+
 // ResolveCustomTypesInTx reads custom issue types from the custom_types table,
 // falling back to config string when the table is empty or pre-migration,
 // and always overlay-unions project-extension types from .beads/config.yaml on
@@ -239,7 +246,7 @@ func ResolveCustomStatusesDetailedInTx(ctx context.Context, tx *sql.Tx) ([]types
 // whose type is in none still fails cleanly.
 //
 // Does not cache — callers layer caching on top.
-func ResolveCustomTypesInTx(ctx context.Context, tx *sql.Tx) ([]string, error) {
+func ResolveCustomTypesInTx(ctx context.Context, tx DBTX) ([]string, error) {
 	var fromDB []string
 
 	// Try the normalized table first.
@@ -262,27 +269,42 @@ func ResolveCustomTypesInTx(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	// fallback. The table-empty case is intentional: schema migration creates the
 	// table but may not have populated it from the existing types.custom config
 	// string yet.
+	var configValue string
 	if len(fromDB) == 0 {
 		value, err := GetConfigInTx(ctx, tx, "types.custom")
 		if err != nil {
 			return customTypesYAMLFallback(config.GetCustomTypesFromYAML, err)
 		}
-		if value != "" {
-			// Try JSON array first (e.g. '["gate","convoy"]'), fall back to comma-separated.
-			var jsonTypes []string
-			if err := json.Unmarshal([]byte(value), &jsonTypes); err == nil {
-				fromDB = jsonTypes
-			} else {
-				fromDB = ParseCommaSeparatedList(value)
-			}
-		}
+		configValue = value
 	}
+	return ComposeCustomTypes(fromDB, configValue, config.GetCustomTypesFromYAML()), nil
+}
 
-	// Overlay-union with YAML types.custom regardless of the DB-side result.
-	// gastownhall/beads#4024: project-extension types declared in .beads/config.yaml
-	// must validate server-side even when the database side hasn't been migrated
-	// or populated with those types.
-	return mergeWithYAMLCustomTypes(fromDB, config.GetCustomTypesFromYAML), nil
+// ComposeCustomTypes is the single rule for which custom issue types a
+// workspace has. Every reader of the three sources — the resolvers here, the
+// proxied-server config repository, and therefore both `bd types` and
+// create/update validation in every mode — composes them through this
+// function, so the listed set and the accepted set cannot drift apart:
+//
+//  1. the custom_types table, when it has rows;
+//  2. otherwise the types.custom config row (CSV or JSON array), which covers
+//     databases whose table has not been populated yet;
+//  3. always unioned with config.yaml types.custom, the project-extension
+//     overlay (gastownhall/beads#4024).
+//
+// Names are trimmed, empties dropped and duplicates removed; database types
+// keep their order and YAML-only types are appended in declared order.
+// Returns nil when no layer supplies a type.
+func ComposeCustomTypes(fromTable []string, configValue string, yamlTypes []string) []string {
+	fromDB := dedupePreservingOrder(fromTable)
+	if len(fromDB) == 0 && configValue != "" {
+		fromDB = dedupePreservingOrder(ParseTypesConfigValue(configValue))
+	}
+	merged := mergeWithYAMLCustomTypes(fromDB, func() []string { return yamlTypes })
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }
 
 // mergeWithYAMLCustomTypes returns the union of dbTypes and the YAML-declared
@@ -365,9 +387,10 @@ func dedupePreservingOrder(in []string) []string {
 	return out
 }
 
-// SyncCustomStatusesTable replaces all rows in custom_statuses with parsed config value.
-// Used by both DoltStore and EmbeddedDoltStore when "status.custom" config changes.
-func SyncCustomStatusesTable(ctx context.Context, tx *sql.Tx, value string) error {
+// syncCustomStatusesTable replaces all rows in custom_statuses with parsed config value.
+// Reached only through SyncConfigTables, which is the single entry point every
+// SetConfig path uses; call that rather than this directly. Triggered when"status.custom" config changes.
+func syncCustomStatusesTable(ctx context.Context, tx DBTX, value string) error {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM custom_statuses"); err != nil {
 		return err
 	}
@@ -387,16 +410,17 @@ func SyncCustomStatusesTable(ctx context.Context, tx *sql.Tx, value string) erro
 	return nil
 }
 
-// SyncCustomTypesTable replaces all rows in custom_types with parsed config value.
-// Used by both DoltStore and EmbeddedDoltStore when "types.custom" config changes.
-func SyncCustomTypesTable(ctx context.Context, tx *sql.Tx, value string) error {
+// syncCustomTypesTable replaces all rows in custom_types with parsed config value.
+// Reached only through SyncConfigTables, which is the single entry point every
+// SetConfig path uses; call that rather than this directly. Triggered when"types.custom" config changes.
+func syncCustomTypesTable(ctx context.Context, tx DBTX, value string) error {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM custom_types"); err != nil {
 		return err
 	}
 	if value == "" {
 		return nil
 	}
-	names := parseTypesValue(value)
+	names := ParseTypesConfigValue(value)
 	for _, name := range names {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO custom_types (name) VALUES (?)", name); err != nil {
 			return err
@@ -405,8 +429,11 @@ func SyncCustomTypesTable(ctx context.Context, tx *sql.Tx, value string) error {
 	return nil
 }
 
-// parseTypesValue tries JSON array first, then falls back to comma-separated.
-func parseTypesValue(value string) []string {
+// ParseTypesConfigValue parses a types.custom config value, accepting both
+// the JSON-array form written by bd config set / pour (e.g. ["duty","ops"])
+// and the legacy comma-separated form (duty,ops). Elements are trimmed and
+// empties dropped.
+func ParseTypesConfigValue(value string) []string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil
@@ -414,40 +441,45 @@ func parseTypesValue(value string) []string {
 	// Try JSON array first (e.g. '["gate","convoy"]')
 	var jsonTypes []string
 	if err := json.Unmarshal([]byte(value), &jsonTypes); err == nil {
-		return jsonTypes
+		var out []string
+		for _, t := range jsonTypes {
+			if t = strings.TrimSpace(t); t != "" {
+				out = append(out, t)
+			}
+		}
+		return out
 	}
 	// Fall back to comma-separated
 	return ParseCommaSeparatedList(value)
 }
 
-// EnsureCustomTypeInTx registers name as a custom type if it is not
-// already a built-in type and not already in the custom_types table.
-// This is used by bd mol pour/wisp to auto-register types that the
-// formula system creates implicitly (e.g. "gate" for async coordination
-// beads) so that operators don't have to run bd config set types.custom
-// manually before pouring a formula with gate steps. See GH#3213.
-func EnsureCustomTypeInTx(ctx context.Context, tx *sql.Tx, name string) error {
-	if types.IssueType(name).IsValid() {
-		return nil
-	}
-	existing, err := ResolveCustomTypesInTx(ctx, tx)
-	if err != nil {
-		return err
-	}
-	for _, t := range existing {
-		if t == name {
-			return nil
+// SyncConfigTables re-syncs the normalized lookup table backing a config
+// key, if any (status.custom → custom_statuses, types.custom →
+// custom_types). Reads of those sets are table-first, so every SetConfig
+// path must keep the projection in step with the string value or stale
+// table rows win forever. Returns the name of the synced table ("" when
+// the key has no projection) so transactional callers can mark it dirty.
+func SyncConfigTables(ctx context.Context, tx DBTX, key, value string) (string, error) {
+	switch key {
+	case "status.custom":
+		if err := syncCustomStatusesTable(ctx, tx, value); err != nil {
+			return "", fmt.Errorf("syncing custom_statuses table: %w", err)
 		}
+		return "custom_statuses", nil
+	case "types.custom":
+		if err := syncCustomTypesTable(ctx, tx, value); err != nil {
+			return "", fmt.Errorf("syncing custom_types table: %w", err)
+		}
+		return "custom_types", nil
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO custom_types (name) VALUES (?)", name)
-	return err
+	return "", nil
 }
 
 // ResolveInfraTypesInTx reads infrastructure types from the database,
 // falling back to config.yaml then to hardcoded defaults.
 // Returns a map[string]bool for O(1) lookups.
 // Does not cache — callers layer caching on top.
-func ResolveInfraTypesInTx(ctx context.Context, tx *sql.Tx) map[string]bool {
+func ResolveInfraTypesInTx(ctx context.Context, tx DBTX) map[string]bool {
 	var typeList []string
 
 	value, err := GetConfigInTx(ctx, tx, "types.infra")

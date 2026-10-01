@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,10 +14,15 @@ import (
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/ceiling"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/gitenv"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/remotecache"
+	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/issueops"
 )
 
 var configCmd = &cobra.Command{
@@ -32,9 +39,14 @@ Common namespaces:
   - jira.*            Jira integration settings
   - linear.*          Linear integration settings
   - github.*          GitHub integration settings
+  - gitlab.*          GitLab integration settings
+  - ado.*             Azure DevOps integration settings
+  - notion.*          Notion integration settings
   - custom.*          Custom integration settings
   - status.*          Issue status configuration
+  - claim.*           Claim arbitration settings (pool-aware claiming)
   - doctor.suppress.* Suppress specific bd doctor warnings (GH#1095)
+  - lint.*            Additional per-type lint sections (stored in config.yaml)
 
 Auto-Export (config.yaml):
   Optional JSONL export to .beads/issues.jsonl after write commands (throttled).
@@ -67,6 +79,18 @@ Custom Status States:
   This enables issues to use statuses like 'awaiting_review' in addition to
   the built-in statuses (open, in_progress, blocked, deferred, closed).
 
+Claim Pools:
+  A dispatcher can pre-assign issues to a pool pseudo-assignee (e.g.
+  "fable-crew") and let any actor take them with --claim. List the pool
+  aliases in the claim.pools config key, comma-separated:
+
+    bd config set claim.pools "fable-crew,night-crew"
+
+  Issues assigned to a real actor (or to an alias not in the list) keep
+  their anti-steal protection. Pool takes carry the normal lease; note
+  that if a taker's lease expires, bd reclaim returns the issue to the
+  unassigned pool, not to the pool alias it was dispatched to.
+
 Suppressing Doctor Warnings:
   Suppress specific bd doctor warnings by check name slug:
     bd config set doctor.suppress.pending-migrations true
@@ -83,9 +107,11 @@ Examples:
   bd config set jira.url "https://company.atlassian.net"
   bd config set jira.project "PROJ"
   bd config set status.custom "awaiting_review,awaiting_testing"
+  bd config set claim.pools "fable-crew,night-crew"    # Pool aliases claimable by any actor
   bd config set doctor.suppress.pending-migrations true
   bd config set dolt.debug true                        # Enable Dolt sql-server debug mode (loglevel=debug, --prof cpu)
   bd config set dolt.local-only true                   # Skip wiring a Dolt sync remote during bd init
+  bd config set lint.sections.epic "Standards scorecard, Cost"   # Extra sections bd lint requires for epics
   bd config get export.auto
   bd config list
   bd config unset jira.url`,
@@ -93,33 +119,78 @@ Examples:
 
 var forceGitTracked bool
 
+// newRoleConfigWriter captures fresh cwd and scrubbed routing once per write
+// operation. The process-wide Git cache and Beads storage do not select it.
+// Routing is scrubbed along with the suppression ScrubRouting deliberately
+// keeps: beads.role is an authority value, and the reader it feeds treats a
+// missing value as maintainer, so a suppressed config file would fail open.
+func newRoleConfigWriter() (func(...string) error, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	env := gitenv.ScrubRoutingAndSuppression(os.Environ())
+	probe := exec.Command("git", "rev-parse", "--git-common-dir")
+	probe.Dir, probe.Env = dir, env
+	out, err := probe.Output()
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && len(exit.Stderr) > 0 {
+			err = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exit.Stderr)))
+		}
+		return nil, fmt.Errorf("resolving common Git config: %w", err)
+	}
+	commonDir := git.NormalizePath(strings.TrimSpace(string(out)))
+	if commonDir == "" {
+		return nil, fmt.Errorf("Git returned an empty common directory")
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(dir, commonDir)
+	}
+	return func(args ...string) error {
+		// Callers supply only the fixed role key, validated values and unset flag.
+		cmd := exec.Command("git", append([]string{"--git-dir", commonDir, "config", "--local"}, args...)...) //nolint:gosec // private validated config operations
+		cmd.Dir, cmd.Env = dir, env
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+		}
+		return nil
+	}, nil
+}
+
 var configSetCmd = &cobra.Command{
-	Use:   "set <key> <value>",
-	Short: "Set a configuration value",
-	Args:  cobra.ExactArgs(2),
-	Run: func(_ *cobra.Command, args []string) {
+	Use:           "set <key> <value>",
+	Short:         "Set a configuration value",
+	Args:          cobra.ExactArgs(2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(_ *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("config-set")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		key := args[0]
 		value := args[1]
 
-		// Reject keys that look like init-only state so the user does not
-		// silently land a write in a store that 'bd create' never reads.
-		// 'bd config set issue-prefix' used to write DB key "issue-prefix"
-		// (dash) while 'bd create' only reads YAML "issue-prefix" or DB
-		// "issue_prefix" (underscore) — three divergent stores, write never
-		// visible.
 		if msg, rejected := rejectProtectedConfigKey(key); rejected {
 			fmt.Fprintln(os.Stderr, msg)
-			os.Exit(1)
+			return SilentExit()
 		}
 
 		if key == "dolt.debug" && !usesSQLServer() {
 			fmt.Fprintln(os.Stderr, "Error: dolt.debug requires a sql-server-backed project (embedded mode has no managed server).")
 			fmt.Fprintln(os.Stderr, "  To migrate: re-init with 'bd init --server' or 'bd init --shared-server'.")
-			os.Exit(1)
+			return SilentExit()
 		}
 
-		// Warn on unrecognized config keys so typos don't silently become
-		// no-ops. The custom.* namespace is exempt (user-extensible). GH#3293.
+		if strings.HasPrefix(key, "storage-class.") {
+			if err := validateStorageClassConfig(key, value); err != nil {
+				return HandleError("%v", err)
+			}
+		}
+
 		if !isRecognizedConfigKey(key) {
 			suggestion := suggestConfigKey(key)
 			if suggestion != "" {
@@ -130,223 +201,515 @@ var configSetCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "Run 'bd config --help' for valid namespaces.\n")
 		}
 
-		// Refuse to write secret keys to git-tracked config files unless
-		// --force-git-tracked is set. This prevents accidental exposure of
-		// API keys and tokens in git history.
 		if !forceGitTracked {
 			if err := config.CheckSecretKeyGitSafety(key); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return HandleError("%v", err)
 			}
 		}
 
-		// Check if this is a yaml-only key (startup settings like no-db, etc.)
-		// These must be written to config.yaml, not SQLite, because they're read
-		// before the database is opened. (GH#536)
 		if config.IsYamlOnlyKey(key) {
-			if err := config.SetYamlConfig(key, value); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
-				os.Exit(1)
+			var setErr error
+			location := "config.yaml"
+			if config.IsUserGlobalKey(key) {
+				setErr = config.SetUserYamlConfig(key, value)
+				location = config.UserConfigYamlDisplayPath()
+			} else {
+				setErr = config.SetYamlConfig(key, value)
+			}
+			if setErr != nil {
+				return HandleError("setting config: %v", setErr)
 			}
 
 			if jsonOutput {
-				outputJSON(map[string]interface{}{
+				if err := outputJSON(map[string]interface{}{
 					"key":      key,
 					"value":    value,
-					"location": "config.yaml",
-				})
+					"location": location,
+				}); err != nil {
+					return err
+				}
 			} else {
-				fmt.Printf("Set %s = %s (in config.yaml)\n", key, value)
+				fmt.Printf("Set %s = %s (in %s)\n", key, value, location)
 			}
 			printConfigSideEffects(checkConfigSetSideEffects(key, value))
-			return
+			return nil
 		}
 
-		// beads.role is stored in git config, not SQLite (GH#1531).
-		// bd doctor reads it from git config, so we write there for consistency.
 		if key == "beads.role" {
 			validRoles := map[string]bool{"maintainer": true, "contributor": true}
 			if !validRoles[value] {
-				fmt.Fprintf(os.Stderr, "Error: invalid role %q (valid values: maintainer, contributor)\n", value)
-				os.Exit(1)
+				return HandleError("invalid role %q (valid values: maintainer, contributor)", value)
 			}
-			cmd := exec.Command("git", "config", "beads.role", value) //nolint:gosec // value is validated against allowlist above
-			if err := cmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting beads.role in git config: %v\n", err)
-				os.Exit(1)
+			// bd config get/set/unset/set-many beads.role ignore inherited Git
+			// routing, including GIT_CONFIG_GLOBAL, so the value lands in the
+			// repository this command selected. beads.role is an authority
+			// value and the reader it feeds treats a missing value as
+			// maintainer, so these planes also discard the explicit suppression
+			// ScrubRouting deliberately keeps -- otherwise a blinded read fails
+			// open instead of erroring. That boundary is uniform across
+			// routing.DetectUserRole, `bd config show`, `bd doctor`,
+			// `bd hooks uninstall` and beads.RepoContext.Role, which re-pins
+			// GIT_DIR/GIT_WORK_TREE last-wins on top of it.
+			write, err := newRoleConfigWriter()
+			if err != nil {
+				return HandleError("setting beads.role in git config: %v", err)
+			}
+			if err := write("beads.role", value); err != nil {
+				return HandleError("setting beads.role in git config: %v", err)
 			}
 			if jsonOutput {
-				outputJSON(map[string]interface{}{
+				if err := outputJSON(map[string]interface{}{
 					"key":      key,
 					"value":    value,
 					"location": "git config",
-				})
+				}); err != nil {
+					return err
+				}
 			} else {
 				fmt.Printf("Set %s = %s (in git config)\n", key, value)
 			}
-			return
+			return nil
 		}
 
-		// Database-stored config requires direct mode
-		if err := ensureDirectMode("config set requires direct database access"); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		// Everything above this line is FRONT-DOOR routing: which source owns
+		// the key, and whether writing it to a file on this machine would leak
+		// a secret into git. From here the key is known to belong to the
+		// workspace database, and the write is the role's.
+		settings, err := openWorkspaceConfig("config set requires direct database access")
+		if err != nil {
+			return HandleError("%v", err)
 		}
-
-		ctx := rootCtx
-
-		// Validate status.custom config before writing
-		if key == "status.custom" && value != "" {
-			if _, err := types.ParseCustomStatusConfig(value); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid status.custom value: %v\n", err)
-				os.Exit(1)
-			}
+		result, err := settings.SetSetting(rootCtx, issueops.SetSettingRequest{Key: key, Value: value})
+		if err != nil {
+			return HandleError("setting config: %v", err)
 		}
-
-		if err := store.SetConfig(ctx, key, value); err != nil {
-			fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
-			os.Exit(1)
-		}
-		commandDidWrite.Store(true)
+		noteDirectConfigWrite()
 
 		if jsonOutput {
-			outputJSON(map[string]string{
-				"key":   key,
-				"value": value,
-			})
+			if err := outputJSON(map[string]string{
+				"key":   result.Key,
+				"value": result.Value,
+			}); err != nil {
+				return err
+			}
 		} else {
-			fmt.Printf("Set %s = %s\n", key, value)
+			fmt.Printf("Set %s = %s\n", result.Key, result.Value)
 		}
-		printConfigSideEffects(checkConfigSetSideEffects(key, value))
+		printConfigSideEffects(checkConfigSetSideEffects(result.Key, result.Value))
+		return nil
 	},
 }
 
+// openWorkspaceConfig hands back the workspace-settings role for whichever
+// route this invocation is on, each through its OWN capability accessor — the
+// store's for the direct route and the provider's for the proxied one.
+//
+// directRequirement is the message `ensureDirectMode` reports when a workspace
+// is reachable by neither route. It is per-verb because the shipped text names
+// the verb.
+func openWorkspaceConfig(directRequirement string) (issueops.WorkspaceConfig, error) {
+	if usesProxiedServer() {
+		return proxiedWorkspaceConfig()
+	}
+	if err := ensureDirectMode(directRequirement); err != nil {
+		return nil, err
+	}
+	return store.WorkspaceConfig()
+}
+
+// secretRowCleanup is what the best-effort database half of `bd config unset`
+// achieved, kept apart from the config.yaml half because the two removals are
+// independent. The YAML edit is the command's contract; the row is a credential
+// the database replicated to every remote it was pushed to, so "I deleted it",
+// "it is still there and I could not delete it" and "I could not look" are
+// three different things to tell the user, and only the middle one is certain.
+type secretRowCleanup struct {
+	present bool // a row was there when we read it
+	removed bool
+	err     error
+}
+
+// describe writes the database half of the report. It says nothing at all for
+// the overwhelmingly common workspace that never leaked: `config unset` is
+// otherwise a one-line command and this is a footnote about a key's history.
+func (c secretRowCleanup) describe(key, location string) {
+	switch {
+	case c.removed:
+		fmt.Printf("Also removed a stored %s row from the database, left by a bd that predates the key moving to %s.\n", key, location)
+		fmt.Printf("⚠ Rotate this credential: the row was replicated to every Dolt remote this workspace pushed to, and deleting it here does not unpublish it.\n")
+	case c.err != nil && c.present:
+		// The one case that is not a maybe: the read found the row and the
+		// delete failed, so bd knows a live credential is still in the table.
+		fmt.Fprintf(os.Stderr, "⚠ A stored %s row is still in the database: removing it failed (%v).\n", key, c.err)
+		fmt.Fprintf(os.Stderr, "⚠ Rotate this credential: the row was replicated to every Dolt remote this workspace pushed to.\n")
+	case c.err != nil:
+		fmt.Fprintf(os.Stderr, "⚠ Could not check the database for a leaked %s row (%v). An older bd may have stored one there; re-run this command with the database reachable.\n", key, c.err)
+	}
+}
+
+// jsonFields carries the same three-way distinction to machine consumers.
+// database_row_removed is always present for a secret key so a script can tell
+// "nothing leaked" from "the field is missing because bd is older".
+func (c secretRowCleanup) jsonFields(payload map[string]interface{}) {
+	payload["database_row_removed"] = c.removed
+	switch {
+	case c.err != nil && c.present:
+		payload["database_row_present"] = true
+		payload["database_delete_failed"] = c.err.Error()
+	case c.err != nil:
+		payload["database_unreachable"] = c.err.Error()
+	}
+}
+
+// rowNote is the database half folded into the error the YAML half returns, so
+// a failed `config unset` still tells the user where the credential stands. It
+// goes on stderr with that error rather than to stdout, which `--json` owns.
+func (c secretRowCleanup) rowNote(key string) string {
+	switch {
+	case c.removed:
+		return fmt.Sprintf("\nA stored %s row WAS removed from the database; rotate that credential — it was replicated to every Dolt remote this workspace pushed to.", key)
+	case c.err != nil && c.present:
+		return fmt.Sprintf("\nA stored %s row is still in the database: removing it failed (%v).", key, c.err)
+	case c.err != nil:
+		return fmt.Sprintf("\nThe database could not be checked for a leaked %s row (%v).", key, c.err)
+	}
+	return ""
+}
+
+// mayProvisionDatabase reports whether reaching the store from here could have
+// to CREATE a database, which is the only thing unsetLeakedSecretRow's skip
+// exists to avoid. Each arm that returns false is a route on which the database
+// is already there, so consulting it provisions nothing:
+//
+//   - the proxied route opens no local storage at all — proxiedWorkspaceConfig
+//     reaches an already-connected provider;
+//   - a store that is already open and tracked is ensureStoreActive's own
+//     no-op arm: it returns before newDoltStoreFromConfig ever runs. This is
+//     the state PersistentPreRun leaves a connected server-mode workspace in,
+//     and it is the only thing that tells the metadata-less server shape —
+//     `dolt.mode: server` or BEADS_DOLT_SERVER_HOST with no local database
+//     directory, routed deliberately at main.go, GH#3545 — apart from a
+//     workspace that genuinely has no database. beads.FindDatabasePath answers
+//     on metadata.json plus embeddeddolt/ and dolt/, so for that shape it
+//     reports "" while the row itself sits on the shared server, replicated to
+//     every remote the workspace ever pushed to. Skipping there would strand
+//     the leaked credential in the population that holds the most copies of it.
+//
+// Only when neither of those holds does the on-disk answer decide, and there
+// the open really is open-OR-CREATE.
+func mayProvisionDatabase() bool {
+	if usesProxiedServer() {
+		return false
+	}
+	lockStore()
+	active := isStoreActive() && getStore() != nil
+	unlockStore()
+	if active {
+		return false
+	}
+	return beads.FindDatabasePath() == ""
+}
+
+// unsetLeakedSecretRow deletes a yaml-only SECRET key's leftover row from the
+// config table, reporting what it found and what it removed.
+//
+// WHY THE YAML UNSET IS NOT THE WHOLE JOB. A key becomes yaml-only at some
+// point in bd's history, not at the beginning: `notion.token` moved in GH#6676,
+// and every workspace configured before the move still has the value in the
+// config table — a table whose contents `bd dolt push` replicates to every
+// remote. `config unset`'s yaml-only branch returns before the store, so
+// without this the only bd-side remover of that row would be gone for embedded
+// workspaces, which are exactly the population the move protects. The row would
+// keep authenticating (ResolveAuth reads it as the upgrade path) while the user
+// who just ran `bd config unset` believes they are clean.
+//
+// IT IS BEST EFFORT, AND ONLY FOR SECRETS. The caller has already removed the
+// value from config.yaml, which is the command's contract; a workspace with no
+// reachable store must not be told that succeeded work failed. Non-secret
+// yaml-only keys are skipped rather than merely unreported, so the ordinary
+// `bd config unset routing.mode` keeps costing no database open at all — this
+// pays the store-open only where a leaked credential could be sitting.
+//
+// The predicates, not a list of key names: `IsYamlOnlyKey` matches whole
+// prefixes (`ai.`, `sync.`, `federation.`, ...), so the affected set is
+// open-ended and grows whenever a tracker adds a credential. Measured at the
+// time of writing, YamlOnlyKeys alone contributes seven — ado.pat,
+// github.token, gitlab.token, jira.api_token, linear.api_key,
+// linear.oauth_client_secret, notion.token — plus whatever the prefixes cover.
+//
+// IT NEVER PROVISIONS ONE. `config unset <yaml-only key>` is deliberately
+// classified as runnable with no store (configCommandCanRunWithoutStore in
+// main.go, GH#536 / bd-934 / bd-3rw), and the direct open below is
+// open-OR-CREATE (ensureDirectMode → ensureStoreActive →
+// newDoltStoreFromConfig), so without a gate editing a YAML file would
+// materialize a database in a workspace that never had one and flip it out of
+// its db-less mode for every later command. mayProvisionDatabase is that gate,
+// and it asks about the store before the disk: "no local database directory" is
+// not the same question as "no database", and the workspaces where the two
+// answers differ are the ones whose row traveled furthest.
+func unsetLeakedSecretRow(key string) secretRowCleanup {
+	// Gate BEFORE opening the store, not inside removeStoredSecretRow: this is
+	// what keeps `bd config unset routing.mode` from paying a database open it
+	// has no use for.
+	if !config.IsSecretKey(key) {
+		return secretRowCleanup{}
+	}
+	if mayProvisionDatabase() {
+		return secretRowCleanup{}
+	}
+	settings, err := openWorkspaceConfig("config unset requires direct database access")
+	if err != nil {
+		return secretRowCleanup{err: err}
+	}
+	present, removed, err := removeStoredSecretRow(rootCtx, settings, key)
+	if removed {
+		noteDirectConfigWrite()
+	}
+	return secretRowCleanup{present: present, removed: removed, err: err}
+}
+
+// removeStoredSecretRow deletes key's row, reporting whether one was there and
+// whether it is gone. Those are two bits, not one: a failed delete on a row the
+// read found is the single outcome that means "a live credential is still in
+// the table bd pushes", and collapsing it into the error alone renders it as an
+// unreachable database — the one case that needs no hedging.
+//
+// It READS BEFORE DELETING because UnsetSetting deliberately has no "removed"
+// flag and deleting an absent key is a success — so a blind delete could not
+// tell the caller whether anything had leaked, and the overwhelmingly common
+// case (a workspace that never stored the key) has to stay silent rather than
+// announce a removal that did not happen.
+func removeStoredSecretRow(ctx context.Context, settings issueops.WorkspaceConfig, key string) (present bool, removed bool, err error) {
+	stored, err := settings.GetSetting(ctx, issueops.GetSettingRequest{Key: key})
+	if err != nil {
+		return false, false, err
+	}
+	if strings.TrimSpace(stored.Value) == "" {
+		return false, false, nil
+	}
+	if _, err := settings.UnsetSetting(ctx, issueops.UnsetSettingRequest{Key: key}); err != nil {
+		return true, false, err
+	}
+	return true, true, nil
+}
+
+// noteDirectConfigWrite marks the invocation as having written, which is what
+// the auto-commit epilogue in main.go keys on.
+//
+// It is DIRECT-ROUTE ONLY: a proxied write already committed inside the role's
+// own unit of work, so flagging it here would ask the epilogue to commit a
+// second time on a route that has nothing outstanding.
+func noteDirectConfigWrite() {
+	if !usesProxiedServer() {
+		commandDidWrite.Store(true)
+	}
+}
+
 var configGetCmd = &cobra.Command{
-	Use:   "get <key>",
-	Short: "Get a configuration value",
-	Args:  cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "get <key>",
+	Short:         "Get a configuration value",
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("config-get")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		key := args[0]
 
-		// Check if this is a yaml-only key (startup settings)
-		// These are read from config.yaml via viper, not SQLite. (GH#536)
+		if key == "backup.enabled" {
+			// backup.enabled has an auto-detected effective value that
+			// differs from the stored value: when unset it auto-enables
+			// in embedded mode with a git remote, and is forced OFF in
+			// sql-server mode (see isBackupAutoEnabled). Reporting the raw
+			// stored "false"/"not set" here misled operators during the
+			// 2026-07 shared-dolt incident, so show the EFFECTIVE value
+			// and its source.
+			return runConfigGetBackupEnabled()
+		}
+
 		if config.IsYamlOnlyKey(key) {
+			// User-global keys (e.g. metrics.*) must be read from the user-global
+			// config.yaml only — the same source the runtime uses for metrics
+			// consent and endpoint. Reading the merged value here would let a
+			// project's .beads/config.yaml shadow the effective value and report the
+			// opposite of what `bd metrics` actually honors.
+			if config.IsUserGlobalKey(key) {
+				value := config.GetUserYamlConfig(key)
+				location := config.UserConfigYamlDisplayPath()
+				if jsonOutput {
+					return outputJSON(map[string]interface{}{
+						"key":      key,
+						"value":    value,
+						"location": location,
+					})
+				}
+				if value == "" {
+					fmt.Printf("%s (not set in %s)\n", key, location)
+				} else {
+					fmt.Printf("%s\n", value)
+				}
+				return nil
+			}
+
 			value := config.GetYamlConfig(key)
 
 			if jsonOutput {
-				outputJSON(map[string]interface{}{
+				return outputJSON(map[string]interface{}{
 					"key":      key,
 					"value":    value,
 					"location": "config.yaml",
 				})
-			} else {
-				if value == "" {
-					fmt.Printf("%s (not set in config.yaml)\n", key)
-				} else {
-					fmt.Printf("%s\n", value)
-				}
 			}
-			return
+			if value == "" {
+				fmt.Printf("%s (not set in config.yaml)\n", key)
+			} else {
+				fmt.Printf("%s\n", value)
+			}
+			return nil
 		}
 
-		// beads.role is stored in git config, not SQLite (GH#1531).
 		if key == "beads.role" {
+			// Same role-authority boundary as `bd config set` above.
 			cmd := exec.Command("git", "config", "--get", "beads.role")
+			cmd.Env = gitenv.ScrubRoutingAndSuppression(os.Environ())
 			output, err := cmd.Output()
 			value := strings.TrimSpace(string(output))
 			if err != nil {
 				value = ""
 			}
 			if jsonOutput {
-				outputJSON(map[string]interface{}{
+				return outputJSON(map[string]interface{}{
 					"key":      key,
 					"value":    value,
 					"location": "git config",
 				})
-			} else {
-				if value == "" {
-					fmt.Printf("%s (not set in git config)\n", key)
-				} else {
-					fmt.Printf("%s\n", value)
-				}
 			}
-			return
-		}
-
-		// Database-stored config requires direct mode
-		if err := ensureDirectMode("config get requires direct database access"); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		ctx := rootCtx
-		var value string
-		var err error
-
-		value, err = store.GetConfig(ctx, key)
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting config: %v\n", err)
-			os.Exit(1)
-		}
-
-		if jsonOutput {
-			outputJSON(map[string]string{
-				"key":   key,
-				"value": value,
-			})
-		} else {
 			if value == "" {
-				fmt.Printf("%s (not set)\n", key)
+				fmt.Printf("%s (not set in git config)\n", key)
 			} else {
 				fmt.Printf("%s\n", value)
 			}
-		}
-	},
-}
-
-var configListCmd = &cobra.Command{
-	Use:   "list",
-	Short: "List all configuration",
-	Run: func(cmd *cobra.Command, args []string) {
-		// Config operations work in direct mode only
-		if err := ensureDirectMode("config list requires direct database access"); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return nil
 		}
 
-		ctx := rootCtx
-		config, err := store.GetAllConfig(ctx)
+		settings, err := openWorkspaceConfig("config get requires direct database access")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing config: %v\n", err)
-			os.Exit(1)
+			return HandleError("%v", err)
+		}
+		result, err := settings.GetSetting(rootCtx, issueops.GetSettingRequest{Key: key})
+		if err != nil {
+			return HandleError("getting config: %v", err)
 		}
 
 		if jsonOutput {
-			outputJSON(config)
-			return
+			return outputJSON(map[string]string{
+				"key":   result.Key,
+				"value": result.Value,
+			})
+		}
+		// "(not set)" also prints for a key stored as the empty string: the
+		// role answers "" for both, and issueops.SettingResult.Value says why.
+		if result.Value == "" {
+			fmt.Printf("%s (not set)\n", result.Key)
+		} else {
+			fmt.Printf("%s\n", result.Value)
+		}
+		return nil
+	},
+}
+
+// runConfigGetBackupEnabled reports the EFFECTIVE value of
+// backup.enabled together with its source, rather than the raw stored
+// value. The stored value is misleading because isBackupAutoEnabled()
+// derives the runtime value: unset → auto-enabled in embedded mode
+// when a git remote exists, and forced OFF in sql-server mode.
+func runConfigGetBackupEnabled() error {
+	const key = "backup.enabled"
+	source := config.GetValueSource(key)
+	effective := isBackupAutoEnabled()
+
+	var sourceDesc string
+	switch source {
+	case config.SourceEnvVar:
+		sourceDesc = "env var"
+	case config.SourceConfigFile:
+		sourceDesc = "config.yaml"
+	default: // SourceDefault — value came from auto-detection
+		switch {
+		case usesSQLServer():
+			sourceDesc = "default (auto: off in sql-server mode)"
+		case effective:
+			sourceDesc = "default (auto: on — git remote detected)"
+		default:
+			sourceDesc = "default (auto: off — no git remote)"
+		}
+	}
+
+	if jsonOutput {
+		return outputJSON(map[string]interface{}{
+			"key":       key,
+			"value":     effective,
+			"effective": effective,
+			"source":    string(source),
+		})
+	}
+	fmt.Printf("%t (%s)\n", effective, sourceDesc)
+	return nil
+}
+
+var configListCmd = &cobra.Command{
+	Use:           "list",
+	Short:         "List all configuration",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("config-list")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		settings, err := openWorkspaceConfig("config list requires direct database access")
+		if err != nil {
+			return HandleError("%v", err)
+		}
+		result, err := settings.ListSettings(rootCtx, issueops.ListSettingsRequest{})
+		if err != nil {
+			return HandleError("listing config: %v", err)
+		}
+		stored := result.Settings
+
+		if jsonOutput {
+			return outputJSON(stored)
 		}
 
-		if len(config) == 0 {
+		if len(stored) == 0 {
 			fmt.Println("No configuration set")
-			return
+			return nil
 		}
 
-		// Sort keys for consistent output
-		keys := make([]string, 0, len(config))
-		for k := range config {
+		keys := make([]string, 0, len(stored))
+		for k := range stored {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 
 		fmt.Println("\nConfiguration:")
 		for _, k := range keys {
-			fmt.Printf("  %s = %s\n", k, config[k])
+			fmt.Printf("  %s = %s\n", k, stored[k])
 		}
 
-		// Check for config.yaml overrides that take precedence (bd-20j)
-		// This helps diagnose when effective config differs from database config
-		showConfigYAMLOverrides(config)
+		// The OTHER sources, reported beside the stored ones rather than merged
+		// into them: the role answers for the database, and config.yaml and the
+		// environment are files and variables of THIS process.
+		showConfigYAMLOverrides(stored)
+		return nil
 	},
 }
 
@@ -422,72 +785,173 @@ func showConfigYAMLOverrides(dbConfig map[string]string) {
 	fmt.Println("\nTip: Run 'bd config show' for all effective config with provenance.")
 }
 
+// runConfigUnsetYamlOnly removes a yaml-only key from config.yaml and, for a
+// secret key, the row a bd that predates the key's move to YAML may have left
+// in the config table.
+//
+// THE TWO REMOVALS ARE INDEPENDENT, AND SO IS THEIR REPORTING. Running the row
+// cleanup only after a successful YAML edit would skip it for exactly the
+// workspaces the cleanup exists for: one whose config.yaml is missing, or whose
+// notion.token sits in a shape the unset refuses, gets an error about
+// config.yaml and keeps the credential in the table `bd dolt push` replicates —
+// while `bd notion status` names this very command as the remover. So the
+// cleanup runs either way, and a failed YAML unset carries the row's fate in
+// its error rather than dropping it.
+func runConfigUnsetYamlOnly(key string) error {
+	file := "config.yaml"
+	var changed bool
+	var unsetErr error
+	if config.IsUserGlobalKey(key) {
+		changed, unsetErr = config.UnsetUserYamlConfig(key)
+		file = config.UserConfigYamlDisplayPath()
+	} else {
+		changed, unsetErr = config.UnsetYamlConfig(key)
+	}
+
+	cleanup := unsetLeakedSecretRow(key)
+
+	if unsetErr != nil {
+		return HandleError("unsetting config: %v%s", unsetErr, cleanup.rowNote(key))
+	}
+
+	// The location is a report of the write, not a guess made before it: an
+	// absent file or a key that was never written there is a no-op, and saying
+	// "Unset <key> (in config.yaml)" over a file that never held it is the
+	// untrustworthy message this command's fix set out to remove.
+	location := ""
+	if changed {
+		location = file
+	}
+
+	if jsonOutput {
+		payload := map[string]interface{}{
+			"key":      key,
+			"location": location,
+			// The human branch gets an explicit "was not set" sentence; without
+			// this the machine branch cannot tell that no-op apart from an
+			// unpopulated field, since both render location as "".
+			"changed": changed,
+		}
+		if config.IsSecretKey(key) {
+			cleanup.jsonFields(payload)
+		}
+		if err := outputJSON(payload); err != nil {
+			return err
+		}
+	} else if changed {
+		fmt.Printf("Unset %s (in %s)\n", key, location)
+		cleanup.describe(key, location)
+	} else {
+		fmt.Printf("%s was not set in %s\n", key, file)
+		cleanup.describe(key, file)
+	}
+	// Gate the hint on the write, uniformly across all three arms above. Every
+	// key in checkConfigUnsetSideEffects is phrased in the completed past tense
+	// ("Backup config removed...") and three of the four hand the operator a
+	// follow-up command, so on the no-op branch the command contradicted the
+	// line it had just printed. This covers the jsonOutput arm too: the hint
+	// goes to stderr, so --json never suppressed it.
+	if changed {
+		printConfigSideEffects(checkConfigUnsetSideEffects(key))
+	}
+	return nil
+}
+
 var configUnsetCmd = &cobra.Command{
-	Use:   "unset <key>",
-	Short: "Delete a configuration value",
-	Args:  cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "unset <key>",
+	Short:         "Delete a configuration value",
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("config-unset")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		key := args[0]
 
-		// Check if this is a yaml-only key (startup settings like backup.*, routing.*, etc.)
-		// These must be removed from config.yaml, not the database. (GH#2727)
 		if config.IsYamlOnlyKey(key) {
-			if err := config.UnsetYamlConfig(key); err != nil {
-				fmt.Fprintf(os.Stderr, "Error unsetting config: %v\n", err)
-				os.Exit(1)
-			}
-
-			if jsonOutput {
-				outputJSON(map[string]interface{}{
-					"key":      key,
-					"location": "config.yaml",
-				})
-			} else {
-				fmt.Printf("Unset %s (in config.yaml)\n", key)
-			}
-			printConfigSideEffects(checkConfigUnsetSideEffects(key))
-			return
+			return runConfigUnsetYamlOnly(key)
 		}
 
-		// beads.role is stored in git config, not the database (GH#1531).
 		if key == "beads.role" {
-			gitCmd := exec.Command("git", "config", "--unset", "beads.role")
-			if err := gitCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error unsetting beads.role in git config: %v\n", err)
-				os.Exit(1)
+			// Same role-authority boundary as `bd config set`/`get` above: every
+			// spelling of a beads.role mutation resolves the repository the same
+			// way, so the next reader has one boundary to reason about.
+			write, err := newRoleConfigWriter()
+			if err != nil {
+				return HandleError("unsetting beads.role in git config: %v", err)
+			}
+			if err := write("--unset", "beads.role"); err != nil {
+				return HandleError("unsetting beads.role in git config: %v", err)
 			}
 			if jsonOutput {
-				outputJSON(map[string]interface{}{
+				if err := outputJSON(map[string]interface{}{
 					"key":      key,
 					"location": "git config",
-				})
+				}); err != nil {
+					return err
+				}
 			} else {
 				fmt.Printf("Unset %s (in git config)\n", key)
 			}
-			return
+			return nil
 		}
 
-		// Database-stored config requires direct mode
-		if err := ensureDirectMode("config unset requires direct database access"); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		settings, err := openWorkspaceConfig("config unset requires direct database access")
+		if err != nil {
+			return HandleError("%v", err)
 		}
+		result, err := settings.UnsetSetting(rootCtx, issueops.UnsetSettingRequest{Key: key})
+		if err != nil {
+			return HandleError("deleting config: %v", err)
+		}
+		noteDirectConfigWrite()
 
-		ctx := rootCtx
-		if err := store.DeleteConfig(ctx, key); err != nil {
-			fmt.Fprintf(os.Stderr, "Error deleting config: %v\n", err)
-			os.Exit(1)
+		// Clear the config.yaml layer unconditionally and report what the
+		// write actually did. Pre-checking with GetYamlConfig would read
+		// viper's *merged* value - SetDefault values and AutomaticEnv
+		// included - so a key with a non-empty default (no-hooks, json,
+		// events-journal-retain-days, ...) looked present in config.yaml even
+		// in a workspace with no config.yaml at all. That produced a more
+		// specific false claim than the message this fix removed, and, with no
+		// project config.yaml, failed the command after the database row was
+		// already gone.
+		//
+		// A config.yaml the unset refuses to edit (a flow-style mapping, a
+		// block value) is reported as exactly that: any database row is
+		// already gone, but the key is still effective from the file, so this
+		// still fails. "Any": UnsetSettingResult cannot say whether a row
+		// existed, since the storage seam discards the affected-row count.
+		location := "database"
+		yamlCleared, err := config.UnsetYamlConfig(result.Key)
+		// A workspace with no project config.yaml has no YAML layer to clear, so
+		// the database write above is the whole unset and this succeeds - that is
+		// the case that used to fail the command after the row was already gone.
+		// A config.yaml that exists and refused the edit is the opposite: the key
+		// is still effective from the file, so that still fails.
+		if err != nil && !errors.Is(err, config.ErrNoProjectConfigYaml) {
+			return HandleError("%s is still set in config.yaml (any database row was removed): %v", result.Key, err)
 		}
-		commandDidWrite.Store(true)
+		if yamlCleared {
+			location = "database, config.yaml"
+		}
 
 		if jsonOutput {
-			outputJSON(map[string]string{
-				"key": key,
-			})
+			if err := outputJSON(map[string]string{
+				"key":      result.Key,
+				"location": location,
+			}); err != nil {
+				return err
+			}
 		} else {
-			fmt.Printf("Unset %s\n", key)
+			fmt.Printf("Unset %s (in %s)\n", result.Key, location)
 		}
-		printConfigSideEffects(checkConfigUnsetSideEffects(key))
+		printConfigSideEffects(checkConfigUnsetSideEffects(result.Key))
+		return nil
 	},
 }
 
@@ -505,38 +969,41 @@ Checks:
 	Examples:
 	  bd config validate
 	  bd config validate --json`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("config-validate")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		repoPath, err := resolvedConfigRepoRoot()
 		if err != nil {
-			FatalErrorWithHintRespectJSON(activeWorkspaceNotFoundError(), diagHint())
+			return HandleErrorWithHintRespectJSON(activeWorkspaceNotFoundError(), diagHint())
 		}
 
-		// Run the existing doctor config values check
 		doctorCheck := doctor.CheckConfigValues(repoPath)
 
-		// Run additional sync-related validations
 		syncIssues := validateSyncConfig(repoPath)
 
-		// Combine results
 		allIssues := []string{}
 		if doctorCheck.Detail != "" {
 			allIssues = append(allIssues, strings.Split(doctorCheck.Detail, "\n")...)
 		}
 		allIssues = append(allIssues, syncIssues...)
 
-		// Output results
 		if jsonOutput {
-			result := map[string]interface{}{
+			return outputJSON(map[string]interface{}{
 				"valid":  len(allIssues) == 0,
 				"issues": allIssues,
-			}
-			outputJSON(result)
-			return
+			})
 		}
 
 		if len(allIssues) == 0 {
 			fmt.Println("✓ All sync-related configuration is valid")
-			return
+			return nil
 		}
 
 		fmt.Println("Configuration validation found issues:")
@@ -546,7 +1013,7 @@ Checks:
 			}
 		}
 		fmt.Println("\nRun 'bd config set <key> <value>' to fix configuration issues.")
-		os.Exit(1)
+		return SilentExit()
 	},
 }
 
@@ -612,7 +1079,8 @@ func isValidRemoteURL(rawURL string) bool {
 // findBeadsRepoRoot walks up from the given path to find the repo root (containing .beads)
 func findBeadsRepoRoot(startPath string) string {
 	path := startPath
-	for {
+	bound := ceiling.For(startPath)
+	for !bound.Excludes(path) {
 		beadsDir := filepath.Join(path, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			return path
@@ -656,9 +1124,17 @@ calls, especially in CI.
 Examples:
   bd config set-many ado.state_map.open=New ado.state_map.closed=Closed
   bd config set-many jira.url=https://example.atlassian.net jira.project=PROJ`,
-	Args: cobra.MinimumNArgs(1),
-	Run: func(_ *cobra.Command, args []string) {
-		// Phase 1: Parse all key=value pairs
+	Args:          cobra.MinimumNArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(_ *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("config-set-many")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		type kvPair struct {
 			key, value string
 		}
@@ -666,30 +1142,39 @@ Examples:
 		for _, arg := range args {
 			idx := strings.Index(arg, "=")
 			if idx <= 0 {
-				fmt.Fprintf(os.Stderr, "Error: invalid argument %q (expected key=value format)\n", arg)
-				os.Exit(1)
+				return HandleError("invalid argument %q (expected key=value format)", arg)
 			}
 			pairs = append(pairs, kvPair{key: arg[:idx], value: arg[idx+1:]})
 		}
 
-		// Phase 2: Validate all pairs before writing any
 		for _, p := range pairs {
+			// The same refusal `bd config set` makes, and it was MISSING here:
+			// `bd config set-many issue_prefix=x` re-prefixed the workspace
+			// behind the guard the single-key verb enforces. This verb does not
+			// go through issueops.WorkspaceConfig (see the write below), so it
+			// makes the refusal itself, before any pair is written.
+			if msg, rejected := rejectProtectedConfigKey(p.key); rejected {
+				fmt.Fprintln(os.Stderr, msg)
+				return SilentExit()
+			}
 			if p.key == "beads.role" {
 				validRoles := map[string]bool{"maintainer": true, "contributor": true}
 				if !validRoles[p.value] {
-					fmt.Fprintf(os.Stderr, "Error: invalid role %q (valid values: maintainer, contributor)\n", p.value)
-					os.Exit(1)
+					return HandleError("invalid role %q (valid values: maintainer, contributor)", p.value)
 				}
 			}
 			if p.key == "status.custom" && p.value != "" {
 				if _, err := types.ParseCustomStatusConfig(p.value); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: invalid status.custom value: %v\n", err)
-					os.Exit(1)
+					return HandleError("invalid status.custom value: %v", err)
+				}
+			}
+			if strings.HasPrefix(p.key, "storage-class.") {
+				if err := validateStorageClassConfig(p.key, p.value); err != nil {
+					return HandleError("%v", err)
 				}
 			}
 		}
 
-		// Phase 3: Separate into categories
 		var yamlPairs, gitPairs, dbPairs []kvPair
 		for _, p := range pairs {
 			if config.IsYamlOnlyKey(p.key) {
@@ -701,56 +1186,77 @@ Examples:
 			}
 		}
 
-		// Phase 3b: Check git-tracked secret safety for yaml keys
 		if !forceGitTracked {
 			for _, p := range yamlPairs {
 				if err := config.CheckSecretKeyGitSafety(p.key); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					return HandleError("%v", err)
 				}
 			}
 		}
 
-		// Phase 4: Write yaml-only keys
 		for _, p := range yamlPairs {
-			if err := config.SetYamlConfig(p.key, p.value); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting config %s: %v\n", p.key, err)
-				os.Exit(1)
+			var setErr error
+			if config.IsUserGlobalKey(p.key) {
+				setErr = config.SetUserYamlConfig(p.key, p.value)
+			} else {
+				setErr = config.SetYamlConfig(p.key, p.value)
+			}
+			if setErr != nil {
+				return HandleError("setting config %s: %v", p.key, setErr)
 			}
 		}
 
-		// Phase 5: Write git config keys
-		for _, p := range gitPairs {
-			cmd := exec.Command("git", "config", "beads.role", p.value) //nolint:gosec // value is validated against allowlist above
-			if err := cmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting %s in git config: %v\n", p.key, err)
-				os.Exit(1)
+		if len(gitPairs) > 0 {
+			// set-many is the batch alias for `bd config set`, so it runs on the
+			// same role-authority boundary that verb does.
+			write, err := newRoleConfigWriter()
+			if err != nil {
+				return HandleError("setting beads.role in git config: %v", err)
 			}
-		}
-
-		// Phase 6: Write DB keys in batch
-		if len(dbPairs) > 0 {
-			if err := ensureDirectMode("config set-many requires direct database access"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-
-			ctx := rootCtx
-			for _, p := range dbPairs {
-				if err := store.SetConfig(ctx, p.key, p.value); err != nil {
-					fmt.Fprintf(os.Stderr, "Error setting config %s: %v\n", p.key, err)
-					os.Exit(1)
+			for _, p := range gitPairs {
+				if err := write("beads.role", p.value); err != nil {
+					return HandleError("setting %s in git config: %v", p.key, err)
 				}
 			}
-			commandDidWrite.Store(true)
 		}
 
-		// Phase 7: Output results
+		// SET-MANY IS NOT ON issueops.WorkspaceConfig, and the reason is the
+		// property TestProxiedServerConfigSetMany pins: the whole batch is ONE
+		// Dolt commit, which is the entire point of the verb ("faster and less
+		// noisy than separate calls, especially in CI"). The role writes one
+		// setting per call and commits each, so routing this through it would
+		// turn a three-key batch into three commits.
+		if len(dbPairs) > 0 {
+			if usesProxiedServer() {
+				keys := make([]string, len(dbPairs))
+				values := make([]string, len(dbPairs))
+				for i, p := range dbPairs {
+					keys[i] = p.key
+					values[i] = p.value
+				}
+				if err := runConfigSetManyProxiedServer(rootCtx, keys, values); err != nil {
+					return err
+				}
+			} else {
+				if err := ensureDirectMode("config set-many requires direct database access"); err != nil {
+					return HandleError("%v", err)
+				}
+				for _, p := range dbPairs {
+					if err := store.SetConfig(rootCtx, p.key, p.value); err != nil {
+						return HandleError("setting config %s: %v", p.key, err)
+					}
+				}
+				commandDidWrite.Store(true)
+			}
+		}
+
 		if jsonOutput {
 			results := make([]map[string]string, 0, len(pairs))
 			for _, p := range pairs {
 				location := "database"
-				if config.IsYamlOnlyKey(p.key) {
+				if config.IsUserGlobalKey(p.key) {
+					location = config.UserConfigYamlDisplayPath()
+				} else if config.IsYamlOnlyKey(p.key) {
 					location = "config.yaml"
 				} else if p.key == "beads.role" {
 					location = "git config"
@@ -761,11 +1267,15 @@ Examples:
 					"location": location,
 				})
 			}
-			outputJSON(results)
+			if err := outputJSON(results); err != nil {
+				return err
+			}
 		} else {
 			for _, p := range pairs {
 				location := ""
-				if config.IsYamlOnlyKey(p.key) {
+				if config.IsUserGlobalKey(p.key) {
+					location = fmt.Sprintf(" (in %s)", config.UserConfigYamlDisplayPath())
+				} else if config.IsYamlOnlyKey(p.key) {
 					location = " (in config.yaml)"
 				} else if p.key == "beads.role" {
 					location = " (in git config)"
@@ -773,32 +1283,94 @@ Examples:
 				fmt.Printf("Set %s = %s%s\n", p.key, p.value, location)
 			}
 		}
+		return nil
 	},
 }
 
 // recognizedConfigPrefixes lists valid top-level config namespaces.
 // Keys under custom.* are always accepted (user-extensible).
+//
+// Tracker namespaces (jira., linear., github., ado., ...) are NOT listed here:
+// they are derived from the tracker registry at runtime via
+// allRecognizedConfigPrefixes, so the recognizer cannot drift out of sync when
+// a new tracker is added (GH#4427).
 var recognizedConfigPrefixes = []string{
-	"export.", "import.", "dolt.", "jira.", "linear.", "github.", "custom.",
-	"status.", "doctor.suppress.", "routing.", "sync.", "git.",
+	"export.", "import.", "dolt.", "custom.",
+	"status.", "types.", "doctor.suppress.", "routing.", "sync.", "git.",
 	"directory.", "repos.", "external_projects.", "validation.",
-	"hierarchy.", "ai.", "backup.", "federation.",
+	"lint.", "hierarchy.", "ai.", "backup.", "federation.", "metrics.",
+	"agent.", "claim.", "storage-class.",
+}
+
+// validateStorageClassConfig validates a storage-class.<type> per-type
+// default at config-set time (Protocol v0.1 C-OQ1: values are validated when
+// set, not discovered broken at create time). The key suffix must name an
+// issue type and the value must be a storage class.
+func validateStorageClassConfig(key, value string) error {
+	suffix := strings.TrimPrefix(key, "storage-class.")
+	if suffix == "" || strings.Contains(suffix, ".") {
+		return fmt.Errorf("invalid key %q: expected storage-class.<issue-type> (e.g. storage-class.event)", key)
+	}
+	// The key suffix must be a canonical, known issue type: create-time lookup
+	// keys on the Normalize()d type (resolveStorageClass), so an alias like
+	// storage-class.feat or a typo like storage-class.taks would pass set-time
+	// validation and then silently never match — the C-OQ1 failure mode this
+	// validator exists to prevent.
+	issueType := types.IssueType(suffix)
+	if canonical := issueType.Normalize(); canonical != issueType {
+		return fmt.Errorf("invalid key %q: %q is an alias of %q, and create-time lookup uses the canonical type; set storage-class.%s instead", key, suffix, canonical, canonical)
+	}
+	customTypes, err := resolveWorkspaceCustomTypes(rootCtx)
+	if err != nil {
+		return err
+	}
+	if !issueType.IsValidWithCustom(customTypes) {
+		return fmt.Errorf("invalid key %q: unknown issue type %q (use a built-in type, or add it to types.custom first)", key, suffix)
+	}
+	if _, err := types.ParseStorageClass(value); err != nil {
+		return err
+	}
+	return nil
+}
+
+// allRecognizedConfigPrefixes returns the static namespaces plus the prefix of
+// every registered tracker ("ado.", "jira.", ...). Deriving tracker prefixes
+// from the registry keeps config-key recognition in sync with the set of
+// trackers compiled into bd instead of a hand-maintained allowlist (GH#4427).
+func allRecognizedConfigPrefixes() []string {
+	names := tracker.List()
+	prefixes := make([]string, 0, len(recognizedConfigPrefixes)+len(names))
+	prefixes = append(prefixes, recognizedConfigPrefixes...)
+	for _, name := range names {
+		prefixes = append(prefixes, name+".")
+	}
+	return prefixes
 }
 
 // recognizedConfigKeys lists valid non-namespaced config keys.
 var recognizedConfigKeys = map[string]bool{
 	"no-db": true, "json": true, "db": true, "actor": true,
 	"identity": true, "no-push": true, "no-git-ops": true,
+	"node_id":                    true, // replica identity for the lease guard (read from yaml/env, never the DB)
 	"create.require-description": true, "beads.role": true,
 	"auto_compact_enabled": true, "schema_version": true,
 	"output.title-length": true,
+	"prime.max-memories":  true, "prime.max-memory-chars": true,
+	// The events-journal family. All four are startup settings that land in
+	// config.yaml (config.YamlOnlyKeys), and every one of them is documented as
+	// a `bd config set` invocation — including the auto-prune opt-out, where an
+	// unrecognized-key warning next to a command that DID take effect reads as
+	// "that did not work" on the one setting whose whole purpose is to stop bd
+	// deleting records.
+	"events-journal": true, "events-journal-auto-prune": true,
+	"events-journal-retain-days": true, "events-journal-retain-rows": true,
 }
 
 func isRecognizedConfigKey(key string) bool {
 	if recognizedConfigKeys[key] {
 		return true
 	}
-	for _, prefix := range recognizedConfigPrefixes {
+	for _, prefix := range allRecognizedConfigPrefixes() {
 		if strings.HasPrefix(key, prefix) {
 			return true
 		}
@@ -837,7 +1409,7 @@ func suggestConfigKey(key string) string {
 
 	bestMatch := ""
 	bestDist := 3 // max edit distance to suggest
-	for _, known := range recognizedConfigPrefixes {
+	for _, known := range allRecognizedConfigPrefixes() {
 		knownPrefix := strings.TrimSuffix(known, ".")
 		d := levenshteinDistance(parts[0], knownPrefix)
 		if d > 0 && d < bestDist {

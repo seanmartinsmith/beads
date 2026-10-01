@@ -5,23 +5,25 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
 var molStaleCmd = &cobra.Command{
 	Use:   "stale",
-	Short: "Detect complete-but-unclosed molecules",
-	Long: `Detect molecules (epics with children) that are complete but still open.
+	Short: "Detect molecules with all children closed but root still open",
+	Long: `Detect molecules (epics with children) whose children are all closed
+with completing reasons, but the root is still open.
 
 A molecule is considered stale if:
-  1. All children are closed (Completed == Total)
+  1. Every child is closed with a completing reason (not duplicate/wontfix/superseded)
   2. Root issue is still open
   3. Not assigned to anyone (optional, use --unassigned)
   4. Is blocking other work (optional, use --blocking)
 
-By default, shows all complete-but-unclosed molecules.
+Review whether epic scope is actually finished before closing — child
+closure alone does not prove the epic's stated work is done (GH#5026).
 
 Examples:
   bd mol stale              # List all stale molecules
@@ -29,7 +31,9 @@ Examples:
   bd mol stale --blocking   # Only show those blocking other work
   bd mol stale --unassigned # Only show unassigned molecules
   bd mol stale --all        # Include molecules with 0 children`,
-	Run: runMolStale,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runMolStale,
 }
 
 // StaleMolecule holds info about a stale molecule
@@ -50,45 +54,57 @@ type StaleResult struct {
 	BlockingCount  int              `json:"blocking_count"`
 }
 
-func runMolStale(cmd *cobra.Command, args []string) {
-	ctx := rootCtx
+func runMolStale(cmd *cobra.Command, args []string) error {
+	evt := metrics.NewCommandEvent("mol-stale")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
 
 	blockingOnly, _ := cmd.Flags().GetBool("blocking")
 	unassignedOnly, _ := cmd.Flags().GetBool("unassigned")
 	showAll, _ := cmd.Flags().GetBool("all")
 
+	if usesProxiedServer() {
+		return runMolStaleProxiedServer(rootCtx, blockingOnly, unassignedOnly, showAll)
+	}
+
+	ctx := rootCtx
+
 	var result *StaleResult
 	var err error
 
 	if store == nil {
-		FatalError("no database connection")
+		return HandleErrorRespectJSON("no database connection")
 	}
 
 	result, err = findStaleMolecules(ctx, store, blockingOnly, unassignedOnly, showAll)
 	if err != nil {
-		FatalError("%v", err)
+		return HandleErrorRespectJSON("%v", err)
 	}
 
 	if jsonOutput {
-		outputJSON(result)
-		return
+		return outputJSON(result)
 	}
+	renderStaleResult(result, blockingOnly)
+	return nil
+}
 
+func renderStaleResult(result *StaleResult, blockingOnly bool) {
 	if len(result.StaleMolecules) == 0 {
 		fmt.Println("No stale molecules found.")
 		return
 	}
 
-	// Print header
 	if blockingOnly {
-		fmt.Printf("%s Stale molecules (complete but unclosed, blocking work):\n\n",
+		fmt.Printf("%s Molecules with all children closed (review scope; blocking work):\n\n",
 			ui.RenderWarnIcon())
 	} else {
-		fmt.Printf("%s Stale molecules (complete but unclosed):\n\n",
+		fmt.Printf("%s Molecules with all children closed (review scope before closing):\n\n",
 			ui.RenderInfoIcon())
 	}
 
-	// Print each stale molecule
 	for _, mol := range result.StaleMolecules {
 		progress := fmt.Sprintf("%d/%d", mol.ClosedChildren, mol.TotalChildren)
 
@@ -107,7 +123,6 @@ func runMolStale(cmd *cobra.Command, args []string) {
 		fmt.Println()
 	}
 
-	// Summary
 	fmt.Printf("Total: %d stale", result.TotalCount)
 	if result.BlockingCount > 0 {
 		fmt.Printf(", %d blocking other work", result.BlockingCount)
@@ -116,7 +131,7 @@ func runMolStale(cmd *cobra.Command, args []string) {
 }
 
 // findStaleMolecules queries the database for stale molecules
-func findStaleMolecules(ctx context.Context, s storage.DoltStorage, blockingOnly, unassignedOnly, showAll bool) (*StaleResult, error) {
+func findStaleMolecules(ctx context.Context, s molReader, blockingOnly, unassignedOnly, showAll bool) (*StaleResult, error) {
 	// Get all epics eligible for closure (complete but unclosed)
 	epicStatuses, err := s.GetEpicsEligibleForClosure(ctx)
 	if err != nil {
