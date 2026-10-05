@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/ceiling"
 	"github.com/steveyegge/beads/internal/git"
 )
 
@@ -58,6 +59,17 @@ func TestFindBeadsRepoRoot_WorktreeFallback(t *testing.T) {
 
 	worktreeBeads := filepath.Join(worktreeDir, ".beads")
 	os.RemoveAll(worktreeBeads)
+
+	// Bound the upward walk at this fixture's temp root. On Windows the
+	// system temp dir lives under the user's home, so an unbounded walk
+	// from the worktree reaches a real ~/.beads before the worktree
+	// fallback runs (gastownhall/beads#4638). Append rather than overwrite
+	// so the ceilings TestMain and bazel set stay in force.
+	ceilingList := tmpDir
+	if existing := os.Getenv(ceiling.EnvVar); existing != "" {
+		ceilingList = existing + string(os.PathListSeparator) + tmpDir
+	}
+	t.Setenv(ceiling.EnvVar, ceilingList)
 
 	t.Chdir(worktreeDir)
 	git.ResetCaches()
